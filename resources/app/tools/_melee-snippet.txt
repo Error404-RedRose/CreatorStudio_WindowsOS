@@ -1,0 +1,73 @@
+  private meleeAttack(): void {
+    const eye = this.eyeScratch.set(this.player.pos.x, this.player.pos.y + PLAYER.eyeHeight, this.player.pos.z);
+    const dir = this.dirScratch.set(0, 0, -1).applyQuaternion(this.rig.camera.quaternion);
+    const to = new THREE.Vector3();
+    const forward = this.input.moveZ;
+    const strafe = this.input.moveX;
+    let direction = "overhead";
+    if (forward > 0 && strafe === 0) direction = "thrust";
+    else if (strafe < 0) direction = "slash-left";
+    else if (strafe > 0) direction = "slash-right";
+    else if (forward < 0) direction = "rising";
+
+    // Each guard picks a different trade: reach, arc width or raw damage.
+    const styles: Record<string, { damage: number; reach: number; arc: number; label: string }> = {
+      thrust: { damage: 0.9, reach: 1.18, arc: 0.62, label: "THRUST" },
+      "slash-left": { damage: 1.0, reach: 1.02, arc: 0.12, label: "LEFT SLASH" },
+      "slash-right": { damage: 1.0, reach: 1.02, arc: 0.12, label: "RIGHT SLASH" },
+      rising: { damage: 1.2, reach: 1.0, arc: 0.3, label: "RISING CUT" },
+      overhead: { damage: 1.15, reach: 0.95, arc: 0.45, label: "OVERHEAD" },
+    };
+    const style = styles[direction];
+    const reach = this.weapon.range * style.reach;
+    const targets: Agent[] = [];
+    for (const agent of this.agents.agents) {
+      if (!agent.alive) continue;
+      to.set(agent.pos.x - eye.x, agent.pos.y + 1.0 - eye.y, agent.pos.z - eye.z);
+      const distance = to.length();
+      if (distance > reach || distance < 0.001) continue;
+      to.divideScalar(distance);
+      if (to.dot(dir) < style.arc) continue;
+      const wall = raycastBoxes(this.world.boxes, eye, to, distance);
+      if (wall && wall.t < distance - 0.3) continue;
+      targets.push(agent);
+    }
+
+    this.lastMeleeDirection = direction;
+    this.viewModel.onMelee(direction);
+    this.combatHud.hit(false);
+    if (targets.length > 0) {
+      if (this.now - this.meleeComboAt < 1.3) this.meleeCombo = Math.min(3, this.meleeCombo + 1);
+      else this.meleeCombo = 1;
+      this.meleeComboAt = this.now;
+      const combo = 1 + (this.meleeCombo - 1) * 0.22;
+      const brawler = 1 + this.survival.perkRank("brawler") * 0.18;
+      const finisher = this.meleeCombo === 3;
+      for (const target of targets.slice(0, 4)) {
+        this.agents.damage(
+          target,
+          this.weapon.damage * style.damage * brawler * combo * (finisher ? 1.25 : 1),
+          false,
+          this.player.pos,
+          this.now,
+          (a) => this.onKill(a),
+        );
+        this.fx.impact(new THREE.Vector3(target.pos.x, target.pos.y + 1.1, target.pos.z), finisher ? 0xffd36b : 0xffe0a0);
+      }
+      if (finisher) this.hud.toast("FINISHER - " + style.label, 0.8);
+      this.audio.hitmarker(false);
+    } else {
+      this.audio.emptyClick();
+    }
+  }
+
+  /** Test/debug snapshot of the melee layer. */
+  meleeInfo() {
+    return {
+      direction: this.lastMeleeDirection,
+      combo: this.meleeCombo,
+      parries: this.parries,
+      guardAge: this.guardStartedAt < 0 ? -1 : this.now - this.guardStartedAt,
+    };
+  }
+

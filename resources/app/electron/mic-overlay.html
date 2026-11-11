@@ -1,0 +1,68 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; background: transparent; overflow: hidden; font-family: "Segoe UI", system-ui, sans-serif; }
+  body { height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .pill {
+    display: flex; align-items: center; gap: 10px; min-width: 280px; max-width: 420px;
+    padding: 9px 15px 9px 9px; border-radius: 999px; background: rgba(20, 18, 30, 0.92);
+    border: 1px solid rgba(170, 130, 255, 0.5); color: #f2eefc;
+    box-shadow: 0 14px 38px rgba(0, 0, 0, 0.45), 0 0 24px rgba(140, 100, 255, 0.22);
+    backdrop-filter: blur(14px); opacity: 0; transition: opacity 0.12s;
+  }
+  .pill.on { opacity: 1; }
+  .orb { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; background: #8b6cf6; flex: 0 0 auto; }
+  .pill.listening .orb { animation: pulse 1.5s ease-in-out infinite; }
+  .copy { display: flex; flex-direction: column; min-width: 0; }
+  .copy strong { font-size: 11px; letter-spacing: 0.01em; }
+  .copy em { font-style: normal; font-size: 9px; color: #aaa3c0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wave { display: flex; align-items: flex-end; gap: 2px; height: 16px; margin-left: 6px; }
+  .wave i { width: 2px; height: 5px; border-radius: 2px; background: #b8a6ff; }
+  .pill.listening .wave i { animation: wave 0.9s ease-in-out infinite; }
+  .pill.listening .wave i:nth-child(2) { animation-delay: 0.12s; }
+  .pill.listening .wave i:nth-child(3) { animation-delay: 0.24s; }
+  .pill.listening .wave i:nth-child(4) { animation-delay: 0.36s; }
+  @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(139, 108, 246, 0.5); } 50% { box-shadow: 0 0 0 7px transparent; } }
+  @keyframes wave { 0%, 100% { height: 5px; } 50% { height: 15px; } }
+</style>
+</head>
+<body>
+  <div class="pill" id="pill">
+    <span class="orb">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="9" y="2.6" width="6" height="11.2" rx="3"></rect>
+        <path d="M5 11a7 7 0 0 0 14 0M12 18v3M8.5 21h7"></path>
+      </svg>
+    </span>
+    <span class="copy"><strong id="title">Microphone live</strong><em id="sub">Listening… release Right Control</em></span>
+    <span class="wave"><i></i><i></i><i></i><i></i></span>
+  </div>
+  <script>
+    const port = new URLSearchParams(location.search).get("port") || "4317";
+    const statusUrl = "http://127.0.0.1:" + port + "/api/speech/status";
+    const pill = document.getElementById("pill");
+    const title = document.getElementById("title");
+    const sub = document.getElementById("sub");
+    async function tick() {
+      try {
+        const response = await fetch(statusUrl, { cache: "no-store" });
+        const status = await response.json();
+        const active = Boolean(status.active);
+        const finishing = Boolean(status.finishing);
+        if (!active && !finishing) {
+          pill.classList.remove("on", "listening");
+          return;
+        }
+        pill.classList.add("on");
+        pill.classList.toggle("listening", active);
+        title.textContent = active ? "Microphone live" : "Transcribing";
+        sub.textContent = active ? "Listening… release Right Control to finish" : "Finishing transcript…";
+      } catch {}
+    }
+    tick();
+    setInterval(tick, 250);
+  </script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+GitHub manual push report
+Workspace: E:\CREATOR STUDIO\Twilight Studio 3D\release\win-unpacked
+Platform: Windows
+Repository: Error404-RedRose/CreatorStudio_WindowsOS
+Branch: main
+Generated: 2026-11-11T10:38:19Z
+Mode: complete build (all files)
+
+TOTALS
+----------------------------------------
+Files: 9562
+Size: 700.5 MB
+
+NOT PUSHED
+----------------------------------------
+None. Every file in the unpacked build is present in the repository.
+
+NOTES
+----------------------------------------
+The main executable exceeds GitHub's 100 MB normal file limit, so it is tracked
+with Git LFS via .gitattributes. Clone with Git LFS installed to receive the
+binary automatically. A repository ZIP download contains an LFS pointer instead
+of the executable. Do not use the in-app GitHub push on this repository; its
+clean-mirror mode skips EXE, DLL, dist, and node_modules files.

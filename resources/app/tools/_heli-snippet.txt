@@ -1,0 +1,56 @@
+  private updateHelicopter(dt: number, vehicle: NonNullable<Game["vehicle"]>): void {
+    const throttle = this.input.moveZ;
+    const steer = this.input.moveX;
+    const powered = vehicle.fuel > 0 && vehicle.health > 0;
+    const liftInput = (this.input.jumpHeld ? 1 : 0) - (this.input.slideHeld ? 1 : 0);
+    if (powered) {
+      vehicle.lift += (liftInput * 22 - 9.8) * dt;
+      vehicle.lift = Math.max(-14, Math.min(14, vehicle.lift));
+      vehicle.speed += throttle * 20 * dt;
+      vehicle.speed *= 1 - 0.6 * dt;
+      vehicle.speed = Math.max(-12, Math.min(40, vehicle.speed));
+      vehicle.yaw -= steer * (0.8 + Math.min(1.2, Math.abs(vehicle.speed) * 0.03)) * dt;
+      vehicle.fuel = Math.max(0, vehicle.fuel - (0.32 + Math.abs(vehicle.lift) * 0.1 + Math.abs(vehicle.speed) * 0.02) * dt);
+    } else {
+      vehicle.speed *= 1 - 2.2 * dt;
+      vehicle.lift -= 16 * dt;
+    }
+    vehicle.altitude = Math.max(0, vehicle.altitude + vehicle.lift * dt);
+    if (vehicle.altitude <= 0.001 && vehicle.lift < 0) vehicle.lift = 0;
+
+    const forwardX = -Math.sin(vehicle.yaw);
+    const forwardZ = -Math.cos(vehicle.yaw);
+    let nextX = vehicle.root.position.x + forwardX * vehicle.speed * dt;
+    let nextZ = vehicle.root.position.z + forwardZ * vehicle.speed * dt;
+    if (vehicle.altitude < 1.6) {
+      const box = {
+        min: [nextX - 1.0, vehicle.altitude + 0.2, nextZ - 1.9] as [number, number, number],
+        max: [nextX + 1.0, vehicle.altitude + 2.0, nextZ + 1.9] as [number, number, number],
+      };
+      const hits = this.world.query(box, this.vehicleHits);
+      let blocked = false;
+      for (const hit of hits) {
+        if (String(hit.tag || "").startsWith("vehicle:" + vehicle.id)) continue;
+        blocked = true;
+        break;
+      }
+      if (blocked) {
+        vehicle.health = Math.max(0, vehicle.health - Math.abs(vehicle.speed) * 0.7 + 2);
+        vehicle.speed = -vehicle.speed * 0.1;
+        nextX = vehicle.root.position.x;
+        nextZ = vehicle.root.position.z;
+        if (vehicle.health <= 0) this.hud.toast("The whirlybird is wrecked. Use a repair kit.", 2.4);
+      }
+    }
+
+    vehicle.root.position.set(nextX, vehicle.altitude, nextZ);
+    vehicle.root.rotation.set(-0.12 * (vehicle.speed / 40), vehicle.yaw, -steer * 0.16);
+    if (vehicle.rotor) vehicle.rotor.rotation.y += (8 + Math.abs(vehicle.lift) * 1.2 + Math.abs(vehicle.speed) * 0.1) * dt;
+    if (vehicle.tailRotor) vehicle.tailRotor.rotation.x += (14 + Math.abs(vehicle.speed) * 0.3) * dt;
+
+    this.player.pos.set(vehicle.root.position.x, vehicle.altitude + 0.9, vehicle.root.position.z);
+    this.player.prevPos.copy(this.player.pos);
+    this.player.vel.set(0, vehicle.lift, 0);
+    this.player.grounded = vehicle.altitude <= 0.05;
+  }
+

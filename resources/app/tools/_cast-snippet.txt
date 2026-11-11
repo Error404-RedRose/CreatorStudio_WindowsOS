@@ -1,0 +1,89 @@
+  /** Cast the selected spell. Public so the acceptance harness can exercise magic directly. */
+  castSpell(): boolean {
+    if (this.phase !== "run" || this.uiOpen || this.vehicle) return false;
+    const spell = this.magic.current;
+    const arcane = this.survival.perkRank("arcane");
+    const healAmount = spell.heal * (1 + arcane * 0.15);
+    if (spell.kind === "heal" && this.survival.stats.health >= 99.5) {
+      this.hud.toast("Already at full health.", 1.2);
+      return false;
+    }
+    if (!this.magic.cast(spell)) {
+      const remaining = this.magic.cooldown(spell.id);
+      if (remaining > 0) this.hud.toast(spell.name + " recharging (" + remaining.toFixed(1) + "s)", 1.2);
+      else this.hud.toast("Not enough mana for " + spell.name + ".", 1.2);
+      this.audio.emptyClick();
+      return false;
+    }
+
+    this.rig.punchFov(1.5);
+    this.audio.spell(spell.kind);
+    const eye = this.eyeScratch.set(this.player.pos.x, this.player.pos.y + PLAYER.eyeHeight, this.player.pos.z);
+    const dir = this.dirScratch.set(0, 0, -1).applyQuaternion(this.rig.camera.quaternion);
+    const damage = spell.damage * (1 + arcane * 0.2);
+
+    if (spell.kind === "heal") {
+      this.survival.heal(healAmount);
+      this.survival.stats.bleeding = 0;
+      this.survival.stats.infection = Math.max(0, this.survival.stats.infection - 25);
+      this.fx.impact(new THREE.Vector3(this.player.pos.x, this.player.pos.y + 1.0, this.player.pos.z), spell.color);
+      this.hud.toast("Mending Light +" + Math.round(healAmount) + " HP", 1.4);
+      return true;
+    }
+
+    if (spell.kind === "nova") {
+      let hits = 0;
+      for (const agent of this.agents.agents) {
+        if (!agent.alive) continue;
+        if (agent.pos.distanceTo(this.player.pos) > spell.radius) continue;
+        this.agents.damage(agent, damage, false, this.player.pos, this.now, (a) => this.onKill(a));
+        this.fx.impact(new THREE.Vector3(agent.pos.x, agent.pos.y + 1.0, agent.pos.z), spell.color);
+        hits++;
+      }
+      for (let i = 0; i < 14; i++) {
+        const angle = (i / 14) * Math.PI * 2;
+        this.fx.impact(
+          new THREE.Vector3(
+            this.player.pos.x + Math.cos(angle) * spell.radius,
+            this.player.pos.y + 0.45,
+            this.player.pos.z + Math.sin(angle) * spell.radius,
+          ),
+          spell.color,
+        );
+      }
+      this.agents.alert(this.player.pos, this.now, 1);
+      this.hud.toast(hits > 0 ? "Frost Nova - " + hits + " hit" : "Frost Nova", 1.2);
+      return true;
+    }
+
+    const worldHit = raycastBoxes(this.world.boxes, eye, dir, spell.range);
+    const worldT = worldHit ? worldHit.t : spell.range;
+    const agentHit = this.agents.raycastHit(eye, dir, Math.min(worldT, spell.range));
+    const endT = agentHit ? agentHit.t : worldT;
+    const end = new THREE.Vector3().copy(eye).addScaledVector(dir, endT);
+    this.fx.tracer(eye, end, spell.color);
+    if (agentHit) {
+      this.agents.damage(agentHit.agent, damage, agentHit.headshot, this.player.pos, this.now, (a) => this.onKill(a));
+      this.combatHud.hit(agentHit.headshot);
+      this.audio.hitmarker(agentHit.headshot);
+      this.fx.impact(end, spell.color);
+    } else if (worldHit) {
+      this.fx.impact(end, spell.color);
+    }
+    this.agents.alert(this.player.pos, this.now, 0.9);
+    this.hud.toast(spell.name, 0.9);
+    return true;
+  }
+
+  /** Test/debug snapshot of the magic layer. */
+  spellInfo() {
+    return {
+      selected: this.magic.current.id,
+      name: this.magic.current.name,
+      mana: this.magic.mana,
+      maxMana: this.magic.maxMana,
+      cooldown: this.magic.cooldown(this.magic.current.id),
+      spells: SPELLS.map((spell) => spell.id),
+    };
+  }
+
