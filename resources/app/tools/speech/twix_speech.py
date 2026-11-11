@@ -14,7 +14,9 @@ import ctypes
 import json
 import os
 import queue
+import shutil
 import string
+import subprocess
 import sys
 import threading
 import time
@@ -147,7 +149,62 @@ def play_tone(freq_hz: float, duration_ms: int, volume: float = 0.2) -> None:
         log(f"[WARN] Toggle sound failed: {error}")
 
 
+def linux_input_tools() -> dict:
+    """Return the available Linux typing backends (Wayland first, then X11)."""
+    return {
+        "wtype": shutil.which("wtype"),
+        "ydotool": shutil.which("ydotool"),
+        "xdotool": shutil.which("xdotool"),
+    }
+
+
+def linux_type_text(text: str) -> bool:
+    tools = linux_input_tools()
+    attempts = []
+    if tools["wtype"]:
+        attempts.append([tools["wtype"], text])
+    if tools["ydotool"]:
+        attempts.append([tools["ydotool"], "type", "--", text])
+    if tools["xdotool"]:
+        attempts.append([tools["xdotool"], "type", "--clearmodifiers", "--", text])
+    for command in attempts:
+        try:
+            subprocess.run(command, check=True, timeout=120)
+            return True
+        except Exception as error:
+            log(f"[WARN] Linux typing via {os.path.basename(command[0])} failed: {error}")
+    return False
+
+
+def linux_press_key(key: str) -> bool:
+    tools = linux_input_tools()
+    attempts = []
+    if tools["wtype"]:
+        attempts.append([tools["wtype"], "-k", key])
+    if tools["ydotool"]:
+        key_codes = {"Return": "28:1 28:0", "enter": "28:1 28:0"}
+        attempts.append([tools["ydotool"], "key", *key_codes.get(key, "28:1 28:0").split()])
+    if tools["xdotool"]:
+        attempts.append([tools["xdotool"], "key", "--clearmodifiers", key])
+    for command in attempts:
+        try:
+            subprocess.run(command, check=True, timeout=30)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def resolve_typer():
+    if sys.platform.startswith("linux"):
+        tools = linux_input_tools()
+        preferred = "wtype" if tools["wtype"] else "ydotool" if tools["ydotool"] else "xdotool" if tools["xdotool"] else ""
+        if preferred:
+            def linux_writer(text: str, delay: float = 0.0) -> None:
+                if not linux_type_text(text):
+                    raise RuntimeError("No Linux input tool could type the transcript.")
+
+            return linux_writer, preferred
     try:
         import keyboard  # type: ignore
 
@@ -157,17 +214,27 @@ def resolve_typer():
         return writer, "keyboard"
     except Exception as error:
         log(f"[WARN] keyboard module unavailable ({error}); using pyautogui.")
-        import pyautogui  # type: ignore
+        try:
+            import pyautogui  # type: ignore
 
-        pyautogui.FAILSAFE = False
+            pyautogui.FAILSAFE = False
 
-        def writer(text: str, delay: float = 0.0) -> None:
-            pyautogui.write(text, interval=delay)
+            def writer(text: str, delay: float = 0.0) -> None:
+                pyautogui.write(text, interval=delay)
 
-        return writer, "pyautogui"
+            return writer, "pyautogui"
+        except Exception as fallback_error:
+            log(f"[WARN] No typing backend is available: {fallback_error}")
+
+            def writer(text: str, delay: float = 0.0) -> None:
+                raise RuntimeError("No typing backend is available on this system.")
+
+            return writer, "unavailable"
 
 
 def press_enter() -> None:
+    if sys.platform.startswith("linux") and linux_press_key("Return"):
+        return
     try:
         import keyboard  # type: ignore
 

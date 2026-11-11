@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("twixDesktop", {
   isDesktop: true,
   platform: process.platform,
+  nativeFrame: process.platform === "linux",
   minimize: () => ipcRenderer.send("win:minimize"),
   fill: () => ipcRenderer.send("win:fill"),
   close: () => ipcRenderer.send("win:close"),

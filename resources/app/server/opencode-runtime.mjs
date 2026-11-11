@@ -123,8 +123,10 @@ async function which(name) {
 }
 
 async function resolveCandidate(value, appRoot) {
-  const text = String(value || "").trim();
+  let text = String(value || "").trim();
   if (!text) return null;
+  if (text === "~") text = os.homedir();
+  else if (text.startsWith("~/") || text.startsWith("~\\")) text = path.join(os.homedir(), text.slice(2));
   if (path.isAbsolute(text)) return fssync.existsSync(text) ? text : null;
   if (text.includes("/") || text.includes("\\")) {
     const resolved = path.resolve(appRoot, text);

@@ -1,10 +1,14 @@
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const SPEECH_TOOLS = path.join(APP_ROOT, "tools", "speech");
+const REQUIREMENTS_FILE = path.join(SPEECH_TOOLS, "requirements.txt");
+const INSTALL_RETRY_MS = 10 * 60 * 1000;
 
 function firstExisting(candidates) {
   for (const candidate of candidates) {
@@ -20,6 +24,12 @@ function firstExisting(candidates) {
 export function createSpeechService({ dataDir, getConfig }) {
   const controlFile = path.join(dataDir, "speech-ptt.txt");
   const controlTag = "speech-ptt.txt";
+  const venvDir = path.join(dataDir, "speech-venv");
+  const venvPython = path.join(
+    venvDir,
+    process.platform === "win32" ? path.join("Scripts", "python.exe") : path.join("bin", "python"),
+  );
+  const venvMarker = path.join(venvDir, ".creator-studio-ready.json");
   let child = null;
   let ready = false;
   let starting = false;
@@ -34,25 +44,196 @@ export function createSpeechService({ dataDir, getConfig }) {
   let currentConfig = { inputDevice: "", model: "base.en", device: "cpu", typeDelay: 0.03 };
   let logTail = [];
   let idleTimer = null;
+  let installing = false;
+  let installProgress = 0;
+  let installError = "";
+  let installLog = [];
+  let installPromise = null;
+  let lastInstallAttemptAt = 0;
+  let installDoneAt = 0;
+
+  function appendInstallLog(line) {
+    const text = String(line || "").trim();
+    if (!text) return;
+    installLog.push(text.slice(0, 400));
+    if (installLog.length > 120) installLog = installLog.slice(-120);
+    console.log(`[speech] ${text.slice(0, 400)}`);
+  }
+
+  function requirementsFingerprint() {
+    try {
+      return createHash("sha256").update(fsSync.readFileSync(REQUIREMENTS_FILE)).digest("hex").slice(0, 16);
+    } catch {
+      return "";
+    }
+  }
+
+  function venvReady() {
+    if (!fsSync.existsSync(venvPython)) return false;
+    try {
+      const marker = JSON.parse(fsSync.readFileSync(venvMarker, "utf8"));
+      return Boolean(marker?.requirements && marker.requirements === requirementsFingerprint());
+    } catch {
+      return false;
+    }
+  }
+
+  function runtimeAvailable() {
+    if (venvReady()) return true;
+    const packaged = [
+      process.platform === "win32"
+        ? path.join(APP_ROOT, "tools", "speech", "venv", "Scripts", "python.exe")
+        : path.join(APP_ROOT, "tools", "speech", "venv", "bin", "python"),
+      process.platform === "win32"
+        ? path.join(APP_ROOT, "tools", "speech", ".venv", "Scripts", "python.exe")
+        : path.join(APP_ROOT, "tools", "speech", ".venv", "bin", "python"),
+    ];
+    const explicit = String(process.env.TWIX_PYTHON || "").trim();
+    return packaged.some((file) => fsSync.existsSync(file)) || Boolean(explicit && fsSync.existsSync(explicit));
+  }
+
+  function systemPython() {
+    return firstExisting([
+      process.env.TWIX_SYSTEM_PYTHON || "",
+      process.platform === "win32" ? "python" : "python3",
+      process.platform === "win32" ? "py" : "python",
+    ]);
+  }
 
   function resolvePython() {
     const candidates =
       process.platform === "win32"
         ? [
+            ...(venvReady() ? [venvPython] : []),
             process.env.TWIX_PYTHON || "",
+            venvPython,
             // Creator Studio owns this environment. There is no BitBoy fallback.
             path.join(APP_ROOT, "tools", "speech", "venv", "Scripts", "python.exe"),
             path.join(APP_ROOT, "tools", "speech", ".venv", "Scripts", "python.exe"),
             "python",
           ]
         : [
+            ...(venvReady() ? [venvPython] : []),
             process.env.TWIX_PYTHON || "",
+            venvPython,
             path.join(APP_ROOT, "tools", "speech", "venv", "bin", "python"),
             path.join(APP_ROOT, "tools", "speech", ".venv", "bin", "python"),
             "python3",
             "python",
           ];
     return firstExisting(candidates);
+  }
+
+  function runStreaming(file, args, onLine, env = {}) {
+    return new Promise((resolve, reject) => {
+      let childProc;
+      try {
+        childProc = spawn(file, args, {
+          cwd: SPEECH_TOOLS,
+          windowsHide: true,
+          env: {
+            ...process.env,
+            PYTHONUNBUFFERED: "1",
+            PIP_DISABLE_PIP_VERSION_CHECK: "1",
+            PIP_NO_INPUT: "1",
+            PIP_CACHE_DIR: path.join(dataDir, "pip-cache"),
+            ...env,
+          },
+        });
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      const handle = (chunk) => {
+        for (const line of String(chunk || "").split(/\r?\n/)) {
+          if (line.trim()) onLine(line);
+        }
+      };
+      childProc.stdout?.on("data", handle);
+      childProc.stderr?.on("data", handle);
+      childProc.on("error", reject);
+      childProc.on("exit", (code, signal) => {
+        if (code === 0) resolve();
+        else reject(new Error(`${path.basename(file)} exited with ${code ?? signal}`));
+      });
+    });
+  }
+
+  async function provisionRuntime() {
+    if (installPromise) return installPromise;
+    if (installing) return null;
+    if (requirementsFingerprint() === "") {
+      installError = `The speech requirements file is missing: ${REQUIREMENTS_FILE}`;
+      return null;
+    }
+    installing = true;
+    installProgress = 3;
+    installError = "";
+    installLog = [];
+    lastInstallAttemptAt = Date.now();
+    appendInstallLog(`Preparing the Creator Studio speech engine in ${venvDir}`);
+    installPromise = (async () => {
+      const basePython = systemPython();
+      if (!basePython) {
+        throw new Error(
+          "Python 3 was not found. Install Python 3 (with venv/pip) from your distribution package manager, then restart Creator Studio.",
+        );
+      }
+      appendInstallLog(`Using ${basePython} to create the speech environment`);
+      const hasVenvPython = fsSync.existsSync(venvPython);
+      if (!hasVenvPython) {
+        installProgress = 10;
+        await runStreaming(basePython, ["-m", "venv", venvDir], (line) => appendInstallLog(line));
+        if (!fsSync.existsSync(venvPython)) {
+          throw new Error("Python created no virtual environment. Install the venv module (for example python3-venv) and retry.");
+        }
+      }
+      installProgress = 25;
+      appendInstallLog("Installing speech packages. This runs in the background and may take several minutes...");
+      installProgress = 45;
+      await runStreaming(
+        venvPython,
+        ["-m", "pip", "install", "-r", REQUIREMENTS_FILE, "--disable-pip-version-check", "--no-input"],
+        (line) => appendInstallLog(line),
+      );
+      installProgress = 95;
+      await fs.mkdir(venvDir, { recursive: true });
+      await fs.writeFile(
+        venvMarker,
+        JSON.stringify(
+          {
+            requirements: requirementsFingerprint(),
+            python: venvPython,
+            installedAt: new Date().toISOString(),
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      installProgress = 100;
+      installDoneAt = Date.now();
+      appendInstallLog("Speech engine installed. Starting the microphone engine...");
+      return venvPython;
+    })()
+      .catch((error) => {
+        installError = String(error?.message || error);
+        installProgress = 0;
+        appendInstallLog(`Speech installation failed: ${installError}`);
+        return null;
+      })
+      .finally(() => {
+        installing = false;
+        installPromise = null;
+        // Only auto-start when the environment is genuinely complete. This
+        // makes first launch hands-free after the packages finish downloading.
+        if (venvReady()) {
+          setTimeout(() => {
+            void prepare().catch(() => null);
+          }, 250);
+        }
+      });
+    return installPromise;
   }
 
   function resolveScript() {
@@ -118,6 +299,14 @@ export function createSpeechService({ dataDir, getConfig }) {
       pythonFound: Boolean(python),
       scriptFound: Boolean(script),
       controlFile,
+      venv: venvDir,
+      venvPython,
+      venvReady: venvReady(),
+      installing,
+      installProgress,
+      installError,
+      installDoneAt,
+      installLog: installLog.slice(-30),
       error: lastError,
       log: logTail.slice(-25),
     };
@@ -187,6 +376,10 @@ export function createSpeechService({ dataDir, getConfig }) {
   }
 
   function ensureOverlay() {
+    // The bundled Tk overlay uses Win32 click-through/transparency APIs. On
+    // Linux the microphone still works through the applet and the control
+    // file; avoid opening a non-click-through stray window.
+    if (process.platform !== "win32") return;
     if (overlayChild) return;
     const python = resolvePython();
     const script = resolveScript();
@@ -222,6 +415,20 @@ export function createSpeechService({ dataDir, getConfig }) {
       return status();
     }
     disabled = false;
+    if (!runtimeAvailable()) {
+      if (installing) {
+        lastError = "The Creator Studio speech engine is installing in the background. This happens once.";
+        return status();
+      }
+      if (installError && Date.now() - lastInstallAttemptAt < INSTALL_RETRY_MS) {
+        lastError = installError;
+        return status();
+      }
+      lastError = "Preparing the Creator Studio speech engine. This happens once.";
+      installProgress = 2;
+      void provisionRuntime();
+      return status();
+    }
     if (!overlayChild) {
       killStaleOverlays();
       ensureOverlay();
@@ -248,7 +455,7 @@ export function createSpeechService({ dataDir, getConfig }) {
       return status();
     }
     if (!python) {
-      lastError = "The Creator Studio speech environment is missing. Run tools/speech/setup.bat, or set TWIX_PYTHON.";
+      lastError = "The Creator Studio speech environment is missing. It is prepared automatically on first launch; you can also run tools/speech/setup.bat or setup.sh, or set TWIX_PYTHON.";
       return status();
     }
     starting = true;
@@ -324,6 +531,13 @@ export function createSpeechService({ dataDir, getConfig }) {
   }
 
   async function start() {
+    if (installing) {
+      return {
+        ...status(),
+        ok: false,
+        error: `The speech engine is installing (${installProgress}%). Try again when it finishes.`,
+      };
+    }
     const prepared = await prepare();
     if (disabled) {
       return { ...prepared, ok: false, error: "The microphone is disabled in Settings." };
@@ -377,10 +591,24 @@ export function createSpeechService({ dataDir, getConfig }) {
     }
     ready = false;
     starting = false;
+    if (installError) {
+      installError = "";
+      lastInstallAttemptAt = 0;
+    }
     return prepare();
   }
 
   function listDevices() {
+    if (installing) {
+      return { ok: false, error: `The speech engine is installing (${installProgress}%).`, devices: [] };
+    }
+    if (!runtimeAvailable()) {
+      return {
+        ok: false,
+        error: installError || "The speech engine is being prepared. Try again in a moment.",
+        devices: [],
+      };
+    }
     const python = resolvePython();
     const script = resolveScript();
     if (!python || !script) {

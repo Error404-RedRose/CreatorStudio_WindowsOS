@@ -123,12 +123,39 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
       try {
         exePath = fs.realpathSync(exePath);
       } catch {}
-      const installDir = path.dirname(exePath);
+      let installDir = path.dirname(exePath);
+      if (process.platform === "linux") {
+        // If the app was launched through a system Electron or a NixOS wrapper,
+        // app.getPath("exe") can point outside the Creator Studio folder. The
+        // packaged resources/app layout always identifies the real install
+        // folder, so prefer it when it contains the Creator Studio binary.
+        try {
+          const packagedAppDir = path.dirname(__dirname); // <install>/resources/app
+          const packagedInstallDir = path.dirname(path.dirname(packagedAppDir)); // <install>
+          const packagedExe = path.join(packagedInstallDir, UPDATE_EXE_NAME);
+          if (
+            fs.existsSync(packagedExe) &&
+            fs.existsSync(path.join(packagedAppDir, "package.json"))
+          ) {
+            installDir = packagedInstallDir;
+            exePath = packagedExe;
+          }
+        } catch {}
+      }
       if (!fs.existsSync(installDir)) {
         return { ok: false, error: "The application folder could not be found." };
       }
       if (!fs.existsSync(exePath)) {
         return { ok: false, error: "The running executable could not be found." };
+      }
+      try {
+        fs.accessSync(installDir, fs.constants.W_OK);
+      } catch {
+        const hint =
+          process.platform === "linux"
+            ? " Creator Studio is running from a read-only location (common on NixOS or a system folder). Move the whole Creator Studio folder into your home directory, then use Update again."
+            : " Move Creator Studio into a folder you can write to, then try again.";
+        return { ok: false, error: `The application folder is not writable.${hint}` };
       }
 
       const helperSource =

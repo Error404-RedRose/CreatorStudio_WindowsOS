@@ -131,6 +131,14 @@ try {
   Start-Sleep -Milliseconds 800
   $InstallDir = (Resolve-Path -LiteralPath $InstallDir).Path
   $parent = Split-Path -Parent $InstallDir
+  if ([string]::IsNullOrWhiteSpace($parent)) {
+    throw "Refusing to update a filesystem root."
+  }
+  $existingPackage = Join-Path $InstallDir "resources\app\package.json"
+  $existingMain = Join-Path $InstallDir "resources\app\electron\main.cjs"
+  if (-not (Test-Path -LiteralPath $existingPackage) -or -not (Test-Path -LiteralPath $existingMain)) {
+    throw ("This folder does not look like a Creator Studio installation: " + $InstallDir + ". Nothing was changed.")
+  }
 
   # The update console is often started from the application folder, which makes
   # that folder the process working directory. Windows cannot rename a directory

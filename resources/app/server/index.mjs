@@ -5069,11 +5069,24 @@ app.post("/api/hub/claim", async (req, res) => {
 /* API: coding workspace                                               */
 /* ------------------------------------------------------------------ */
 
+function expandUserPath(value) {
+  let text = String(value || "").trim();
+  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+    text = text.slice(1, -1).trim();
+  }
+  if (text === "~") return os.homedir();
+  if (text.startsWith("~/") || text.startsWith("~\\")) {
+    return path.join(os.homedir(), text.slice(2));
+  }
+  return text;
+}
+
 function resolveCodingRoot(dir) {
-  if (!dir) throw new Error("Workspace directory is required");
-  const root = path.resolve(String(dir));
+  const expanded = expandUserPath(dir);
+  if (!expanded) throw new Error("Workspace directory is required");
+  const root = path.resolve(expanded);
   if (!fssync.existsSync(root) || !fssync.statSync(root).isDirectory()) {
-    throw new Error("Workspace directory does not exist");
+    throw new Error(`Workspace directory does not exist: ${root}`);
   }
   return root;
 }

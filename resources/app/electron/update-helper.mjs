@@ -33,6 +33,7 @@ const repo = arg("--repo");
 const branch = arg("--branch", "main");
 const parentPid = Number(arg("--parent-pid", "0"));
 const expectedVersion = arg("--expected-version");
+const noStart = args.includes("--no-start");
 const minExeBytes = 50 * 1024 * 1024;
 
 const stateHome = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
@@ -68,23 +69,36 @@ async function waitForParent(pid) {
 }
 
 async function download(url, destination, timeoutMs = 15 * 60 * 1000) {
-  const response = await fetch(url, {
-    redirect: "follow",
-    signal: AbortSignal.timeout(timeoutMs),
-    headers: { "User-Agent": "Creator-Studio-Updater" },
-  });
-  if (!response.ok || !response.body) {
-    throw new Error(`Download failed (HTTP ${response.status}): ${url}`);
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch(url, {
+        redirect: "follow",
+        signal: AbortSignal.timeout(timeoutMs),
+        headers: { "User-Agent": "Creator-Studio-Updater" },
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`Download failed (HTTP ${response.status}): ${url}`);
+      }
+      await fs.mkdir(path.dirname(destination), { recursive: true });
+      await fs.rm(destination, { force: true });
+      await new Promise((resolve, reject) => {
+        const output = fssync.createWriteStream(destination);
+        Readable.fromWeb(response.body).pipe(output);
+        output.on("finish", resolve);
+        output.on("error", reject);
+        response.body.on?.("error", reject);
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) {
+        log(`Download attempt ${attempt} failed (${error.message}); retrying...`);
+        await sleep(2000 * attempt);
+      }
+    }
   }
-  await fs.mkdir(path.dirname(destination), { recursive: true });
-  await fs.rm(destination, { force: true });
-  await new Promise((resolve, reject) => {
-    const output = fssync.createWriteStream(destination);
-    Readable.fromWeb(response.body).pipe(output);
-    output.on("finish", resolve);
-    output.on("error", reject);
-    response.body.on?.("error", reject);
-  });
+  throw lastError;
 }
 
 async function extractZip(archive, destination) {
@@ -214,6 +228,7 @@ async function startApp(executable, workingDirectory) {
     stdio: "ignore",
     env: { ...process.env, TWIX_UPDATED: "1" },
   });
+  child.on("error", (error) => log(`Could not start ${executable}: ${error.message}`));
   child.unref();
 }
 
@@ -222,8 +237,26 @@ async function main() {
   log(`Install folder: ${installDir}`);
   log(`Repository: ${repo} (${branch})`);
   if (!repo) throw new Error("No update repository was supplied.");
+  if (!installDir || installDir === path.parse(installDir).root) {
+    throw new Error("Refusing to update a filesystem root.");
+  }
+  const appPackage = path.join(installDir, "resources", "app", "package.json");
+  const appMain = path.join(installDir, "resources", "app", "electron", "main.cjs");
+  if (!fssync.existsSync(appPackage) || !fssync.existsSync(appMain)) {
+    throw new Error(
+      `This folder does not look like a Creator Studio installation: ${installDir}. Nothing was changed.`,
+    );
+  }
 
   await waitForParent(parentPid);
+  try {
+    await fs.access(installDir, fssync.constants.W_OK);
+    await fs.access(path.dirname(installDir), fssync.constants.W_OK);
+  } catch {
+    throw new Error(
+      `The application folder is not writable: ${installDir}. Move the whole Creator Studio folder into your home directory and use Update again.`,
+    );
+  }
   const parent = path.dirname(installDir);
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const work = path.join(parent, `.creator-studio-update-${stamp}`);
@@ -273,8 +306,13 @@ async function main() {
     }
     const newExecutable = path.join(installDir, path.basename(executable));
     chmodExecutables(installDir, path.basename(executable));
-    log(`Starting ${newExecutable}`);
-    await startApp(newExecutable, installDir);
+    log(`Installed the new build at ${installDir}`);
+    if (noStart) {
+      log("Skipping launch because --no-start was supplied.");
+    } else {
+      log(`Starting ${newExecutable}`);
+      await startApp(newExecutable, installDir);
+    }
     log("Update complete. Previous build kept at " + backup);
     await fs.rm(work, { recursive: true, force: true }).catch(() => {});
     process.exit(0);
@@ -285,8 +323,10 @@ async function main() {
         await fs.rename(backup, installDir);
         log("Restored the previous build.");
       }
-      const oldExecutable = path.join(installDir, exeName);
-      if (fssync.existsSync(oldExecutable)) await startApp(oldExecutable, installDir);
+      if (!noStart) {
+        const oldExecutable = path.join(installDir, exeName);
+        if (fssync.existsSync(oldExecutable)) await startApp(oldExecutable, installDir);
+      }
     } catch (restoreError) {
       log(`Could not restore the previous build: ${restoreError.message}`);
     }

@@ -18,6 +18,15 @@ if (process.platform === "linux") app.commandLine.appendSwitch("no-sandbox");
 
 app.setName("Creator Studio");
 app.setAppUserModelId("com.twilightstudio.creatorstudio3d");
+if (process.platform === "linux") {
+  // Makes notifications and the window manager associate the process with the
+  // installed desktop entry instead of the generic Electron app.
+  try {
+    app.setDesktopName("creator-studio.desktop");
+  } catch {}
+}
+
+const isLinux = process.platform === "linux";
 
 let mainWindow = null;
 let overlayWindow = null;
@@ -184,24 +193,40 @@ async function createOverlayWindow() {
 async function createWindow() {
   const display = screen.getPrimaryDisplay();
   const workArea = display.workArea;
+  // Linux keeps the same two-header design as Windows, but the window is
+  // resizable and maximizable so it behaves like a normal desktop application.
+  // The branded title bar is rendered by the app, so it is always present even
+  // on tiling window managers that draw no native decorations.
+  const chromeOptions = isLinux
+    ? {
+        frame: false,
+        thickFrame: false,
+        hasShadow: false,
+        resizable: true,
+        maximizable: true,
+        fullscreenable: true,
+        autoHideMenuBar: true,
+      }
+    : {
+        frame: false,
+        thickFrame: false,
+        hasShadow: false,
+        titleBarStyle: "hidden",
+        resizable: false,
+        maximizable: false,
+        fullscreenable: false,
+      };
   mainWindow = new BrowserWindow({
     x: workArea.x,
     y: workArea.y,
-    width: workArea.width,
-    height: workArea.height,
+    width: Math.max(1024, workArea.width),
+    height: Math.max(640, workArea.height),
     minWidth: 1024,
     minHeight: 640,
     show: false,
     icon: path.join(appRoot, "build", process.platform === "win32" ? "icon.ico" : "icon.png"),
-    frame: false,
-    thickFrame: false,
-    hasShadow: false,
-    titleBarStyle: "hidden",
     backgroundColor: "#0b0a12",
-    autoHideMenuBar: true,
-    resizable: false,
-    maximizable: false,
-    fullscreenable: false,
+    ...chromeOptions,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -212,8 +237,17 @@ async function createWindow() {
   });
 
   mainWindow.setMenuBarVisibility(false);
-  mainLog("info", "electron", "window created", { dev: isDev, target: isDev ? "http://localhost:5173" : `http://127.0.0.1:${serverPort}` });
+  mainWindow.setTitle("Creator Studio");
+  mainLog("info", "electron", "window created", { dev: isDev, platform: process.platform, target: isDev ? "http://localhost:5173" : `http://127.0.0.1:${serverPort}` });
   mainWindow.once("ready-to-show", () => {
+    if (isLinux) {
+      // The app's own title bar is always rendered on Linux. Maximizing gives
+      // the same full-workspace feel as Windows without hiding that header.
+      mainWindow.show();
+      mainWindow.maximize();
+      mainWindow.focus();
+      return;
+    }
     // Do not call maximize() on a frameless window: Windows adds an invisible
     // resize border that leaves a 1px desktop gap above the taskbar.
     mainWindow.setResizable(false);
@@ -258,6 +292,13 @@ async function createWindow() {
 function fillWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   if (mainWindow.isMinimized()) mainWindow.restore();
+  if (isLinux) {
+    if (mainWindow.isMaximized()) mainWindow.unmaximize();
+    else mainWindow.maximize();
+    mainWindow.show();
+    mainWindow.focus();
+    return;
+  }
   const bounds = mainWindow.getBounds();
   const display = screen.getDisplayMatching(bounds);
   const area = display.workArea;
@@ -280,7 +321,11 @@ ipcMain.on("win:close", () => app.quit());
 ipcMain.on("win:home", () => mainWindow?.webContents.send("twix:home"));
 ipcMain.handle("dialog:openDirectory", async () => {
   if (!mainWindow) return null;
-  const result = await dialog.showOpenDialog(mainWindow, { properties: ["openDirectory", "createDirectory"] });
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "Select a coding workspace",
+    defaultPath: app.getPath("documents"),
+    properties: ["openDirectory", "createDirectory"],
+  });
   return result.canceled || !result.filePaths.length ? null : result.filePaths[0];
 });
 ipcMain.handle("shell:openPath", async (_event, target) => {
