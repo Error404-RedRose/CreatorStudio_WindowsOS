@@ -28,6 +28,13 @@ if (process.platform === "linux") {
 
 const isLinux = process.platform === "linux";
 
+if (isLinux && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+  console.error(
+    "Creator Studio needs a graphical desktop session (X11 or Wayland). Launch it from your applications menu or a desktop terminal, not from SSH or a background service.",
+  );
+  app.exit(1);
+}
+
 let mainWindow = null;
 let overlayWindow = null;
 let overlayTimer = null;
@@ -190,6 +197,35 @@ async function createOverlayWindow() {
   }, 300);
 }
 
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    if (isLinux) {
+      // Some Linux window managers ignore or unmap a frameless window that is
+      // maximized before it has been mapped. Show it first at a normal size;
+      // the user can maximize it with the app's own title bar.
+      const area = screen.getPrimaryDisplay().workArea;
+      const width = Math.min(1400, Math.max(1024, Math.round((area.width || 1440) * 0.9)));
+      const height = Math.min(900, Math.max(640, Math.round((area.height || 900) * 0.9)));
+      mainWindow.setSize(width, height);
+      mainWindow.center();
+      mainWindow.show();
+      mainWindow.focus();
+      return;
+    }
+    mainWindow.setResizable(false);
+    const bounds = mainWindow.getBounds();
+    const display = screen.getDisplayMatching(bounds);
+    const area = display.workArea;
+    mainWindow.setBounds({ x: area.x, y: area.y, width: area.width + 1, height: area.height + 1 }, false);
+    mainWindow.show();
+    mainWindow.focus();
+  } catch (error) {
+    mainLog("warning", "electron", "show window failed", { message: error?.message });
+  }
+}
+
 async function createWindow() {
   const display = screen.getPrimaryDisplay();
   const workArea = display.workArea;
@@ -239,24 +275,16 @@ async function createWindow() {
   mainWindow.setMenuBarVisibility(false);
   mainWindow.setTitle("Creator Studio");
   mainLog("info", "electron", "window created", { dev: isDev, platform: process.platform, target: isDev ? "http://localhost:5173" : `http://127.0.0.1:${serverPort}` });
-  mainWindow.once("ready-to-show", () => {
-    if (isLinux) {
-      // The app's own title bar is always rendered on Linux. Maximizing gives
-      // the same full-workspace feel as Windows without hiding that header.
-      mainWindow.show();
-      mainWindow.maximize();
-      mainWindow.focus();
-      return;
-    }
-    // Do not call maximize() on a frameless window: Windows adds an invisible
-    // resize border that leaves a 1px desktop gap above the taskbar.
-    mainWindow.setResizable(false);
-    const fill = { x: workArea.x, y: workArea.y, width: workArea.width + 1, height: workArea.height + 1 };
-    mainWindow.setBounds(fill, false);
-    mainWindow.show();
-    mainWindow.setBounds(fill, false);
-    mainWindow.focus();
+  mainWindow.once("ready-to-show", showMainWindow);
+  mainWindow.webContents.on("did-finish-load", showMainWindow);
+  mainWindow.webContents.on("did-fail-load", (_event, code, description, url) => {
+    mainLog("warning", "electron", "page load failed", { code, description, url });
+    showMainWindow();
   });
+  // Never leave a running process with no visible window if ready-to-show is
+  // missed by a Linux compositor or GPU driver.
+  const showFallback = setTimeout(showMainWindow, 1800);
+  mainWindow.on("closed", () => clearTimeout(showFallback));
 
   mainWindow.webContents.on("render-process-gone", (_event, details) => mainLog("error", "electron", "render-process-gone", details));
   mainWindow.webContents.on("unresponsive", () => mainLog("warning", "electron", "window unresponsive"));
@@ -264,6 +292,18 @@ async function createWindow() {
     if (/^https?:/i.test(url)) shell.openExternal(url);
     return { action: "deny" };
   });
+
+  // Show a local loading page immediately. The backend can take a while to
+  // start (or fail), and an invisible window during that wait looks like a
+  // background process that did nothing.
+  try {
+    await mainWindow.loadURL(
+      `data:text/html;charset=utf-8,${encodeURIComponent(
+        `<body style="margin:0;background:#0b0a12;color:#ece8fa;font-family:Segoe UI,sans-serif;display:grid;place-items:center;height:100vh"><div style="max-width:560px;text-align:center"><h1 style="font-weight:600">Creator Studio</h1><p style="color:#9b95b2;line-height:1.6">Starting Creator Studio…</p></div></body>`,
+      )}`,
+    );
+  } catch {}
+  showMainWindow();
 
   const target = isDev ? "http://localhost:5173" : `http://127.0.0.1:${serverPort}`;
   const ready = await waitForServer(isDev ? target : `http://127.0.0.1:${serverPort}`, isDev ? 30000 : 60000);
@@ -279,6 +319,7 @@ async function createWindow() {
       )}`,
     );
   }
+  showMainWindow();
 
   mainWindow.on("closed", () => {
     if (overlayTimer) clearInterval(overlayTimer);
@@ -390,10 +431,14 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on("second-instance", () => {
-    if (mainWindow) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
       if (mainWindow.isMinimized()) mainWindow.restore();
+      if (!mainWindow.isVisible()) mainWindow.show();
       mainWindow.focus();
+      showMainWindow();
+      return;
     }
+    if (app.isReady()) void createWindow();
   });
 
   mainLog("info", "electron", "app ready", { version: app.getVersion(), electron: process.versions.electron, userData: app.getPath("userData") });

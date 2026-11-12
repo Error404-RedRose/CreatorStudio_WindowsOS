@@ -1896,9 +1896,48 @@ function launchOpenCodeProcess({ executable, cwd, env, state }) {
     env,
     windowsHide: true,
   });
+  let logBuffer = "";
   const capture = (data) => {
     pushLog(state.logs, data);
     for (const url of listeningUrlsFromText(data)) state.discoveredUrls.add(url);
+    logBuffer += String(data || "");
+    const lines = logBuffer.split(/\r?\n/);
+    logBuffer = lines.pop() || "";
+    for (const line of lines) {
+      const providerError = extractOpenCodeProviderError(line);
+      if (!providerError) continue;
+      const dedupeKey = `${providerError.sessionID}|${providerError.message}`;
+      if (
+        state.lastProviderError === dedupeKey &&
+        Date.now() - (state.lastProviderErrorAt || 0) < 5000
+      ) {
+        continue;
+      }
+      state.lastProviderError = dedupeKey;
+      state.lastProviderErrorAt = Date.now();
+      if (!Array.isArray(state.providerErrors)) state.providerErrors = [];
+      state.providerErrors.push({ ...providerError, at: Date.now() });
+      if (state.providerErrors.length > 50) {
+        state.providerErrors.splice(0, state.providerErrors.length - 50);
+      }
+      log("warning", state.channel || "opencode", "provider stream error", {
+        sessionID: providerError.sessionID || null,
+        message: providerError.message,
+      });
+      if (state.projectId) {
+        broadcast(state.projectId, {
+          type: state.channel === "coding" ? "coding.event" : "opencode.event",
+          event: {
+            type: "session.error",
+            properties: {
+              sessionID: providerError.sessionID || null,
+              error: { data: { message: providerError.message } },
+            },
+          },
+        });
+      }
+    }
+    if (logBuffer.length > 8000) logBuffer = "";
   };
   proc.stdout?.on("data", capture);
   proc.stderr?.on("data", capture);
@@ -2295,6 +2334,27 @@ function pushLog(logs, data) {
   if (logs.length > 200) logs.splice(0, logs.length - 200);
 }
 
+function extractOpenCodeProviderError(line) {
+  const text = String(line || "");
+  if (!/stream error|AI_APICallError|free usage limit|insufficient balance|rate limit/i.test(text)) {
+    return null;
+  }
+  const sessionID = /session\.id=([A-Za-z0-9_-]+)/.exec(text)?.[1] || "";
+  const match = /error\.error="([^"]+)"/.exec(text) || /error="([^"]+)"/.exec(text);
+  let message = match ? match[1] : text;
+  if (/free usage limit reached/i.test(message)) {
+    message =
+      "OpenCode Zen free usage limit reached. Free models work in the OpenCode app, but continued API use needs OpenCode Go (https://opencode.ai/go) or another provider. Choose an OpenCode Go or local model to keep working.";
+  } else if (/insufficient balance/i.test(message)) {
+    message = "The model provider reports insufficient balance. Top up that provider or choose another model.";
+  } else if (/rate limit/i.test(message)) {
+    message = "The model provider rate limit was reached. Wait a moment or choose another model.";
+  } else {
+    message = message.replace(/^AI_APICallError:\s*/i, "");
+  }
+  return { sessionID, message };
+}
+
 function basicAuth(auth) {
   return `Basic ${Buffer.from(`${auth.username}:${auth.password}`).toString("base64")}`;
 }
@@ -2321,6 +2381,58 @@ async function ocFetch(state, pathname, options = {}) {
   if (res.status === 204) return null;
   const type = res.headers.get("content-type") || "";
   return type.includes("application/json") ? res.json() : res.text();
+}
+
+async function ocFetchWithProviderWatch(state, sessionId, pathname, options = {}) {
+  const controller = new AbortController();
+  const external = options.signal;
+  const forwardAbort = () => controller.abort();
+  try {
+    external?.addEventListener?.("abort", forwardAbort);
+  } catch {}
+  let providerError = "";
+  const startedAt = Date.now();
+  const logStart = state.logs.length;
+  const watcher = setInterval(() => {
+    const known = (state.providerErrors || []).find(
+      (item) => item.sessionID === sessionId && item.at >= startedAt - 1000,
+    );
+    if (known) {
+      providerError = known.message;
+      controller.abort();
+      return;
+    }
+    const recent = state.logs.slice(Math.max(0, logStart - 10));
+    for (const line of recent) {
+      const parsed = extractOpenCodeProviderError(line);
+      if (!parsed) continue;
+      if (parsed.sessionID && parsed.sessionID !== sessionId) continue;
+      providerError = parsed.message;
+      controller.abort();
+      return;
+    }
+  }, 250);
+  const timeout = setTimeout(() => {
+    providerError =
+      "The model did not answer within 120 seconds. The provider may be unavailable or out of quota. Choose another model and try again.";
+    controller.abort();
+  }, 120000);
+  try {
+    return await ocFetch(state, pathname, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (providerError) {
+      const wrapped = new Error(providerError);
+      wrapped.code = "OPENCODE_PROVIDER_ERROR";
+      throw wrapped;
+    }
+    throw error;
+  } finally {
+    clearInterval(watcher);
+    clearTimeout(timeout);
+    try {
+      external?.removeEventListener?.("abort", forwardAbort);
+    } catch {}
+  }
 }
 
 /**
@@ -2444,7 +2556,7 @@ async function ocSendMessage(state, { sessionId, title, body, signal }) {
     sessionId,
     title,
     run: (sid) =>
-      ocFetch(state, `/session/${sid}/message`, {
+      ocFetchWithProviderWatch(state, sid, `/session/${sid}/message`, {
         method: "POST",
         body: JSON.stringify(body),
         signal,
