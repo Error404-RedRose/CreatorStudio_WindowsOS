@@ -415,6 +415,19 @@ ipcMain.on("app:relaunch", () => {
 ipcMain.on("win:fill", fillWindow);
 ipcMain.on("win:close", () => app.quit());
 ipcMain.on("win:home", () => mainWindow?.webContents.send("twix:home"));
+ipcMain.on("app:set-zoom", (event, factor) => {
+  const value = Number(factor);
+  const scale = Number.isFinite(value) ? Math.min(1.5, Math.max(0.8, value)) : 1;
+  const win = BrowserWindow.fromWebContents(event.sender);
+  try {
+    win?.webContents.setZoomFactor(scale);
+  } catch (error) {
+    mainLog("warning", "appearance", "could not apply interface scale", {
+      scale,
+      message: error?.message || String(error),
+    });
+  }
+});
 ipcMain.handle("dialog:openDirectory", async () => {
   if (!mainWindow) return null;
   const result = await dialog.showOpenDialog(mainWindow, {

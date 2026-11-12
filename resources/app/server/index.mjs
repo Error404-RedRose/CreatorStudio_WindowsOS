@@ -604,6 +604,7 @@ const defaultSettings = () => ({
   backgroundSpeed: 1.5,
   backgroundZoomPct: 100,
   textScale: 1,
+  uiScale: 1,
   reducedMotion: false,
   soundEffects: true,
   soundVolume: 0.8,
@@ -1544,6 +1545,11 @@ async function writeAgentWorkspace(projectId, workspace) {
         enabled: true,
         timeout: 300000,
         environment: {
+          // OpenCode launches this MCP server with process.execPath, which is
+          // the Creator Studio Electron binary in a packaged build. Electron
+          // must run in Node mode or it will try to start a second GUI process
+          // and fail on Linux's Chromium sandbox before MCP can answer.
+          ELECTRON_RUN_AS_NODE: "1",
           TWIX_BRIDGE_URL: `http://127.0.0.1:${PORT}`,
           TWIX_BRIDGE_TOKEN: BRIDGE_TOKEN,
           TWIX_PROJECT_ID: projectId,
@@ -1555,6 +1561,7 @@ async function writeAgentWorkspace(projectId, workspace) {
         enabled: true,
         timeout: 300000,
         environment: {
+          ELECTRON_RUN_AS_NODE: "1",
           TWIX_CODING_ROOT: globalReferencesDir(),
           TWIX_CODING_TRUSTED: "1",
           TWIX_GITHUB_ONLY: "1",
@@ -2748,6 +2755,9 @@ async function writeCodingWorkspace(projectId, dir, trusted, unityPort = null) {
         enabled: true,
         timeout: 300000,
         environment: {
+          // Run the packaged Electron binary as Node so the MCP stdio server
+          // starts reliably on Linux instead of trying to open a second app.
+          ELECTRON_RUN_AS_NODE: "1",
           TWIX_CODING_ROOT: dir,
           TWIX_APP_ROOT: APP_ROOT,
           TWIX_CODING_TRUSTED: trusted ? "1" : "0",

@@ -1,6 +1,6 @@
 # Creator Studio
 
-**By Twilight Studio** · Version **0.14.0-beta.4** · Windows x64
+**By Twilight Studio** · Version **0.14.0-beta.5** · Windows x64
 
 A native Windows creative workspace where AI agents and manual tools share the same project.
 Model in 3D, simulate cloth, format writing, code with an AI agent, drive a live Unity Editor,
@@ -95,6 +95,13 @@ The application opens as a full-screen, frameless window with a custom title bar
 bar buttons for Home, minimize, and close.
 
 To move the app to another location, copy the **entire folder**, not just the executable.
+
+### Scale the interface
+
+Open **Settings > Appearance** and use **App scale** to resize the whole interface from 80% to
+150%. The setting is saved and applies to panels, dialogs, the launcher and the 3D viewport.
+**Ctrl + =**, **Ctrl + -** and **Ctrl + 0** also work from any applet. **Text scale** changes only
+the workspace text. Both Windows and Linux builds use the same controls.
 
 ---
 

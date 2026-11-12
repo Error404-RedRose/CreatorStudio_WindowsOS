@@ -222,13 +222,18 @@ async function startApp(executable, workingDirectory) {
   try {
     fssync.chmodSync(executable, 0o755);
   } catch {}
-  const child = spawn(executable, [], {
+  // Always prefer the launcher. It sets the SwiftShader/Vulkan environment
+  // that WebGL needs on NixOS and minimal distributions, so an in-app update
+  // must not reopen the raw binary and lose those flags.
+  const launcher = path.join(workingDirectory, "creator-studio-launcher");
+  const target = fssync.existsSync(launcher) ? launcher : executable;
+  const child = spawn(target, [], {
     cwd: workingDirectory,
     detached: true,
     stdio: "ignore",
     env: { ...process.env, TWIX_UPDATED: "1" },
   });
-  child.on("error", (error) => log(`Could not start ${executable}: ${error.message}`));
+  child.on("error", (error) => log(`Could not start ${target}: ${error.message}`));
   child.unref();
 }
 

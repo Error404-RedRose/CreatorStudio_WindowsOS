@@ -5,9 +5,12 @@ const UPDATE_REPOS = {
   linux: "Error404-RedRose/CreatorStudio_LinuxOS",
 };
 const UPDATE_BRANCH = "main";
+const UPDATE_CHANNEL = process.platform === "linux" ? "linux" : "windows";
 const UPDATE_REPO = UPDATE_REPOS[process.platform] || UPDATE_REPOS.win32;
 const UPDATE_REPO_URL = `https://github.com/${UPDATE_REPO}`;
+const UPDATE_RELEASES_URL = `${UPDATE_REPO_URL}/releases`;
 const UPDATE_PACKAGE_URL = `https://raw.githubusercontent.com/${UPDATE_REPO}/${UPDATE_BRANCH}/resources/app/package.json`;
+const UPDATE_PACKAGE_API_URL = `https://api.github.com/repos/${UPDATE_REPO}/contents/resources/app/package.json?ref=${UPDATE_BRANCH}`;
 const UPDATE_EXE_NAME = process.platform === "win32" ? "Creator Studio.exe" : "creator-studio";
 const CACHE_MS = 60 * 1000;
 
@@ -21,24 +24,55 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
   let cache = null;
   let cacheAt = 0;
 
-  async function fetchRemoteVersion() {
-    const response = await fetch(`${UPDATE_PACKAGE_URL}?t=${Date.now()}`, {
-      cache: "no-store",
-      signal: AbortSignal.timeout(12000),
-      headers: {
-        Accept: "application/json",
-        "User-Agent": "Creator-Studio-Updater",
-      },
-    });
-    if (!response.ok) {
-      throw new Error(`GitHub returned HTTP ${response.status}.`);
-    }
-    const payload = await response.json();
+  function parseRemoteVersion(payload) {
     const version = String(payload?.version || "").trim();
     if (!/^\d+\.\d+\.\d+/.test(version)) {
       throw new Error("The published version file is not valid.");
     }
     return version;
+  }
+
+  async function fetchRemoteVersion() {
+    let lastError = null;
+
+    // Read package.json through the GitHub Contents API first. Unlike
+    // raw.githubusercontent.com, this is tied to the current commit and does
+    // not serve a cached copy of the previous release after a push.
+    try {
+      const response = await fetch(`${UPDATE_PACKAGE_API_URL}&t=${Date.now()}`, {
+        cache: "no-store",
+        signal: AbortSignal.timeout(12000),
+        headers: {
+          Accept: "application/vnd.github.raw+json",
+          "User-Agent": "Creator-Studio-Updater",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+      });
+      if (response.ok) {
+        return parseRemoteVersion(JSON.parse(await response.text()));
+      }
+      lastError = new Error(`GitHub returned HTTP ${response.status}.`);
+    } catch (error) {
+      lastError = error;
+    }
+
+    // Fallback for API rate limits or a temporary Contents API outage.
+    try {
+      const response = await fetch(`${UPDATE_PACKAGE_URL}?t=${Date.now()}`, {
+        cache: "no-store",
+        signal: AbortSignal.timeout(12000),
+        headers: {
+          Accept: "application/json",
+          "User-Agent": "Creator-Studio-Updater",
+        },
+      });
+      if (!response.ok) {
+        throw new Error(`GitHub returned HTTP ${response.status}.`);
+      }
+      return parseRemoteVersion(await response.json());
+    } catch (error) {
+      throw lastError || error;
+    }
   }
 
   async function checkForUpdates(force = false) {
@@ -49,10 +83,12 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
       return {
         mode,
         platform: process.platform,
+        channel: UPDATE_CHANNEL,
         currentVersion,
         updateAvailable: false,
         updateDisabled: true,
         repoUrl: UPDATE_REPO_URL,
+        releasesUrl: UPDATE_RELEASES_URL,
         reason:
           mode === "dev"
             ? "Updates are disabled when running the development build."
@@ -69,10 +105,12 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
       const result = {
         mode,
         platform: process.platform,
+        channel: UPDATE_CHANNEL,
         currentVersion,
         remoteVersion,
         updateAvailable: compareVersions(remoteVersion, currentVersion) > 0,
         repoUrl: UPDATE_REPO_URL,
+        releasesUrl: UPDATE_RELEASES_URL,
         checkedAt: new Date().toISOString(),
       };
       cache = result;
@@ -81,6 +119,8 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
         currentVersion,
         remoteVersion,
         updateAvailable: result.updateAvailable,
+        channel: UPDATE_CHANNEL,
+        repo: UPDATE_REPO,
       });
       return result;
     } catch (error) {
@@ -89,9 +129,11 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
       return {
         mode,
         platform: process.platform,
+        channel: UPDATE_CHANNEL,
         currentVersion,
         updateAvailable: false,
         repoUrl: UPDATE_REPO_URL,
+        releasesUrl: UPDATE_RELEASES_URL,
         error: message,
         checkedAt: new Date().toISOString(),
       };
@@ -270,8 +312,11 @@ module.exports = {
   compareVersions,
   UPDATE_REPOS,
   UPDATE_REPO,
+  UPDATE_CHANNEL,
   UPDATE_REPO_URL,
+  UPDATE_RELEASES_URL,
   UPDATE_PACKAGE_URL,
+  UPDATE_PACKAGE_API_URL,
   UPDATE_BRANCH,
   UPDATE_EXE_NAME,
 };
