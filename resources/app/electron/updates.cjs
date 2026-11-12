@@ -1,4 +1,7 @@
 const { compareVersions } = require("./version.cjs");
+const { spawnSync } = require("node:child_process");
+const os = require("node:os");
+const path = require("node:path");
 
 const UPDATE_REPOS = {
   win32: "Error404-RedRose/CreatorStudio_WindowsOS",
@@ -23,6 +26,156 @@ function currentMode(app) {
 function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
   let cache = null;
   let cacheAt = 0;
+
+  const linuxStateDir =
+    process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
+  const linuxUpdateStatusFile = path.join(linuxStateDir, "creator-studio", "update-status.json");
+
+  function readLinuxUpdateStatus() {
+    if (process.platform !== "linux") return null;
+    try {
+      const status = JSON.parse(fs.readFileSync(linuxUpdateStatusFile, "utf8"));
+      return status && typeof status === "object" ? status : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function lastUpdateError() {
+    const status = readLinuxUpdateStatus();
+    if (!status || status.status !== "failed") return null;
+    return {
+      message: String(status.message || "The last update attempt failed.").slice(0, 800),
+      at: String(status.at || ""),
+      logPath: String(status.logPath || ""),
+    };
+  }
+
+  function linuxUpdateLaunchFiles() {
+    return {
+      logFile: path.join(app.getPath("userData"), "data", "logs", "linux-update-launch.log"),
+      statusFile: linuxUpdateStatusFile,
+    };
+  }
+
+  function linuxSystemdRun() {
+    const candidates = [
+      "systemd-run",
+      "/usr/bin/systemd-run",
+      "/run/current-system/sw/bin/systemd-run",
+      "/usr/local/bin/systemd-run",
+    ];
+    for (const candidate of candidates) {
+      try {
+        const result = spawnSync(candidate, ["--version"], {
+          encoding: "utf8",
+          timeout: 4000,
+          windowsHide: true,
+        });
+        if (result.status === 0) return candidate;
+      } catch {}
+    }
+    return "";
+  }
+
+  function linuxServiceEnvironment() {
+    const keys = [
+      "HOME",
+      "USER",
+      "LOGNAME",
+      "PATH",
+      "DISPLAY",
+      "WAYLAND_DISPLAY",
+      "XAUTHORITY",
+      "XDG_RUNTIME_DIR",
+      "DBUS_SESSION_BUS_ADDRESS",
+      "XDG_SESSION_TYPE",
+      "XDG_CURRENT_DESKTOP",
+      "XDG_STATE_HOME",
+      "XDG_CONFIG_HOME",
+      "XDG_DATA_HOME",
+      "XDG_CACHE_HOME",
+      "TMPDIR",
+      "LANG",
+      "LC_ALL",
+    ];
+    const args = [];
+    for (const key of keys) {
+      const value = process.env[key];
+      if (value) args.push(`--setenv=${key}=${value}`);
+    }
+    args.push("--setenv=ELECTRON_RUN_AS_NODE=1");
+    return args;
+  }
+
+  /**
+   * Run the Linux updater outside this application's systemd cgroup. Desktop
+   * launchers on Arch and NixOS commonly put Creator Studio in a transient
+   * scope, and a normal detached child is killed when that scope stops. A
+   * transient user service survives the app exit and can finish the download
+   * and folder swap.
+   */
+  function launchLinuxUpdateHelper(helperSource, helperArgs) {
+    const files = linuxUpdateLaunchFiles();
+    const systemdRun = linuxSystemdRun();
+    if (systemdRun) {
+      const unit = `creator-studio-update-${process.pid}-${Date.now()}`;
+      const args = [
+        "--user",
+        "--no-block",
+        "--collect",
+        `--unit=${unit}`,
+        "--description=Creator Studio update",
+        ...linuxServiceEnvironment(),
+        process.execPath,
+        ...helperArgs,
+      ];
+      const result = spawnSync(systemdRun, args, {
+        encoding: "utf8",
+        timeout: 15000,
+        windowsHide: true,
+      });
+      if (result.status === 0) {
+        return {
+          launched: true,
+          method: "systemd-run",
+          unit,
+          detail: String(result.stdout || "").trim(),
+          ...files,
+        };
+      }
+      mainLog("warning", "updates", "systemd update launcher failed; using detached fallback", {
+        status: result.status,
+        error: result.error?.message || "",
+        stderr: String(result.stderr || "").slice(-1200),
+        stdout: String(result.stdout || "").slice(-400),
+      });
+    }
+
+    let logFd = null;
+    try {
+      fs.mkdirSync(path.dirname(files.logFile), { recursive: true });
+      logFd = fs.openSync(files.logFile, "a");
+    } catch {}
+    const child = spawn(process.execPath, helperArgs, {
+      cwd: app.getPath("temp"),
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+      detached: true,
+      stdio: logFd ? ["ignore", logFd, logFd] : "ignore",
+    });
+    child.unref();
+    if (logFd) {
+      try {
+        fs.closeSync(logFd);
+      } catch {}
+    }
+    return {
+      launched: Boolean(child.pid),
+      method: "detached",
+      pid: child.pid || null,
+      ...files,
+    };
+  }
 
   function parseRemoteVersion(payload) {
     const version = String(payload?.version || "").trim();
@@ -112,6 +265,7 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
         repoUrl: UPDATE_REPO_URL,
         releasesUrl: UPDATE_RELEASES_URL,
         checkedAt: new Date().toISOString(),
+        lastUpdateError: lastUpdateError(),
       };
       cache = result;
       cacheAt = Date.now();
@@ -136,6 +290,7 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
         releasesUrl: UPDATE_RELEASES_URL,
         error: message,
         checkedAt: new Date().toISOString(),
+        lastUpdateError: lastUpdateError(),
       };
     }
   }
@@ -208,8 +363,8 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
         return { ok: false, error: "The update helper is missing from this build." };
       }
 
-      let child;
       let helper = helperSource;
+      let launch = null;
       if (process.platform === "win32") {
         const tempRoot = fs.mkdtempSync(path.join(app.getPath("temp"), "creator-studio-update-"));
         helper = path.join(tempRoot, "update-helper.ps1");
@@ -226,49 +381,48 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
         ];
         fs.writeFileSync(launcher, lines.join("\r\n"), "utf8");
 
-        child = spawn("cmd.exe", ["/c", "start", "", launcher], {
+        const child = spawn("cmd.exe", ["/c", "start", "", launcher], {
           cwd: app.getPath("temp"),
           detached: true,
           stdio: "ignore",
           windowsHide: false,
         });
+        child.unref();
+        if (!child.pid) {
+          return { ok: false, error: "The update process could not be started." };
+        }
+        launch = { launched: true, method: "powershell", pid: child.pid };
       } else {
         try {
           require.resolve("adm-zip");
         } catch {
           return { ok: false, error: "The Linux update dependency (adm-zip) is missing from this build." };
         }
-        // Run the updater with the current Electron binary in Node mode. This
-        // keeps the Linux updater dependency-free while still allowing it to
-        // use adm-zip from the packaged app and replace the folder after quit.
-        child = spawn(
-          process.execPath,
-          [
-            helperSource,
-            "--install-dir",
-            installDir,
-            "--exe-name",
-            UPDATE_EXE_NAME,
-            "--repo",
-            UPDATE_REPO,
-            "--branch",
-            UPDATE_BRANCH,
-            "--parent-pid",
-            String(process.pid),
-            "--expected-version",
-            String(status.remoteVersion || ""),
-          ],
-          {
-            cwd: app.getPath("temp"),
-            env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
-            detached: true,
-            stdio: "ignore",
-          },
-        );
-      }
-      child.unref();
-      if (!child.pid) {
-        return { ok: false, error: "The update process could not be started." };
+        // Run the updater with the current Electron binary in Node mode. On
+        // systemd desktops it is started as a transient user service so the
+        // desktop's application scope cannot kill it when Creator Studio exits.
+        const helperArgs = [
+          helperSource,
+          "--install-dir",
+          installDir,
+          "--exe-name",
+          UPDATE_EXE_NAME,
+          "--repo",
+          UPDATE_REPO,
+          "--branch",
+          UPDATE_BRANCH,
+          "--parent-pid",
+          String(process.pid),
+          "--expected-version",
+          String(status.remoteVersion || ""),
+        ];
+        launch = launchLinuxUpdateHelper(helperSource, helperArgs);
+        if (!launch.launched) {
+          return {
+            ok: false,
+            error: `The Linux update process could not be started. Open ${launch.logFile || "~/.local/state/creator-studio/update.log"} for details.`,
+          };
+        }
       }
 
       mainLog("info", "updates", "update started", {
@@ -277,6 +431,7 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
         remoteVersion: status.remoteVersion,
         installDir,
         helper,
+        launch,
       });
 
       setTimeout(() => {

@@ -4523,13 +4523,92 @@ app.get("/api/chat/channels", async (req, res) => {
 });
 
 const chatPresence = new Map();
+const CHAT_PRESENCE_TTL_MS = 90 * 1000;
 
 function chatPresenceList() {
   return [...chatPresence.values()].sort((a, b) => b.at - a.at);
 }
 
-app.get("/api/chat/presence", (req, res) => {
-  res.json({ ok: true, presence: chatPresenceList(), at: new Date().toISOString() });
+function chatPresenceEntry(raw) {
+  if (!raw) return null;
+  const username = String(raw.username || raw.u || "").trim();
+  if (!username) return null;
+  const at = Number(raw.at || raw.i || raw.ts || Date.parse(raw.__updated_at || "") || 0) || Date.now();
+  const online = raw.online !== false && String(raw.m || raw.msg || "").toLowerCase() !== "offline";
+  return {
+    username,
+    name: String(raw.name || username),
+    online: online && Date.now() - at < CHAT_PRESENCE_TTL_MS,
+    at,
+    pid: String(raw.pid || ""),
+  };
+}
+
+async function chatCloudPresence() {
+  try {
+    const data = await chatServerFetch("/api/creator_chat_presence", { timeoutMs: 12000 });
+    return Object.values(data?.records || {})
+      .map(chatPresenceEntry)
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+let chatLegacyPresenceCache = { at: 0, entries: [] };
+
+async function chatLegacyPresence() {
+  // Older builds and other clients wrote presence into the message table.
+  // Keep reading that history so those users still get a correct dot while
+  // they update to the build that heartbeats into creator_chat_presence.
+  if (Date.now() - chatLegacyPresenceCache.at < 60_000) return chatLegacyPresenceCache.entries;
+  try {
+    const data = await chatServerFetch(
+      "/api/channels/" +
+        encodeURIComponent(CHAT_CHANNEL_ID) +
+        "/messages?newest=1&limit=500",
+      { timeoutMs: 12000 },
+    );
+    const entries = (Array.isArray(data?.messages) ? data.messages : [])
+      .filter((row) => String(row.kind || row.t || "msg") === "presence")
+      .map(chatPresenceEntry)
+      .filter(Boolean);
+    chatLegacyPresenceCache = { at: Date.now(), entries };
+    return entries;
+  } catch {
+    return chatLegacyPresenceCache.entries;
+  }
+}
+
+async function mergedChatPresence() {
+  const merged = new Map();
+  const add = (entry) => {
+    if (!entry) return;
+    const key = entry.username.toLowerCase();
+    const previous = merged.get(key);
+    if (!previous || entry.at >= previous.at) merged.set(key, entry);
+  };
+  for (const entry of chatPresence.values()) add(chatPresenceEntry(entry));
+  const [cloudPresence, legacyPresence] = await Promise.all([
+    chatCloudPresence(),
+    chatLegacyPresence(),
+  ]);
+  for (const entry of cloudPresence) add(entry);
+  for (const entry of legacyPresence) add(entry);
+  return [...merged.values()]
+    .map((entry) => ({
+      ...entry,
+      online: entry.online && Date.now() - entry.at < CHAT_PRESENCE_TTL_MS,
+    }))
+    .sort((a, b) => b.at - a.at);
+}
+
+app.get("/api/chat/presence", async (req, res) => {
+  try {
+    res.json({ ok: true, presence: await mergedChatPresence(), at: new Date().toISOString() });
+  } catch (error) {
+    res.json({ ok: true, presence: chatPresenceList(), at: new Date().toISOString(), warning: error.message });
+  }
 });
 
 app.post("/api/chat/presence", async (req, res) => {
@@ -4547,20 +4626,21 @@ app.post("/api/chat/presence", async (req, res) => {
       at: Date.now(),
     };
     chatPresence.set(key, entry);
-    // One presence event on start/close keeps the cloud channel informed
-    // without any polling or heartbeat load.
-    const payload = {
-      ch: CHAT_CHANNEL_ID,
-      i: Date.now(),
-      u: username,
-      pid: entry.pid,
-      t: "presence",
-      kind: "presence",
-      m: online ? "online" : "offline",
-      online,
-      name: entry.name,
-    };
-    chatServerFetch("/api/bitboy_chat_messages", { method: "POST", body: payload }).catch(() => null);
+    // Presence lives in its own cloud table. Keeping it out of the message
+    // table means heartbeats can no longer push real chat messages out of the
+    // newest-history window.
+    chatServerFetch("/api/creator_chat_presence", {
+      method: "POST",
+      timeoutMs: 12000,
+      body: {
+        id: "presence:" + key,
+        u: username,
+        name: entry.name,
+        online,
+        pid: entry.pid,
+        at: entry.at,
+      },
+    }).catch((error) => log("warning", "chat", "presence cloud write failed", { message: error.message }));
     res.json({ ok: true, presence: chatPresenceList() });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -4573,8 +4653,11 @@ app.get("/api/chat/messages", async (req, res) => {
     if (!channel) return res.status(400).json({ error: "channel is required" });
     const before = String(req.query.before || "").trim();
     const limit = Math.max(1, Math.min(50, Number(req.query.limit || 15)));
+    // Presence heartbeats used to be stored in the message table. Fetch a
+    // deep enough window that those old events cannot hide every real message.
+    const requestLimit = 500;
     const params = new URLSearchParams();
-    params.set("limit", String(limit));
+    params.set("limit", String(requestLimit));
     if (before) params.set("before", before);
     else params.set("newest", "1");
     const data = await chatServerFetch(
@@ -4587,7 +4670,7 @@ app.get("/api/chat/messages", async (req, res) => {
     let legacy = [];
     try {
       const old = await chatServerFetch(
-        "/api/messages?channel=" + encodeURIComponent(channel) + "&newest=1&limit=100",
+        "/api/messages?channel=" + encodeURIComponent(channel) + "&newest=1&limit=" + requestLimit,
       );
       legacy = Object.values(old?.records || {});
     } catch {}

@@ -39,6 +39,29 @@ const minExeBytes = 50 * 1024 * 1024;
 const stateHome = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
 const logDir = path.join(stateHome, "creator-studio");
 const logPath = path.join(logDir, "update.log");
+const statusPath = path.join(logDir, "update-status.json");
+
+function writeStatus(status, extra = {}) {
+  try {
+    fssync.mkdirSync(logDir, { recursive: true });
+    fssync.writeFileSync(
+      statusPath,
+      JSON.stringify(
+        {
+          status,
+          at: new Date().toISOString(),
+          repo,
+          expectedVersion,
+          logPath,
+          ...extra,
+        },
+        null,
+        2,
+      ) + "\n",
+      "utf8",
+    );
+  } catch {}
+}
 
 function log(message) {
   const line = `[${new Date().toISOString()}] ${message}`;
@@ -241,6 +264,7 @@ async function main() {
   log("Creator Studio Linux update started.");
   log(`Install folder: ${installDir}`);
   log(`Repository: ${repo} (${branch})`);
+  writeStatus("running", { installDir, branch });
   if (!repo) throw new Error("No update repository was supplied.");
   if (!installDir || installDir === path.parse(installDir).root) {
     throw new Error("Refusing to update a filesystem root.");
@@ -312,6 +336,7 @@ async function main() {
     const newExecutable = path.join(installDir, path.basename(executable));
     chmodExecutables(installDir, path.basename(executable));
     log(`Installed the new build at ${installDir}`);
+    writeStatus("complete", { installDir, version: pkg.version });
     if (noStart) {
       log("Skipping launch because --no-start was supplied.");
     } else {
@@ -323,6 +348,7 @@ async function main() {
     process.exit(0);
   } catch (error) {
     log(`UPDATE FAILED: ${error.message}`);
+    writeStatus("failed", { installDir, message: error.message });
     try {
       if (backup && fssync.existsSync(backup) && !fssync.existsSync(installDir)) {
         await fs.rename(backup, installDir);
@@ -342,5 +368,6 @@ async function main() {
 
 main().catch((error) => {
   log(`UPDATE FAILED: ${error.message}`);
+  writeStatus("failed", { installDir, message: error.message });
   process.exit(1);
 });
