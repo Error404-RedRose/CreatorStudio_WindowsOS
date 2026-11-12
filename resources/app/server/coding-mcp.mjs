@@ -15,7 +15,33 @@ const TRUSTED = process.env.TWIX_CODING_TRUSTED === "1";
 const UNITY_PORT = process.env.TWIX_UNITY_BRIDGE_PORT ? Number(process.env.TWIX_UNITY_BRIDGE_PORT) : null;
 const BRIDGE_URL = process.env.TWIX_BRIDGE_URL || "";
 const BRIDGE_TOKEN = process.env.TWIX_BRIDGE_TOKEN || "";
-const IGNORED = new Set(["node_modules", ".git", ".svn", "dist", "build", ".next", ".turbo", "release", ".twix"]);
+const IGNORED = new Set([
+  "node_modules",
+  ".git",
+  ".svn",
+  "target",
+  "dist",
+  "build",
+  "release",
+  "release-build",
+  "out",
+  "bin",
+  "obj",
+  ".next",
+  ".turbo",
+  ".vs",
+  ".idea",
+  ".gradle",
+  "Pods",
+  "DerivedData",
+  "CMakeFiles",
+  "__pycache__",
+  ".venv",
+  "venv",
+  "coverage",
+  ".cache",
+  ".twix",
+]);
 const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_ZIP_BYTES = 200 * 1024 * 1024;
 const GITHUB_ONLY = process.env.TWIX_GITHUB_ONLY === "1";
@@ -178,7 +204,7 @@ function assertCommandScope(command) {
 }
 
 async function listFiles(dir, depth, includeIgnored, level = 0) {
-  const entries = await fs.readdir(dir, { withFileTypes: true });
+  const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
   const out = [];
   for (const entry of entries) {
     if (!includeIgnored && IGNORED.has(entry.name)) continue;
@@ -358,7 +384,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return respond({ ok: true, scenes });
       }
       if (name === "creator_scene_tool" || name === "creator_3d_export") {
-        let projectId = args.projectId ? String(args.projectId) : "";
+        let projectId = args.projectId ? String(args.projectId) : CODING_PROJECT_ID || "";
         if (!projectId) {
           const scenes = await listScenes();
           projectId = scenes[0] && scenes[0].projectId ? String(scenes[0].projectId) : "";
@@ -475,7 +501,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       const walk = async (dir) => {
         if (matches.length >= limit) return;
-        const entries = await fs.readdir(dir, { withFileTypes: true });
+        const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
         for (const entry of entries) {
           if (matches.length >= limit) return;
           if (IGNORED.has(entry.name)) continue;

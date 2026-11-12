@@ -10,6 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createLicenseService } from "./license.mjs";
 import { createSpeechService } from "./speech.mjs";
+import { discoverLocalAiEndpoints, ensureHermesApiServer, readHermesDirectProviders } from "./ai-endpoints.mjs";
 import { assessCommand } from "../shared/command-safety.mjs";
 import { createGithubIndex } from "./github-index.mjs";
 import {
@@ -1524,7 +1525,7 @@ async function writeAgentWorkspace(projectId, workspace) {
   const dir = agentWorkspace(projectId);
   await ensureDir(dir);
   const settings = await getSettings();
-  const localProviders = openCodeLocalProviders(settings);
+  const localProviders = await openCodeLocalProviders(settings);
   const config = {
     $schema: "https://opencode.ai/config.json",
     ...(Object.keys(localProviders).length ? { provider: localProviders } : {}),
@@ -1636,35 +1637,107 @@ function mergeLocalModels(base, patch) {
   };
 }
 
+let ollamaProviderCache = { at: 0, provider: null };
+
+async function localOllamaProvider() {
+  if (Date.now() - ollamaProviderCache.at < 30000) return ollamaProviderCache.provider;
+  let provider = null;
+  try {
+    const response = await fetch("http://127.0.0.1:11434/api/tags", {
+      signal: AbortSignal.timeout(1500),
+      headers: { Accept: "application/json" },
+    });
+    if (response.ok) {
+      const payload = await response.json().catch(() => null);
+      const models = [
+        ...new Set(
+          (payload?.models || [])
+            .map((item) => String(item?.name || item?.model || "").trim())
+            .filter(Boolean),
+        ),
+      ];
+      if (models.length) {
+        provider = {
+          npm: "@ai-sdk/openai-compatible",
+          name: "Ollama (local)",
+          options: { baseURL: "http://127.0.0.1:11434/v1" },
+          models: Object.fromEntries(
+            models.map((id) => [
+              id,
+              {
+                name: id,
+                limit: { context: 8192, output: 4096 },
+              },
+            ]),
+          ),
+        };
+      }
+    }
+  } catch {}
+  ollamaProviderCache = { at: Date.now(), provider };
+  return provider;
+}
+
 /** Build the OpenCode provider block for every enabled local LLM. */
-function openCodeLocalProviders(settings) {
+async function openCodeLocalProviders(settings) {
   const local = settings?.localModels || {};
   const providers = {};
+  const directHermes = local.hermes?.enabled ? await readHermesDirectProviders() : [];
   for (const kind of ["hermes", "claude"]) {
     const entry = local[kind];
     if (!entry?.enabled) continue;
     const baseUrl = String(entry.baseUrl || "").trim().replace(/\/+$/, "");
     const model = String(entry.model || "").trim();
     if (!baseUrl || !model) continue;
+    // The Hermes agent endpoint streams Hermes-only tool events that OpenCode
+    // cannot parse. When direct Hermes model providers are available, prefer
+    // those so Creator Studio tools work normally.
+    if (kind === "hermes" && directHermes.length && /:8642(?:\/|$)/.test(baseUrl)) continue;
     const anthropic = entry.apiStyle === "anthropic";
     const options = { baseURL: baseUrl };
     if (entry.apiKey) options.apiKey = String(entry.apiKey);
     if (anthropic) options.headers = { "anthropic-version": "2023-06-01" };
+    const modelIds = [
+      ...new Set([model, ...(Array.isArray(entry.models) ? entry.models : [])].map((id) => String(id || "").trim()).filter(Boolean)),
+    ];
     providers[LOCAL_BACKEND_LOCAL_IDS[kind]] = {
       npm: anthropic ? "@ai-sdk/anthropic" : "@ai-sdk/openai-compatible",
       name: String(entry.label || kind) + " (local)",
       options,
-      models: {
-        [model]: {
-          name: model,
-          limit: {
-            context: Math.max(1024, Number(entry.context) || 131072),
-            output: 8192,
+      models: Object.fromEntries(
+        modelIds.map((id) => [
+          id,
+          {
+            name: id,
+            limit: {
+              context: Math.max(1024, Number(entry.context) || 131072),
+              output: 8192,
+            },
           },
-        },
-      },
+        ]),
+      ),
     };
   }
+  const hermesEntryBase = String(local.hermes?.baseUrl || "").trim().replace(/\/+$/, "");
+  for (const direct of directHermes) {
+    if (hermesEntryBase && hermesEntryBase === direct.baseUrl) continue;
+    providers[direct.providerId] = {
+      npm: "@ai-sdk/openai-compatible",
+      name: direct.name,
+      options: { baseURL: direct.baseUrl, ...(direct.apiKey ? { apiKey: direct.apiKey } : {}) },
+      models: Object.fromEntries(
+        direct.models.map((id) => [
+          id,
+          {
+            name: id,
+            limit: { context: 1000000, output: 65536 },
+          },
+        ]),
+      ),
+    };
+  }
+  const ollama = await localOllamaProvider();
+  if (ollama) providers["ollama-local"] = ollama;
   return providers;
 }
 
@@ -2544,7 +2617,7 @@ async function writeCodingWorkspace(projectId, dir, trusted, unityPort = null) {
   const workspace = codingWorkspaceDir(projectId);
   await ensureDir(workspace);
   const settings = await getSettings();
-  const localProviders = openCodeLocalProviders(settings);
+  const localProviders = await openCodeLocalProviders(settings);
   const config = {
     $schema: "https://opencode.ai/config.json",
     ...(Object.keys(localProviders).length ? { provider: localProviders } : {}),
@@ -2918,6 +2991,7 @@ app.post("/api/license/refresh", async (req, res) => {
 
 app.get("/api/speech/status", (req, res) => {
   try {
+    res.set("Cache-Control", "no-store");
     res.json(speechService.status());
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
@@ -2926,6 +3000,7 @@ app.get("/api/speech/status", (req, res) => {
 
 app.get("/api/speech/devices", (req, res) => {
   try {
+    res.set("Cache-Control", "no-store");
     res.json(speechService.listDevices());
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message, devices: [] });
@@ -3070,6 +3145,8 @@ async function commandAvailable(name) {
 async function detectAiBackends() {
   const settings = await getSettings();
   const local = settings.localModels || {};
+  const discovery = await discoverLocalAiEndpoints().catch(() => null);
+  const discoveredFor = (id) => discovery?.endpoints?.find((endpoint) => endpoint.backend === id) || null;
   const configuredExecutable = String(settings.opencode?.executable || "opencode");
   const managedExecutable = path.join(
     DATA_DIR,
@@ -3085,6 +3162,7 @@ async function detectAiBackends() {
     process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs", "Claude", "Claude.exe") : "",
     process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "AnthropicClaude", "Claude.exe") : "",
     process.env.PROGRAMFILES ? path.join(process.env.PROGRAMFILES, "Claude", "Claude.exe") : "",
+    path.join(os.homedir(), ".local", "bin", "claude.exe"),
     path.join(os.homedir(), ".local", "bin", "claude"),
     "/usr/local/bin/claude",
     "/usr/bin/claude",
@@ -3121,23 +3199,27 @@ async function detectAiBackends() {
       id: "hermes",
       name: "Hermes",
       installed: hermesDetected,
-      configured: endpointConfigured(local.hermes),
-      enabled: Boolean(local.hermes?.enabled),
-      endpoint: String(local.hermes?.baseUrl || ""),
-      model: String(local.hermes?.model || ""),
+      configured: endpointConfigured(local.hermes) || Boolean(discoveredFor("hermes")),
+      enabled: Boolean(local.hermes?.enabled) || Boolean(discoveredFor("hermes")),
+      endpoint: String(local.hermes?.baseUrl || discoveredFor("hermes")?.baseUrl || ""),
+      model: String(local.hermes?.model || discoveredFor("hermes")?.models?.[0] || ""),
       downloadUrl: "https://hermes-agent.nousresearch.com/",
       note: "Connect a local Hermes endpoint through Settings > AI backends. It uses the same sessions, tools and permissions as OpenCode.",
+      discovered: discoveredFor("hermes"),
+      canStart: Boolean(discovery?.hermes?.canStart),
     },
     {
       id: "claude",
       name: "Claude",
       installed: claudeDetected,
-      configured: endpointConfigured(local.claude),
-      enabled: Boolean(local.claude?.enabled),
-      endpoint: String(local.claude?.baseUrl || ""),
-      model: String(local.claude?.model || ""),
+      configured: endpointConfigured(local.claude) || Boolean(discoveredFor("claude")),
+      enabled: Boolean(local.claude?.enabled) || Boolean(discoveredFor("claude")),
+      endpoint: String(local.claude?.baseUrl || discoveredFor("claude")?.baseUrl || ""),
+      model: String(local.claude?.model || discoveredFor("claude")?.models?.[0] || ""),
       downloadUrl: "https://claude.com/download",
       note: "Connect a local Claude or Claude-compatible endpoint through Settings > AI backends. It uses the same sessions, tools and permissions as OpenCode.",
+      discovered: discoveredFor("claude"),
+      canStart: false,
     },
   ];
   for (const backend of backends) backend.active = backend.id === (local.activeBackend || "opencode");
@@ -3154,6 +3236,22 @@ async function detectAiBackends() {
 app.get("/api/ai-backends/detect", async (req, res) => {
   try {
     res.json(await detectAiBackends());
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/ai-backends/discover", async (req, res) => {
+  try {
+    res.json(await discoverLocalAiEndpoints({ force: String(req.query.force || "") === "1" }));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai-backends/hermes/start", async (req, res) => {
+  try {
+    res.json(await ensureHermesApiServer());
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -5091,14 +5189,40 @@ function resolveCodingRoot(dir) {
   return root;
 }
 
+const CODING_IGNORED = new Set([
+  "node_modules",
+  ".git",
+  ".svn",
+  "target",
+  "dist",
+  "build",
+  "release",
+  "release-build",
+  "out",
+  "bin",
+  "obj",
+  ".next",
+  ".turbo",
+  ".vs",
+  ".idea",
+  ".gradle",
+  "Pods",
+  "DerivedData",
+  "CMakeFiles",
+  "__pycache__",
+  ".venv",
+  "venv",
+  "coverage",
+  ".cache",
+]);
+
 async function codingTree(root, relative, depth, level = 0) {
   const target = path.resolve(root, relative || ".");
   if (!isInside(root, target)) throw new Error("Path outside workspace");
-  const entries = await fs.readdir(target, { withFileTypes: true });
-  const ignored = new Set(["node_modules", ".git"]);
+  const entries = await fs.readdir(target, { withFileTypes: true }).catch(() => []);
   const out = [];
   for (const entry of entries) {
-    if (ignored.has(entry.name)) continue;
+    if (CODING_IGNORED.has(entry.name)) continue;
     const child = path.join(target, entry.name);
     const node = {
       name: entry.name,
@@ -5274,7 +5398,15 @@ app.post("/api/coding/chat", async (req, res) => {
     sessionRecreated = sessionRecreated || Boolean(sent.recreated);
     const response = sent.value;
     const responseParts = response?.parts || [];
-    const responseText = cleanAssistantText(responseParts.filter((part) => part.type === "text").map((part) => part.text).join("\n\n"));
+    const responseError =
+      response?.info?.error?.data?.message ||
+      response?.info?.error?.message ||
+      response?.error?.data?.message ||
+      response?.error?.message ||
+      "";
+    const responseText =
+      cleanAssistantText(responseParts.filter((part) => part.type === "text").map((part) => part.text).join("\n\n")) ||
+      (responseError ? `AI provider error: ${responseError}` : "");
     const reasoning = responseParts.filter((part) => part.type === "reasoning").map((part) => part.text).join("\n\n");
     const tools = responseParts.filter((part) => part.type === "tool").map((part) => ({
       name: part.tool,
@@ -5309,6 +5441,7 @@ app.post("/api/coding/chat", async (req, res) => {
       text: responseText,
       reasoning,
       tools,
+      error: responseError || null,
       research: { counts: research.counts, elapsedMs: research.elapsedMs },
     });
   } catch (error) {
@@ -10798,22 +10931,30 @@ app.post("/api/bridge/tool", async (req, res) => {
   log("info", "bridge", "tool.call " + name, { projectId, args });
   if (token !== BRIDGE_TOKEN) return res.status(403).json({ error: "Bad bridge token" });
   const set = clients.get(projectId);
-  const ws = set ? [...set].find((c) => c.readyState === 1) : null;
-  if (!ws) {
+  const sockets = set ? [...set].filter((c) => c.readyState === 1) : [];
+  if (!sockets.length) {
     return res.status(409).json({
       ok: false,
       error: "TwiX workspace is not connected. Open the project in the TwiX app and try again.",
     });
   }
   const id = randomUUID();
-  const result = await new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      pendingTools.delete(id);
-      resolve({ ok: false, error: "Tool call timed out after 5 minutes" });
-    }, 300000);
-    pendingTools.set(id, { resolve, timer, projectId, ws });
-    ws.send(JSON.stringify({ type: "tool.call", id, name, args: args || {}, projectId }));
-  });
+  const runOn = (ws) =>
+    new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingTools.delete(id);
+        resolve({ ok: false, error: "Tool call timed out after 5 minutes" });
+      }, 300000);
+      pendingTools.set(id, { resolve, timer, projectId, ws });
+      ws.send(JSON.stringify({ type: "tool.call", id, name, args: args || {}, projectId }));
+    });
+  let result = null;
+  for (const ws of sockets) {
+    result = await runOn(ws);
+    const notReady =
+      result?.ok === false && /workspace is not ready|viewport is not ready/i.test(String(result.error || result.summary || ""));
+    if (!notReady) break;
+  }
   log(result?.ok === false ? "warning" : "info", "bridge", "tool.result " + name, { projectId, ms: Date.now() - started, result });
   res.json(result);
 });

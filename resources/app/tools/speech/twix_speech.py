@@ -57,10 +57,27 @@ _GLYPH_MAP = str.maketrans(
 
 KEYEVENTF_KEYUP = 0x0002
 MODIFIER_VKS = (0x11, 0x10, 0x12, 0x5B, 0x5C, 0xA2, 0xA3, 0xA0, 0xA1, 0xA4, 0xA5)
+_LOG_LOCK = threading.Lock()
 
 
 def log(message: str) -> None:
-    print(message, flush=True)
+    # The recorder, transcriber and typer threads all log. Without a lock,
+    # their separate print() writes can interleave into one line, which breaks
+    # the overlay's [PTT]/[PROGRESS]/[DONE] state parsing.
+    with _LOG_LOCK:
+        print(message, flush=True)
+
+
+def refresh_devices() -> None:
+    """Re-enumerate PortAudio so a headset connected later is visible."""
+    try:
+        sd._terminate()
+    except Exception:
+        pass
+    try:
+        sd._initialize()
+    except Exception:
+        pass
 
 
 def modifier_is_down() -> bool:
@@ -361,6 +378,7 @@ class Transcriber:
     def _type_out(self, text: str, generation: int) -> None:
         text = " ".join(str(text or "").translate(_GLYPH_MAP).split())
         if not text:
+            log("[ASR] (no speech detected)")
             return
         log(f"[ASR] {text}")
         if self.print_only or not self.type_text:
@@ -495,6 +513,26 @@ class HoldState:
 
 
 class Microphone:
+    VIRTUAL_HINTS = (
+        "cable output",
+        "cable input",
+        "vb-audio",
+        "voicemeeter",
+        "voice meter",
+        "virtual cable",
+        "virtual audio",
+        "loopback",
+        "stereo mix",
+        "steam streaming",
+        "sound mapper",
+        "primary sound capture",
+    )
+
+    @staticmethod
+    def is_virtual_device(name: str) -> bool:
+        lowered = str(name or "").lower()
+        return any(hint in lowered for hint in Microphone.VIRTUAL_HINTS)
+
     @staticmethod
     def resolve_device(value: str):
         if not value:
@@ -514,47 +552,288 @@ class Microphone:
             return None
         return None
 
+    @staticmethod
+    def device_label(index) -> str:
+        try:
+            info = sd.query_devices(index)
+            host = sd.query_hostapis(info.get("hostapi", 0)).get("name", "unknown")
+            name = " ".join(str(info.get("name", "Microphone")).split())
+            return f"{name} (index {index}, {host}, {info.get('max_input_channels', 0)} ch)"
+        except Exception:
+            return f"device {index}"
+
+    @staticmethod
+    def rank_input_devices(include_virtual: bool = True, usable_only: bool = True):
+        """Score input devices, preferring real microphones over loopbacks.
+
+        PortAudio's WDM-KS backend reports devices but never invokes callback
+        streams on Windows, so those devices are excluded from the live engine
+        unless the caller asks for the complete list (the Settings scanner).
+        """
+        try:
+            devices = list(sd.query_devices())
+        except Exception:
+            return []
+        ranked = []
+        for index, info in enumerate(devices):
+            if info.get("max_input_channels", 0) <= 0:
+                continue
+            name = info.get("name", "")
+            virtual = Microphone.is_virtual_device(name)
+            if virtual and not include_virtual:
+                continue
+            try:
+                host = sd.query_hostapis(info.get("hostapi", 0)).get("name", "").lower()
+            except Exception:
+                host = ""
+            if usable_only and "wdm-ks" in host:
+                continue
+            lowered = name.lower()
+            score = -100 if virtual else 0
+            if "headset" in lowered:
+                score += 40
+            if "microphone" in lowered or "mic" in lowered:
+                score += 30
+            if "array" in lowered:
+                score += 10
+            if "line in" in lowered:
+                score += 5
+            if "wasapi" in host:
+                score += 8
+            elif "mme" in host:
+                score += 6
+            elif "wdm-ks" in host:
+                score += 4
+            elif "directsound" in host:
+                score += 3
+            try:
+                if float(info.get("default_samplerate") or 0) >= 16000:
+                    score += 2
+            except Exception:
+                pass
+            try:
+                if int(info.get("max_input_channels") or 1) <= 2:
+                    score += 2
+            except Exception:
+                pass
+            ranked.append((score, index, name))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return ranked
+
+    @staticmethod
+    def choose_default_device():
+        """Return (index, name, replaced) and skip virtual loopback cables.
+
+        Windows can silently make VB-Cable, Stereo Mix or another loopback the
+        default input. Those devices deliver silence for dictation even though
+        PortAudio opens them successfully, so prefer a real microphone when the
+        user has not explicitly selected a device.
+        """
+        try:
+            default_index = sd.default.device[0]
+        except Exception:
+            default_index = None
+        try:
+            devices = list(sd.query_devices())
+        except Exception:
+            return default_index, None, False
+        if default_index is not None and 0 <= default_index < len(devices):
+            info = devices[default_index]
+            name = info.get("name", "system default")
+            if info.get("max_input_channels", 0) > 0 and not Microphone.is_virtual_device(name):
+                return default_index, name, False
+        ranked = Microphone.rank_input_devices(include_virtual=False)
+        if ranked:
+            return ranked[0][1], ranked[0][2], True
+        return default_index, None, False
+
+    @staticmethod
+    def describe_device(device_value: str):
+        try:
+            if device_value:
+                index = Microphone.resolve_device(device_value)
+                if index is None:
+                    log(f"[WARN] Selected microphone '{device_value}' was not found; using the best available input.")
+                    index, _name, _replaced = Microphone.choose_default_device()
+            else:
+                index, name, replaced = Microphone.choose_default_device()
+                if replaced:
+                    log(f"[Mic] The Windows default input is a virtual loopback; using {name} instead.")
+            if index is None or index < 0:
+                return None, "system default"
+            return index, Microphone.device_label(index)
+        except Exception:
+            return None, str(device_value or "system default")
+
     def __init__(self):
         self.vad = webrtcvad.Vad(VAD_MODE)
-        self.audio_q: queue.Queue = queue.Queue(maxsize=240)
+        self.audio_q: queue.Queue = queue.Queue(maxsize=480)
         self.pending = bytearray()
         self.stream = None
+        self.device_value = ""
+        self.device_index = None
+        self.device_name = "system default"
+        self.stream_rate = SAMPLE_RATE_HZ
+        self.started_at = 0.0
+        self.last_block_at = 0.0
+        self.block_count = 0
+        self.peak = 0
+        self.stream_error = ""
+        self.last_status = ""
+        self.last_detected = []
 
     def start(self, device_value: str = "") -> None:
+        self.device_value = str(device_value or "")
         try:
             sd.default.channels = 1
         except Exception:
             pass
-        try:
-            sd.check_input_settings(samplerate=SAMPLE_RATE_HZ, dtype="int16", channels=1)
-        except Exception as error:
-            log(f"[WARN] Input settings check failed (continuing): {error}")
-        device_index = self.resolve_device(device_value)
-        if device_value:
+        self.stream_error = ""
+        self.last_status = ""
+        self.last_detected = []
+        ranked = Microphone.rank_input_devices(include_virtual=bool(self.device_value), usable_only=True)
+        candidates = []
+        seen = set()
+        if self.device_value:
+            explicit = Microphone.resolve_device(self.device_value)
+            if explicit is not None:
+                try:
+                    host = sd.query_hostapis(sd.query_devices(explicit).get("hostapi", 0)).get("name", "").lower()
+                except Exception:
+                    host = ""
+                if "wdm-ks" in host:
+                    log("[WARN] Windows WDM-KS microphones cannot stream audio reliably; choose an MME or WASAPI device.")
+                else:
+                    candidates.append(explicit)
+                    seen.add(explicit)
+            else:
+                log(f"[WARN] Selected microphone '{self.device_value}' was not found; using the best available input.")
+        default_index, default_name, replaced = Microphone.choose_default_device()
+        if replaced:
+            log(f"[Mic] The Windows default input is a virtual loopback; using {default_name} instead.")
+        if default_index is not None and default_index not in seen:
             try:
-                name = sd.query_devices(device_index)["name"] if device_index is not None else device_value
+                default_label = sd.query_devices(default_index).get("name", "")
             except Exception:
-                name = device_value
-            log(f"[Mic] Using input device: {name}")
-        self.stream = sd.RawInputStream(
-            device=device_index,
-            samplerate=SAMPLE_RATE_HZ,
-            blocksize=FRAME_SAMPLES,
-            dtype="int16",
-            channels=1,
-            callback=self._callback,
-        )
-        self.stream.start()
+                default_label = default_name or ""
+            # Never silently use a loopback/virtual cable when the user has not
+            # explicitly selected one. It opens fine but records pure silence.
+            if self.device_value or not Microphone.is_virtual_device(default_label):
+                candidates.append(default_index)
+                seen.add(default_index)
+        for _score, index, _name in ranked:
+            if index in seen:
+                continue
+            candidates.append(index)
+            seen.add(index)
+        if not candidates:
+            detected = []
+            try:
+                for _index, info in enumerate(sd.query_devices()):
+                    if info.get("max_input_channels", 0) > 0:
+                        detected.append(" ".join(str(info.get("name", "")).split()))
+            except Exception:
+                pass
+            self.last_detected = detected
+            raise RuntimeError(
+                "No usable microphone found. Connect a microphone or enable it in Windows Sound settings; "
+                "the engine will start automatically when a device appears."
+            )
+
+        errors = []
+        for index in candidates:
+            label = Microphone.device_label(index)
+            rates = [SAMPLE_RATE_HZ]
+            try:
+                native = int(float(sd.query_devices(index).get("default_samplerate") or SAMPLE_RATE_HZ))
+            except Exception:
+                native = SAMPLE_RATE_HZ
+            if native and native != SAMPLE_RATE_HZ:
+                rates.append(native)
+            for rate in rates:
+                stream = None
+                try:
+                    sd.check_input_settings(device=index, samplerate=rate, dtype="int16", channels=1)
+                except Exception as error:
+                    # Some host APIs reject the probe but still open the stream.
+                    errors.append(f"{label} @ {rate} Hz: {error}")
+                try:
+                    blocksize = max(FRAME_SAMPLES, int(round(rate * FRAME_MS / 1000.0)))
+                    stream = sd.RawInputStream(
+                        device=index,
+                        samplerate=rate,
+                        blocksize=blocksize,
+                        dtype="int16",
+                        channels=1,
+                        callback=self._callback,
+                    )
+                    stream.start()
+                    self.stream = stream
+                    self.stream_rate = rate
+                    self.device_index = index
+                    self.device_name = label
+                    self.started_at = time.monotonic()
+                    self.last_block_at = self.started_at
+                    self.block_count = 0
+                    self.peak = 0
+                    self.stream_error = ""
+                    log(f"[Mic] Using input device: {label} at {rate} Hz")
+                    if rate != SAMPLE_RATE_HZ:
+                        log(f"[Mic] Resampling {rate} Hz input to {SAMPLE_RATE_HZ} Hz in software.")
+                    log(f"[Mic] Stream open, {FRAME_MS} ms frames.")
+                    return
+                except Exception as error:
+                    errors.append(f"{label} @ {rate} Hz: {error}")
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+        raise RuntimeError("Could not open any microphone. " + " | ".join(errors[-5:]))
 
     def _callback(self, indata, frames, time_info, status):
         if status:
-            log(f"[Audio] {status}")
+            text = str(status)
+            if text != self.last_status:
+                self.last_status = text
+                log(f"[Audio] {text}")
         try:
-            self.audio_q.put_nowait(bytes(indata))
-        except queue.Full:
-            pass
+            data = bytes(indata)
+            if self.stream_rate != SAMPLE_RATE_HZ and len(data) >= 2:
+                source = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                if source.size:
+                    target_len = max(1, int(round(source.size * SAMPLE_RATE_HZ / self.stream_rate)))
+                    positions = np.linspace(0, source.size - 1, target_len, dtype=np.float32)
+                    source = np.interp(positions, np.arange(source.size, dtype=np.float32), source)
+                    data = np.clip(source, -32768, 32767).astype(np.int16).tobytes()
+            self.last_block_at = time.monotonic()
+            self.block_count += 1
+            if len(data) >= 2:
+                try:
+                    block_peak = int(np.max(np.abs(np.frombuffer(data, dtype=np.int16))))
+                    self.peak = max(self.peak, block_peak)
+                except Exception:
+                    pass
+            try:
+                self.audio_q.put_nowait(data)
+            except queue.Full:
+                # A stalled consumer must never wedge the PortAudio callback.
+                # Drop the oldest block and keep the newest audio.
+                try:
+                    self.audio_q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.audio_q.put_nowait(data)
+                except queue.Full:
+                    pass
+        except Exception as error:
+            self.stream_error = str(error)
+            log(f"[ERROR] Microphone callback failed: {error}")
 
     def read_frame(self, timeout: float = 0.1):
+        if self.stream is None:
+            return None
         try:
             block = self.audio_q.get(timeout=timeout)
         except queue.Empty:
@@ -575,6 +854,30 @@ class Microphone:
             except queue.Empty:
                 break
         self.pending.clear()
+
+    def is_stale(self, seconds: float = 12.0) -> bool:
+        if self.stream is None:
+            return True
+        return time.monotonic() - self.last_block_at > seconds
+
+    def restart(self) -> None:
+        log("[Mic] Reopening the input stream...")
+        self.stop()
+        time.sleep(0.15)
+        refresh_devices()
+        self.start(self.device_value)
+        log(f"[Mic] Reopened: {self.device_name}")
+
+    def snapshot(self):
+        return {
+            "device": self.device_name,
+            "blocks": self.block_count,
+            "peak": self.peak,
+            "lastBlockAgeMs": int((time.monotonic() - self.last_block_at) * 1000)
+            if self.last_block_at
+            else -1,
+            "streamError": self.stream_error,
+        }
 
     def trim(self, frames):
         if not frames:
@@ -600,6 +903,11 @@ class Microphone:
             except Exception:
                 pass
             self.stream = None
+        try:
+            self.drain()
+        except Exception:
+            pass
+        self.last_block_at = time.monotonic()
 
 
 def load_model(model_size: str, device: str):
@@ -625,8 +933,11 @@ def ptt_loop(mic: Microphone, transcriber: Transcriber, control: str, beep: bool
     active = False
     frames = []
     active_since = 0.0
+    last_stream_check = time.monotonic()
     while True:
-        held = hold.held() if (hold is not None and hold.ok) else read_control(control)
+        physical = bool(hold.held()) if (hold is not None and hold.ok) else False
+        requested = read_control(control) if control else False
+        held = physical or requested
         if held and not active:
             active = True
             active_since = time.monotonic()
@@ -649,13 +960,37 @@ def ptt_loop(mic: Microphone, transcriber: Transcriber, control: str, beep: bool
                         break
                     frames.append(extra)
                 transcriber.end_hold()
+                hold_ms = int((time.monotonic() - active_since) * 1000)
+                captured_ms = int(len(frames) * FRAME_MS)
+                peak = 0
+                for frame in frames:
+                    if len(frame) < 2:
+                        continue
+                    try:
+                        peak = max(peak, int(np.max(np.abs(np.frombuffer(frame, dtype=np.int16)))))
+                    except Exception:
+                        pass
+                log(f"[AUDIO] hold={hold_ms}ms captured={captured_ms}ms peak={peak}")
                 audio = mic.trim(frames)
                 if len(audio) >= int(SAMPLE_RATE_HZ * 0.15) * 2:
                     transcriber.submit_final(audio)
                     log("[PTT] Final transcript queued")
                 else:
+                    # A long hold with no frames means Windows/Bluetooth stopped
+                    # the PortAudio stream (for example after the headset slept).
+                    # Reopen it now so the next hold is not silently empty.
+                    if hold_ms >= 350 and captured_ms < 100:
+                        log("[WARN] The microphone delivered no audio. Reopening the input device...")
+                        try:
+                            mic.restart()
+                        except Exception as error:
+                            log(f"[ERROR] Could not reopen the microphone: {error}")
+                    elif hold_ms >= 350 and peak == 0:
+                        log("[WARN] The microphone delivered silence. Check the Windows input device and mute state.")
                     log("[PROGRESS] 100")
                     log("[DONE]")
+                if mic.stream_error:
+                    log(f"[ERROR] Microphone stream error: {mic.stream_error}")
                 active = False
                 frames = []
                 if beep:
@@ -663,6 +998,15 @@ def ptt_loop(mic: Microphone, transcriber: Transcriber, control: str, beep: bool
         else:
             mic.read_frame(timeout=0.05)
             mic.drain(limit=20)
+            now = time.monotonic()
+            if now - last_stream_check > 5.0:
+                last_stream_check = now
+                if mic.is_stale(12.0):
+                    log("[WARN] The microphone stream stopped delivering audio. Reopening it...")
+                    try:
+                        mic.restart()
+                    except Exception as error:
+                        log(f"[ERROR] Could not reopen the microphone: {error}")
 
 
 def vad_loop(mic: Microphone, transcriber: Transcriber) -> None:
@@ -738,26 +1082,42 @@ def main() -> int:
     parser.add_argument("--no-type", action="store_true")
     parser.add_argument("--stdout", action="store_true")
     args = parser.parse_args()
-    if not acquire_single_instance():
-        return 0
 
+    # Device enumeration must work while the warm engine owns the
+    # single-instance mutex. Handle it before acquiring the mutex.
     if args.list_devices:
         devices = []
         try:
             default_input = sd.default.device[0]
+            recommended_index = Microphone.choose_default_device()[0]
             for index, device in enumerate(sd.query_devices()):
                 if device.get("max_input_channels", 0) > 0:
+                    name = " ".join(str(device.get("name", "Microphone")).split())
+                    try:
+                        host = sd.query_hostapis(device.get("hostapi", 0)).get("name", "unknown")
+                    except Exception:
+                        host = "unknown"
+                    usable = "wdm-ks" not in host.lower()
+                    virtual = Microphone.is_virtual_device(name)
                     devices.append(
                         {
                             "index": index,
-                            "name": device.get("name", "Microphone"),
+                            "name": name,
                             "channels": device.get("max_input_channels", 0),
                             "default": index == default_input,
+                            "recommended": index == recommended_index and usable and not virtual,
+                            "usable": usable,
+                            "virtual": virtual,
+                            "host": host,
                         }
                     )
         except Exception as error:
             log(f"[ERROR] Could not list microphones: {error}")
+        devices.sort(key=lambda item: (not item["recommended"], not item["usable"], item["virtual"], item["index"]))
         print("DEVICES_JSON=" + json.dumps(devices), flush=True)
+        return 0
+
+    if not acquire_single_instance():
         return 0
 
     log("[TwiX] Starting speech engine.")
@@ -771,11 +1131,28 @@ def main() -> int:
     log(f"[Type] backend={transcriber.typer_backend} delay={transcriber.type_delay:.3f}s")
 
     mic = Microphone()
-    try:
-        mic.start(args.input_device)
-    except Exception as error:
-        log(f"[ERROR] Could not open the microphone: {error}")
-        return 3
+    attempts = 0
+    while True:
+        try:
+            refresh_devices()
+            mic.start(args.input_device)
+            break
+        except KeyboardInterrupt:
+            log("[Exit] Ctrl+C.")
+            return 0
+        except Exception as error:
+            attempts += 1
+            if attempts == 1:
+                if mic.last_detected:
+                    log("[Mic] Detected inputs: " + (", ".join(mic.last_detected[:8]) or "none"))
+                log(f"[WARN] Microphone not available yet: {error}")
+                log(
+                    "[MIC] Waiting for a microphone. Connect it or enable it in Windows Sound settings; "
+                    "the engine will start automatically when a device appears."
+                )
+            elif attempts % 6 == 0:
+                log("[MIC] Still waiting for a microphone.")
+            time.sleep(5)
 
     log("[READY]")
     hold = HoldState(args.hotkey) if args.hotkey else None

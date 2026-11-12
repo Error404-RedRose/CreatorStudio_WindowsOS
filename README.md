@@ -121,15 +121,21 @@ approval flow and per-studio model memory.
 - **OpenCode** — install it from [opencode.ai](https://opencode.ai/), then open
   **Settings → OpenCode**. Creator Studio can provision a compatible 1.x runtime automatically.
 - **Hermes** — install Hermes from
-  [hermes-agent.nousresearch.com](https://hermes-agent.nousresearch.com/), start its local
-  OpenAI-compatible endpoint, then open **Settings → AI backends**, enable Hermes, and enter the
-  endpoint URL and model id.
-- **Claude** — install Claude from [claude.com/download](https://claude.com/download), start a
-  local Claude or Claude-compatible endpoint, then open **Settings → AI backends**, enable Claude,
-  choose OpenAI or Anthropic API style, and enter the endpoint URL and model id.
+  [hermes-agent.nousresearch.com](https://hermes-agent.nousresearch.com/). Creator Studio reads
+  Hermes's authenticated model providers directly (including the BlitzBoy models and Nous free
+  when its token is valid), so OpenCode's tools and approvals work normally. If Hermes is installed
+  but not signed in, open **Settings → AI backends** and configure it there.
+- **Claude** — install Claude from [claude.com/download](https://claude.com/download). Claude Code and
+  Claude Desktop are agents, not local model servers: they do not expose an HTTP model endpoint by
+  themselves. Run a Claude-compatible proxy, or enter the proxy URL in **Settings → AI backends**.
+  Creator Studio scans local ports and auto-fills a running Claude proxy when it finds one.
 
 Use **Test endpoint**, then **Save & reconnect agents**. The header model menu follows the active
 backend and shows only that backend's models. Auto-connect uses whichever backend you saved.
+
+When Ollama is running on this PC, Creator Studio also adds an **Ollama (local)** provider with
+every installed model. OpenCode Zen, OpenCode Go and Ollama Cloud models stay in the same model
+menu, so you can switch between free Zen models, Go models and local models without leaving the app.
 
 **Each workspace remembers its own model.** The model you select for Writing is used for Writing;
 the model you select for Coding is used for Coding, and so on. Choose models with tool calling

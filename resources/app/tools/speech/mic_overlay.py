@@ -8,9 +8,12 @@
 import argparse
 import ctypes
 import json
+import sys
+import textwrap
 import threading
 import time
 import tkinter as tk
+import traceback
 import urllib.request
 
 WIN_W = 430
@@ -63,12 +66,24 @@ class Overlay:
         self.port = port
         self.active = False
         self.finishing = False
+        self.loading = False
+        self.installing = False
+        self.install_progress = 0
+        self.ready = False
         self.progress = 0
         self.failures = 0
+        self.backend_down = False
+        self.error_text = ""
+        self.error_seen = ""
+        self.error_until = 0.0
+        self.last_transcript = ""
+        self.last_audio = None
+        self.waiting_for_mic = False
         self.visible = False
         self.signature = None
         self.done_until = 0.0
         self.done_shown = False
+        self.hwnd = None
 
         enable_dpi_awareness()
         self.root = tk.Tk()
@@ -225,10 +240,27 @@ class Overlay:
     def make_click_through(self):
         try:
             user32 = ctypes.windll.user32
-            hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
-            style = user32.GetWindowLongW(hwnd, -20)
+            self.hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            style = user32.GetWindowLongW(self.hwnd, -20)
             # WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
-            user32.SetWindowLongW(hwnd, -20, style | 0x00080000 | 0x00000020 | 0x08000000 | 0x00000080)
+            user32.SetWindowLongW(self.hwnd, -20, style | 0x00080000 | 0x00000020 | 0x08000000 | 0x00000080)
+        except Exception:
+            self.hwnd = None
+
+    def ensure_topmost(self):
+        try:
+            if not self.hwnd:
+                return
+            user32 = ctypes.windll.user32
+            user32.SetWindowPos(
+                self.hwnd,
+                -1,  # HWND_TOPMOST
+                0,
+                0,
+                0,
+                0,
+                0x0002 | 0x0001 | 0x0010 | 0x0040,  # NOMOVE | NOSIZE | NOACTIVATE | SHOWWINDOW
+            )
         except Exception:
             pass
 
@@ -240,30 +272,119 @@ class Overlay:
                     data = json.load(response)
                 self.active = bool(data.get("active"))
                 self.finishing = bool(data.get("finishing"))
+                self.ready = bool(data.get("ready"))
+                self.installing = bool(data.get("installing"))
+                self.install_progress = max(0, min(100, int(data.get("installProgress") or 0)))
+                self.waiting_for_mic = bool(data.get("waitingForMic"))
+                self.loading = (bool(data.get("starting")) or self.installing) and not self.waiting_for_mic
                 self.progress = max(0, min(100, int(data.get("progress") or 0)))
+                self.last_transcript = str(data.get("lastTranscript") or "")
+                self.last_audio = data.get("lastAudio") if isinstance(data.get("lastAudio"), dict) else None
+                error_text = str(data.get("error") or data.get("warning") or "").strip()
+                if error_text and error_text != self.error_seen:
+                    self.error_seen = error_text
+                    self.error_until = time.monotonic() + 6.0
+                elif not error_text:
+                    self.error_seen = ""
+                self.error_text = error_text
                 self.failures = 0
+                self.backend_down = False
             except Exception:
                 self.failures += 1
                 if self.failures >= 5:
                     self.active = False
                     self.finishing = False
+                    self.loading = False
+                # Do not leave a stale overlay holding the single-instance
+                # mutex forever after the backend exits or restarts.
+                if self.failures >= 30:
+                    self.backend_down = True
             time.sleep(0.16)
 
-    def _render(self, done: bool) -> None:
+    def _no_speech(self) -> bool:
+        if "no speech detected" not in self.last_transcript.lower():
+            return False
+        captured = 0
+        if isinstance(self.last_audio, dict):
+            try:
+                captured = int(self.last_audio.get("capturedMs") or 0)
+            except Exception:
+                captured = 0
+        return captured >= 700
+
+    def _render(self, done: bool, loading: bool = False, error: bool = False) -> None:
         s = self.s
+        if error:
+            self.canvas.itemconfigure(
+                self.title_id,
+                text="Microphone needed" if self.waiting_for_mic else "Dictation issue",
+                fill=TEXT,
+            )
+            self.canvas.coords(self.title_id, self.text_cx, self.card_center_y - s(10))
+            message = textwrap.shorten(
+                self.error_text or "Check Settings > Microphone.", width=46, placeholder="…"
+            )
+            self.canvas.itemconfigure(self.sub_id, text=message, state="normal")
+            self.canvas.itemconfigure(self.bar_track_id, state="hidden")
+            self.canvas.itemconfigure(self.bar_fill_id, state="hidden")
+            return
+
+        if loading:
+            progress = self.install_progress if self.installing else 0
+            title = "Installing speech engine" if self.installing else "Preparing microphone"
+            self.canvas.itemconfigure(self.title_id, text=title, fill=TEXT)
+            self.canvas.coords(self.title_id, self.text_cx, self.card_center_y - s(10))
+            self.canvas.itemconfigure(
+                self.sub_id,
+                text="This only happens once" if self.installing else "Right Ctrl will be ready in a moment",
+                state="normal",
+            )
+            self.canvas.itemconfigure(self.bar_track_id, state="normal")
+            span = max(1, self.bar_right - self.bar_left)
+            fill_right = self.bar_left + max(0, int(span * progress / 100))
+            if progress <= 0:
+                self.canvas.itemconfigure(self.bar_fill_id, state="hidden")
+            else:
+                self.canvas.itemconfigure(self.bar_fill_id, state="normal")
+                self.canvas.coords(
+                    self.bar_fill_id,
+                    *self._rounded_points(
+                        self.bar_left,
+                        self.bar_top,
+                        fill_right,
+                        self.bar_bottom,
+                        (self.bar_bottom - self.bar_top) // 2,
+                    ),
+                )
+            return
+
         if self.active:
             self.canvas.itemconfigure(self.title_id, text="Listening", fill=TEXT)
             self.canvas.coords(self.title_id, self.text_cx, self.card_center_y - s(10))
-            self.canvas.itemconfigure(self.sub_id, text="Release Right Ctrl to transcribe", state="normal")
+            self.canvas.itemconfigure(self.sub_id, text="Release Right Ctrl or click the mic to stop", state="normal")
             self.canvas.itemconfigure(self.bar_track_id, state="hidden")
             self.canvas.itemconfigure(self.bar_fill_id, state="hidden")
             return
 
         progress = 100 if done else self.progress
-        title = "Done" if done else ("Transcribing" if progress < 50 else "Writing")
+        no_speech = done and self._no_speech()
+        title = (
+            "No speech detected"
+            if no_speech
+            else "Done"
+            if done
+            else "Transcribing"
+            if progress < 50
+            else "Writing"
+        )
         self.canvas.itemconfigure(self.title_id, text=title, fill=TEXT)
         self.canvas.coords(self.title_id, self.text_cx, self.card_center_y - s(10))
-        self.canvas.itemconfigure(self.sub_id, state="hidden")
+        if no_speech:
+            self.canvas.itemconfigure(
+                self.sub_id, text="Hold Right Ctrl while you speak", state="normal"
+            )
+        else:
+            self.canvas.itemconfigure(self.sub_id, state="hidden")
         self.canvas.itemconfigure(self.bar_track_id, state="normal")
         span = max(1, self.bar_right - self.bar_left)
         fill_right = self.bar_left + max(0, int(span * progress / 100))
@@ -294,14 +415,30 @@ class Overlay:
         ]
 
     def tick(self):
+        if self.backend_down:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+            return
         now = time.monotonic()
         if self.finishing and self.progress >= 100:
-            self.done_until = now + 0.85
+            self.done_until = now + 1.4
             self.done_shown = True
         if self.active:
             self.done_shown = False
 
-        show = self.active or self.finishing
+        loading = bool(self.loading) and not self.ready and not self.active and not self.finishing
+        no_speech = self._no_speech()
+        error = (
+            bool(self.error_text)
+            and now < self.error_until
+            and not self.active
+            and not self.finishing
+            and not loading
+            and not no_speech
+        )
+        show = self.active or self.finishing or loading or error
         done = False
         if not show:
             if self.done_shown and now < self.done_until:
@@ -315,11 +452,21 @@ class Overlay:
                 self.root.deiconify()
                 self.root.attributes("-alpha", 1.0)
                 self.root.attributes("-topmost", True)
+                self.ensure_topmost()
                 self.visible = True
-            signature = ("done" if done else "active" if self.active else ("typing", self.progress))
+            if error:
+                signature = ("error", self.error_text)
+            elif loading:
+                signature = ("loading", self.install_progress)
+            elif done:
+                signature = "done"
+            elif self.active:
+                signature = "active"
+            else:
+                signature = ("typing", self.progress)
             if signature != self.signature:
                 self.signature = signature
-                self._render(done)
+                self._render(done, loading, error)
         elif self.visible:
             self.root.attributes("-alpha", 0.0)
             self.root.withdraw()
@@ -352,8 +499,14 @@ def main():
     args = parser.parse_args()
     if not acquire_single_instance():
         return 0
-    Overlay(args.port)
+    print(f"Watching http://127.0.0.1:{args.port}/api/speech/status", flush=True)
+    try:
+        Overlay(args.port)
+    except Exception:
+        traceback.print_exc()
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
