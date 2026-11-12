@@ -14,7 +14,46 @@ const distDir = path.join(appRoot, "dist");
 // the Chromium sandbox disabled avoids requiring a root-owned setuid
 // chrome-sandbox helper on every user machine, so the folder works identically
 // after a clone, a ZIP extraction or an in-app update.
-if (process.platform === "linux") app.commandLine.appendSwitch("no-sandbox");
+if (process.platform === "linux") {
+  app.commandLine.appendSwitch("no-sandbox");
+  // NixOS and minimal distributions do not have an FHS libEGL.so.1. Chromium's
+  // ANGLE backend otherwise dies before a window is painted. Use the bundled
+  // SwiftShader software renderer when the system EGL library is absent, or
+  // when the user explicitly asks for software rendering. WebGL still works.
+  const eglCandidates = [
+    "/usr/lib/x86_64-linux-gnu/libEGL.so.1",
+    "/usr/lib64/libEGL.so.1",
+    "/usr/lib/libEGL.so.1",
+    "/lib/x86_64-linux-gnu/libEGL.so.1",
+    "/lib64/libEGL.so.1",
+  ];
+  const hasSystemEgl = eglCandidates.some((file) => {
+    try {
+      return fs.existsSync(file);
+    } catch {
+      return false;
+    }
+  });
+  const nixos = (() => {
+    try {
+      return fs.existsSync("/etc/NIXOS");
+    } catch {
+      return false;
+    }
+  })() || Boolean(process.env.NIX_STORE);
+  const softwareRendering =
+    process.env.CREATOR_STUDIO_GPU !== "1" &&
+    (nixos || !hasSystemEgl || process.env.CREATOR_STUDIO_SOFTWARE_GL === "1");
+  if (softwareRendering) {
+    app.commandLine.appendSwitch("use-gl", "angle");
+    app.commandLine.appendSwitch("use-angle", "swiftshader");
+    app.commandLine.appendSwitch("enable-unsafe-swiftshader");
+    app.commandLine.appendSwitch("disable-gpu-sandbox");
+    console.log(
+      "[Creator Studio] Starting with the bundled SwiftShader renderer because a system libEGL was not found or software rendering was requested.",
+    );
+  }
+}
 
 app.setName("Creator Studio");
 app.setAppUserModelId("com.twilightstudio.creatorstudio3d");

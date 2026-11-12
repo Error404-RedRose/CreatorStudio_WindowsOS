@@ -110,6 +110,27 @@ export function createSpeechService({ dataDir, getConfig }) {
     return packaged.some((file) => fsSync.existsSync(file)) || Boolean(explicit && fsSync.existsSync(explicit));
   }
 
+  function speechLibraryEnv() {
+    if (process.platform !== "linux") return {};
+    const dirs = [
+      process.env.LD_LIBRARY_PATH || "",
+      "/run/current-system/sw/lib",
+      "/usr/lib",
+      "/usr/lib/x86_64-linux-gnu",
+      "/usr/local/lib",
+    ];
+    try {
+      // NixOS keeps PortAudio/PulseAudio/ALSA in the Nix store rather than
+      // /usr/lib. Give the speech child process a library path so sounddevice
+      // can load them without asking the user to install anything.
+      for (const entry of fsSync.readdirSync("/nix/store")) {
+        if (!/(portaudio|pulseaudio|pipewire|alsa-lib|libpulse)/i.test(entry)) continue;
+        dirs.push(path.join("/nix/store", entry, "lib"));
+      }
+    } catch {}
+    return { LD_LIBRARY_PATH: [...new Set(dirs.filter(Boolean))].join(":") };
+  }
+
   function systemPython() {
     return firstExisting([
       process.env.TWIX_SYSTEM_PYTHON || "",
@@ -679,6 +700,7 @@ export function createSpeechService({ dataDir, getConfig }) {
         windowsHide: true,
         env: {
           ...process.env,
+          ...speechLibraryEnv(),
           PYTHONUNBUFFERED: "1",
           PYTHONIOENCODING: "utf-8",
           TWIX_MODEL: model,
@@ -922,6 +944,7 @@ export function createSpeechService({ dataDir, getConfig }) {
         windowsHide: true,
         env: {
           ...process.env,
+          ...speechLibraryEnv(),
           PYTHONUNBUFFERED: "1",
           PYTHONIOENCODING: "utf-8",
         },

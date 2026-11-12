@@ -188,8 +188,8 @@ async function restoreLfsFiles(root) {
 }
 
 function chmodExecutables(root, executableName) {
-  const names = new Set([executableName, "chrome-sandbox", "chrome_crashpad_handler", "install.sh"]);
-  const candidates = [path.join(root, executableName), path.join(root, "chrome-sandbox"), path.join(root, "chrome_crashpad_handler")];
+  const names = new Set([executableName, "creator-studio-launcher", "chrome-sandbox", "chrome_crashpad_handler", "install.sh"]);
+  const candidates = [path.join(root, executableName), path.join(root, "creator-studio-launcher"), path.join(root, "chrome-sandbox"), path.join(root, "chrome_crashpad_handler")];
   for (const candidate of candidates) {
     try {
       if (fssync.existsSync(candidate)) fssync.chmodSync(candidate, 0o755);
