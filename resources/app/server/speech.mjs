@@ -3,12 +3,20 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SPEECH_TOOLS = path.join(APP_ROOT, "tools", "speech");
 const REQUIREMENTS_FILE = path.join(SPEECH_TOOLS, "requirements.txt");
+const REQUIREMENTS_LINUX_FILE = path.join(SPEECH_TOOLS, "requirements-linux.txt");
 const INSTALL_RETRY_MS = 10 * 60 * 1000;
+
+function speechRequirementsFile() {
+  return process.platform === "linux" && fsSync.existsSync(REQUIREMENTS_LINUX_FILE)
+    ? REQUIREMENTS_LINUX_FILE
+    : REQUIREMENTS_FILE;
+}
 
 function firstExisting(candidates) {
   for (const candidate of candidates) {
@@ -21,7 +29,7 @@ function firstExisting(candidates) {
   return "";
 }
 
-export function createSpeechService({ dataDir, getConfig }) {
+export function createSpeechService({ dataDir, getConfig, onTranscript }) {
   const controlFile = path.join(dataDir, "speech-ptt.txt");
   const controlTag = "speech-ptt.txt";
   const venvDir = path.join(dataDir, "speech-venv");
@@ -38,6 +46,7 @@ export function createSpeechService({ dataDir, getConfig }) {
   let lastWarning = "";
   let lastTranscript = "";
   let lastAudio = null;
+  let typeBackend = "";
   let doneAt = 0;
   let overlayChild = null;
   let overlayRestartTimer = null;
@@ -80,7 +89,10 @@ export function createSpeechService({ dataDir, getConfig }) {
 
   function requirementsFingerprint() {
     try {
-      return createHash("sha256").update(fsSync.readFileSync(REQUIREMENTS_FILE)).digest("hex").slice(0, 16);
+      return createHash("sha256")
+        .update(fsSync.readFileSync(speechRequirementsFile()))
+        .digest("hex")
+        .slice(0, 16);
     } catch {
       return "";
     }
@@ -93,6 +105,66 @@ export function createSpeechService({ dataDir, getConfig }) {
       return Boolean(marker?.requirements && marker.requirements === requirementsFingerprint());
     } catch {
       return false;
+    }
+  }
+
+  const SPEECH_PYTHON_VERSION = "3.11.18";
+  const SPEECH_PYTHON_BUILD = "20261110";
+
+  async function ensureLinuxSpeechPython() {
+    const arch =
+      process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : "";
+    if (!arch) throw new Error(`No bundled speech runtime is available for Linux/${process.arch}.`);
+    const runtimeRoot = path.join(dataDir, "speech-runtime");
+    const runtimePython = path.join(runtimeRoot, "bin", `python${SPEECH_PYTHON_VERSION}`);
+    if (fsSync.existsSync(runtimePython)) return runtimePython;
+    const archive = path.join(dataDir, `speech-runtime-${SPEECH_PYTHON_BUILD}.tar.gz`);
+    const url =
+      `https://github.com/astral-sh/python-build-standalone/releases/download/` +
+      `${SPEECH_PYTHON_BUILD}/cpython-${SPEECH_PYTHON_VERSION}%2B${SPEECH_PYTHON_BUILD}-` +
+      `${arch}-unknown-linux-gnu-install_only.tar.gz`;
+    appendInstallLog(`Downloading the Creator Studio speech runtime (${arch})...`);
+    installProgress = Math.max(installProgress, 8);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5 * 60 * 1000);
+    try {
+      const response = await fetch(url, {
+        redirect: "follow",
+        signal: controller.signal,
+        headers: { "User-Agent": "Creator-Studio-Speech" },
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`Speech runtime download failed: HTTP ${response.status}`);
+      }
+      await fs.mkdir(path.dirname(archive), { recursive: true });
+      await fs.rm(archive, { force: true });
+      await new Promise((resolve, reject) => {
+        const output = fsSync.createWriteStream(archive);
+        Readable.fromWeb(response.body).pipe(output);
+        output.on("finish", resolve);
+        output.on("error", reject);
+        response.body.on?.("error", reject);
+      });
+      appendInstallLog("Extracting the speech runtime...");
+      fsSync.mkdirSync(runtimeRoot, { recursive: true });
+      const result = spawnSync(
+        "tar",
+        ["-xzf", archive, "-C", runtimeRoot, "--strip-components", "1"],
+        { encoding: "utf8", timeout: 120000, windowsHide: true },
+      );
+      if (result.status !== 0) {
+        throw new Error(
+          `Could not extract the speech runtime: ${String(result.stderr || result.error || "tar failed").slice(0, 300)}`,
+        );
+      }
+      if (!fsSync.existsSync(runtimePython)) {
+        throw new Error("The speech runtime archive did not contain python3.11.");
+      }
+      appendInstallLog("Speech runtime ready.");
+      return runtimePython;
+    } finally {
+      clearTimeout(timer);
+      fs.rm(archive, { force: true }).catch(() => {});
     }
   }
 
@@ -114,6 +186,8 @@ export function createSpeechService({ dataDir, getConfig }) {
     if (process.platform !== "linux") return {};
     const dirs = [
       process.env.LD_LIBRARY_PATH || "",
+      path.join(dataDir, "speech-runtime", "lib"),
+      path.join(dataDir, "speech-venv", "lib"),
       "/run/current-system/sw/lib",
       "/usr/lib",
       "/usr/lib/x86_64-linux-gnu",
@@ -173,6 +247,7 @@ export function createSpeechService({ dataDir, getConfig }) {
           windowsHide: true,
           env: {
             ...process.env,
+            ...speechLibraryEnv(),
             PYTHONUNBUFFERED: "1",
             PIP_DISABLE_PIP_VERSION_CHECK: "1",
             PIP_NO_INPUT: "1",
@@ -203,7 +278,7 @@ export function createSpeechService({ dataDir, getConfig }) {
     if (installPromise) return installPromise;
     if (installing) return null;
     if (requirementsFingerprint() === "") {
-      installError = `The speech requirements file is missing: ${REQUIREMENTS_FILE}`;
+      installError = `The speech requirements file is missing: ${speechRequirementsFile()}`;
       return null;
     }
     installing = true;
@@ -213,17 +288,24 @@ export function createSpeechService({ dataDir, getConfig }) {
     lastInstallAttemptAt = Date.now();
     appendInstallLog(`Preparing the Creator Studio speech engine in ${venvDir}`);
     installPromise = (async () => {
-      const basePython = systemPython();
-      if (!basePython) {
+      const basePython = (() => {
+        if (process.platform !== "linux") return systemPython();
+        return ensureLinuxSpeechPython().catch((error) => {
+          appendInstallLog(`Bundled speech runtime unavailable: ${error.message}`);
+          return systemPython();
+        });
+      })();
+      const resolvedPython = await basePython;
+      if (!resolvedPython) {
         throw new Error(
           "Python 3 was not found. Install Python 3 (with venv/pip) from your distribution package manager, then restart Creator Studio.",
         );
       }
-      appendInstallLog(`Using ${basePython} to create the speech environment`);
+      appendInstallLog(`Using ${resolvedPython} to create the speech environment`);
       const hasVenvPython = fsSync.existsSync(venvPython);
       if (!hasVenvPython) {
         installProgress = 10;
-        await runStreaming(basePython, ["-m", "venv", venvDir], (line) => appendInstallLog(line));
+        await runStreaming(resolvedPython, ["-m", "venv", venvDir], (line) => appendInstallLog(line));
         if (!fsSync.existsSync(venvPython)) {
           throw new Error("Python created no virtual environment. Install the venv module (for example python3-venv) and retry.");
         }
@@ -233,7 +315,7 @@ export function createSpeechService({ dataDir, getConfig }) {
       installProgress = 45;
       await runStreaming(
         venvPython,
-        ["-m", "pip", "install", "-r", REQUIREMENTS_FILE, "--disable-pip-version-check", "--no-input"],
+        ["-m", "pip", "install", "-r", speechRequirementsFile(), "--disable-pip-version-check", "--no-input"],
         (line) => appendInstallLog(line),
       );
       installProgress = 95;
@@ -333,6 +415,8 @@ export function createSpeechService({ dataDir, getConfig }) {
         at: Date.now(),
       };
     }
+    const typeMatch = text.match(/\[Type\]\s+backend=(\S+)/);
+    if (typeMatch) typeBackend = typeMatch[1];
     if (text.includes("[ASR]")) {
       lastTranscript = text.replace(/^\[ASR\]\s*/, "").slice(0, 500);
       if (/no speech detected/i.test(lastTranscript)) {
@@ -343,6 +427,13 @@ export function createSpeechService({ dataDir, getConfig }) {
         lastWarning = audible
           ? "No speech was detected in that clip. Check the selected microphone and speak a little closer."
           : "";
+      } else if (onTranscript && /unavailable/i.test(typeBackend)) {
+        // Linux without wtype/ydotool/xdotool cannot inject keys system-wide.
+        // Send the transcript to Creator Studio so it can insert it into the
+        // focused input instead of losing the text.
+        try {
+          onTranscript(lastTranscript);
+        } catch {}
       }
     }
     if (text.includes("[WARN]")) {

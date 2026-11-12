@@ -23,8 +23,17 @@ import time
 from collections import deque
 
 import numpy as np
-import sounddevice as sd
 import webrtcvad
+
+try:
+    import sounddevice as sd
+except Exception as _sd_error:
+    sd = None
+
+try:
+    import soundcard as sc
+except Exception:
+    sc = None
 
 SAMPLE_RATE_HZ = 16000
 FRAME_MS = 30
@@ -70,6 +79,8 @@ def log(message: str) -> None:
 
 def refresh_devices() -> None:
     """Re-enumerate PortAudio so a headset connected later is visible."""
+    if sd is None:
+        return
     try:
         sd._terminate()
     except Exception:
@@ -154,6 +165,8 @@ def read_control(path: str) -> bool:
 
 
 def play_tone(freq_hz: float, duration_ms: int, volume: float = 0.2) -> None:
+    if sd is None:
+        return
     try:
         duration_s = duration_ms / 1000.0
         samples = int(SAMPLE_RATE_HZ * duration_s)
@@ -910,6 +923,182 @@ class Microphone:
         self.last_block_at = time.monotonic()
 
 
+class SoundcardMicrophone:
+    """PulseAudio/PipeWire capture without PortAudio.
+
+    NixOS and minimal images do not provide an FHS libportaudio, but the
+    desktop audio server is always available. soundcard talks to PulseAudio
+    (including PipeWire's Pulse compatibility) and records at 16 kHz.
+    """
+
+    def __init__(self):
+        self.vad = webrtcvad.Vad(VAD_MODE)
+        self.audio_q: queue.Queue = queue.Queue(maxsize=480)
+        self.pending = bytearray()
+        self.mic = None
+        self.thread = None
+        self.stop_event = threading.Event()
+        self.device_value = ""
+        self.device_name = "system default"
+        self.started_at = 0.0
+        self.last_block_at = 0.0
+        self.block_count = 0
+        self.peak = 0
+        self.stream_error = ""
+        self.last_detected = []
+
+    @staticmethod
+    def _microphones():
+        return list(sc.all_microphones(include_loopback=False))
+
+    def _resolve(self, value: str):
+        microphones = self._microphones()
+        self.last_detected = [" ".join(str(item.name).split()) for item in microphones[:8]]
+        if value:
+            try:
+                index = int(value)
+                if 0 <= index < len(microphones):
+                    return microphones[index]
+            except Exception:
+                pass
+            needle = str(value).strip().lower()
+            for item in microphones:
+                if needle and needle in str(item.name).lower():
+                    return item
+        try:
+            return sc.default_microphone()
+        except Exception:
+            return microphones[0] if microphones else None
+
+    def start(self, device_value: str = "") -> None:
+        if sc is None:
+            raise RuntimeError(
+                "The Linux speech capture backend is missing. Creator Studio is preparing it automatically."
+            )
+        self.device_value = str(device_value or "")
+        self.stream_error = ""
+        self.pending.clear()
+        self.audio_q = queue.Queue(maxsize=480)
+        self.mic = self._resolve(self.device_value)
+        if self.mic is None:
+            raise RuntimeError("No PulseAudio/PipeWire microphone was found.")
+        self.device_name = " ".join(str(self.mic.name).split())
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+        self.started_at = time.monotonic()
+        self.last_block_at = self.started_at
+        self.block_count = 0
+        self.peak = 0
+        for _ in range(20):
+            if self.block_count > 0 or self.stream_error:
+                break
+            time.sleep(0.05)
+        if self.stream_error:
+            raise RuntimeError(self.stream_error)
+        log(f"[Mic] Using PulseAudio/PipeWire input: {self.device_name}")
+
+    def _loop(self) -> None:
+        try:
+            with self.mic.recorder(samplerate=SAMPLE_RATE_HZ, channels=1) as recorder:
+                while not self.stop_event.is_set():
+                    data = recorder.record(numframes=FRAME_SAMPLES)
+                    if data is None:
+                        continue
+                    samples = np.asarray(data, dtype=np.float32).reshape(-1)
+                    if samples.size == 0:
+                        continue
+                    pcm = np.clip(samples, -1.0, 1.0)
+                    pcm = (pcm * 32767.0).astype(np.int16).tobytes()
+                    self.last_block_at = time.monotonic()
+                    self.block_count += 1
+                    if len(pcm) >= 2:
+                        try:
+                            self.peak = max(
+                                self.peak,
+                                int(np.max(np.abs(np.frombuffer(pcm, dtype=np.int16)))),
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        self.audio_q.put_nowait(pcm)
+                    except queue.Full:
+                        try:
+                            self.audio_q.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            self.audio_q.put_nowait(pcm)
+                        except queue.Full:
+                            pass
+        except Exception as error:
+            self.stream_error = str(error)
+            log(f"[ERROR] PulseAudio/PipeWire capture failed: {error}")
+
+    def read_frame(self, timeout: float = 0.1):
+        try:
+            block = self.audio_q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        self.pending.extend(block)
+        if len(self.pending) < FRAME_BYTES:
+            return None
+        frame = bytes(self.pending[:FRAME_BYTES])
+        del self.pending[:FRAME_BYTES]
+        return frame
+
+    def drain(self, limit: int = 400) -> None:
+        count = 0
+        while count < limit:
+            try:
+                self.audio_q.get_nowait()
+                count += 1
+            except queue.Empty:
+                break
+        self.pending.clear()
+
+    def is_stale(self, seconds: float = 12.0) -> bool:
+        if self.thread is None or not self.thread.is_alive():
+            return True
+        return time.monotonic() - self.last_block_at > seconds
+
+    def restart(self) -> None:
+        log("[Mic] Reopening the PulseAudio/PipeWire input...")
+        self.stop()
+        time.sleep(0.15)
+        self.start(self.device_value)
+        log(f"[Mic] Reopened: {self.device_name}")
+
+    def snapshot(self):
+        return {
+            "device": self.device_name,
+            "blocks": self.block_count,
+            "peak": self.peak,
+            "lastBlockAgeMs": int((time.monotonic() - self.last_block_at) * 1000)
+            if self.last_block_at
+            else -1,
+            "streamError": self.stream_error,
+        }
+
+    def trim(self, frames):
+        return Microphone.trim(self, frames)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        thread = self.thread
+        self.thread = None
+        if thread is not None and thread.is_alive():
+            try:
+                thread.join(timeout=1.5)
+            except Exception:
+                pass
+        try:
+            self.drain()
+        except Exception:
+            pass
+        self.last_block_at = time.monotonic()
+
+
 def load_model(model_size: str, device: str):
     log(f"[Init] Loading faster-whisper '{model_size}' on {device}...")
     from faster_whisper import WhisperModel
@@ -1087,30 +1276,53 @@ def main() -> int:
     # single-instance mutex. Handle it before acquiring the mutex.
     if args.list_devices:
         devices = []
+        use_soundcard = sys.platform.startswith("linux") and sc is not None
         try:
-            default_input = sd.default.device[0]
-            recommended_index = Microphone.choose_default_device()[0]
-            for index, device in enumerate(sd.query_devices()):
-                if device.get("max_input_channels", 0) > 0:
-                    name = " ".join(str(device.get("name", "Microphone")).split())
-                    try:
-                        host = sd.query_hostapis(device.get("hostapi", 0)).get("name", "unknown")
-                    except Exception:
-                        host = "unknown"
-                    usable = "wdm-ks" not in host.lower()
-                    virtual = Microphone.is_virtual_device(name)
+            if use_soundcard:
+                microphones = list(sc.all_microphones(include_loopback=False))
+                try:
+                    default_mic = sc.default_microphone()
+                    default_name = " ".join(str(default_mic.name).split())
+                except Exception:
+                    default_name = ""
+                for index, microphone in enumerate(microphones):
+                    name = " ".join(str(microphone.name).split())
                     devices.append(
                         {
                             "index": index,
                             "name": name,
-                            "channels": device.get("max_input_channels", 0),
-                            "default": index == default_input,
-                            "recommended": index == recommended_index and usable and not virtual,
-                            "usable": usable,
-                            "virtual": virtual,
-                            "host": host,
+                            "channels": 1,
+                            "default": name == default_name,
+                            "recommended": name == default_name,
+                            "usable": True,
+                            "virtual": Microphone.is_virtual_device(name),
+                            "host": "PulseAudio/PipeWire",
                         }
                     )
+            elif sd is not None:
+                default_input = sd.default.device[0]
+                recommended_index = Microphone.choose_default_device()[0]
+                for index, device in enumerate(sd.query_devices()):
+                    if device.get("max_input_channels", 0) > 0:
+                        name = " ".join(str(device.get("name", "Microphone")).split())
+                        try:
+                            host = sd.query_hostapis(device.get("hostapi", 0)).get("name", "unknown")
+                        except Exception:
+                            host = "unknown"
+                        usable = "wdm-ks" not in host.lower()
+                        virtual = Microphone.is_virtual_device(name)
+                        devices.append(
+                            {
+                                "index": index,
+                                "name": name,
+                                "channels": device.get("max_input_channels", 0),
+                                "default": index == default_input,
+                                "recommended": index == recommended_index and usable and not virtual,
+                                "usable": usable,
+                                "virtual": virtual,
+                                "host": host,
+                            }
+                        )
         except Exception as error:
             log(f"[ERROR] Could not list microphones: {error}")
         devices.sort(key=lambda item: (not item["recommended"], not item["usable"], item["virtual"], item["index"]))
@@ -1130,7 +1342,8 @@ def main() -> int:
     transcriber = Transcriber(model, args.language, not args.no_type, args.stdout, args.type_delay)
     log(f"[Type] backend={transcriber.typer_backend} delay={transcriber.type_delay:.3f}s")
 
-    mic = Microphone()
+    use_soundcard = sys.platform.startswith("linux") and sc is not None
+    mic = SoundcardMicrophone() if use_soundcard else Microphone()
     attempts = 0
     while True:
         try:
@@ -1147,7 +1360,7 @@ def main() -> int:
                     log("[Mic] Detected inputs: " + (", ".join(mic.last_detected[:8]) or "none"))
                 log(f"[WARN] Microphone not available yet: {error}")
                 log(
-                    "[MIC] Waiting for a microphone. Connect it or enable it in Windows Sound settings; "
+                    "[MIC] Waiting for a microphone. Connect it or enable it in your system sound settings; "
                     "the engine will start automatically when a device appears."
                 )
             elif attempts % 6 == 0:

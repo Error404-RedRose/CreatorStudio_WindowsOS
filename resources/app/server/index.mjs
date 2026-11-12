@@ -105,6 +105,14 @@ const speechService = createSpeechService({
       typeDelay: Number(settings.speech?.typeDelay ?? 0.03),
     };
   },
+  onTranscript: (text) => {
+    const message = JSON.stringify({ type: "speech.transcript", text: String(text || "") });
+    for (const sockets of clients.values()) {
+      for (const socket of sockets) {
+        if (socket.readyState === 1) socket.send(message);
+      }
+    }
+  },
 });
 const collabService = createCollabService({ dataDir: DATA_DIR, appRoot: APP_ROOT, log });
 

@@ -45,10 +45,26 @@ if (process.platform === "linux") {
     process.env.CREATOR_STUDIO_GPU !== "1" &&
     (nixos || !hasSystemEgl || process.env.CREATOR_STUDIO_SOFTWARE_GL === "1");
   if (softwareRendering) {
-    app.commandLine.appendSwitch("use-gl", "angle");
-    app.commandLine.appendSwitch("use-angle", "swiftshader");
+    try {
+      process.chdir(appRoot);
+    } catch {}
+    const vkIcd = path.join(appRoot, "vk_swiftshader_icd.json");
+    if (fs.existsSync(vkIcd)) {
+      // The bundled SwiftShader Vulkan ICD uses a relative library path. Give
+      // the loader the absolute manifest so the GPU process can find it even
+      // when launched from a desktop menu.
+      process.env.VK_ICD_FILENAMES = vkIcd;
+      process.env.VK_DRIVER_FILES = vkIcd;
+    }
+    app.commandLine.appendSwitch("use-gl", process.env.CREATOR_STUDIO_GL === "swiftshader" ? "swiftshader" : "angle");
+    if (process.env.CREATOR_STUDIO_GL !== "swiftshader") {
+      app.commandLine.appendSwitch("use-angle", "swiftshader");
+    }
     app.commandLine.appendSwitch("enable-unsafe-swiftshader");
     app.commandLine.appendSwitch("disable-gpu-sandbox");
+    app.commandLine.appendSwitch("ignore-gpu-blocklist");
+    app.commandLine.appendSwitch("enable-webgl");
+    app.commandLine.appendSwitch("enable-features", "Vulkan");
     console.log(
       "[Creator Studio] Starting with the bundled SwiftShader renderer because a system libEGL was not found or software rendering was requested.",
     );
