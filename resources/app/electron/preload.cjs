@@ -18,7 +18,7 @@ contextBridge.exposeInMainWorld("twixDesktop", {
   saveTextFile: (defaultName, content, filters) => ipcRenderer.invoke("file:saveText", { defaultName, content, filters }),
   openTextFile: (filters) => ipcRenderer.invoke("file:openText", { filters }),
   checkForUpdates: (force) => ipcRenderer.invoke("updates:check", Boolean(force)),
-  applyUpdate: () => ipcRenderer.invoke("updates:apply"),
+  applyUpdate: (force) => ipcRenderer.invoke("updates:apply", Boolean(force)),
   setZoomFactor: (factor) => ipcRenderer.send("app:set-zoom", Number(factor)),
   log: (entry) => ipcRenderer.send("app:log", entry),
   onHome: (callback) => {

@@ -443,7 +443,7 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
     }
   }
 
-  async function beginUpdate() {
+  async function beginUpdate(force = false) {
     const mode = currentMode(app);
     if (mode !== "packaged") {
       return {
@@ -460,8 +460,11 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
       if (status.error) {
         return { ok: false, error: status.error };
       }
-      if (!status.updateAvailable) {
+      if (!status.updateAvailable && !force) {
         return { ok: false, error: "Creator Studio is already up to date." };
+      }
+      if (!status.remoteVersion) {
+        return { ok: false, error: "The published version could not be determined." };
       }
 
       let exePath = app.getPath("exe");
@@ -616,7 +619,7 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
   }
 
   ipcMain.handle("updates:check", (_event, force) => checkForUpdates(Boolean(force)));
-  ipcMain.handle("updates:apply", () => beginUpdate());
+  ipcMain.handle("updates:apply", (_event, force) => beginUpdate(Boolean(force)));
 
   mainLog("info", "updates", "update handlers ready", {
     repo: UPDATE_REPO,
