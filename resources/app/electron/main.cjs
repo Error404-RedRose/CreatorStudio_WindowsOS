@@ -16,6 +16,9 @@ const distDir = path.join(appRoot, "dist");
 // after a clone, a ZIP extraction or an in-app update.
 if (process.platform === "linux") {
   app.commandLine.appendSwitch("no-sandbox");
+  // Chromium's shared-memory allocator can wait forever on small containers
+  // and some NixOS sandboxes. /tmp is always available for this user process.
+  app.commandLine.appendSwitch("disable-dev-shm-usage");
   // NixOS and minimal distributions do not have an FHS libEGL.so.1. Chromium's
   // ANGLE backend otherwise dies before a window is painted. Use the bundled
   // SwiftShader software renderer when the system EGL library is absent, or
@@ -41,7 +44,21 @@ if (process.platform === "linux") {
       return false;
     }
   })() || Boolean(process.env.NIX_STORE);
+  const disableGpu = process.env.CREATOR_STUDIO_DISABLE_GPU === "1";
+  if (disableGpu) {
+    app.commandLine.appendSwitch("disable-gpu");
+    console.log("[Creator Studio] GPU acceleration disabled by CREATOR_STUDIO_DISABLE_GPU=1.");
+  }
+  // Wayland sessions without XWayland otherwise wait for an X server that is
+  // not there. Let Chromium choose the active session when both are present.
+  if (process.env.WAYLAND_DISPLAY && !process.env.DISPLAY) {
+    app.commandLine.appendSwitch("ozone-platform", "wayland");
+    console.log("[Creator Studio] Starting on the Wayland Ozone backend.");
+  } else {
+    app.commandLine.appendSwitch("ozone-platform-hint", "auto");
+  }
   const softwareRendering =
+    !disableGpu &&
     process.env.CREATOR_STUDIO_GPU !== "1" &&
     (nixos || !hasSystemEgl || process.env.CREATOR_STUDIO_SOFTWARE_GL === "1");
   if (softwareRendering) {
@@ -64,7 +81,6 @@ if (process.platform === "linux") {
     app.commandLine.appendSwitch("disable-gpu-sandbox");
     app.commandLine.appendSwitch("ignore-gpu-blocklist");
     app.commandLine.appendSwitch("enable-webgl");
-    app.commandLine.appendSwitch("enable-features", "Vulkan");
     console.log(
       "[Creator Studio] Starting with the bundled SwiftShader renderer because a system libEGL was not found or software rendering was requested.",
     );
@@ -96,8 +112,12 @@ let overlayTimer = null;
 let quitting = false;
 let serverProc = null;
 let serverPort = 4317;
+let backendFailure = "";
+let windowShownLogged = false;
 
 const logDir = () => path.join(app.getPath("userData"), "data", "logs");
+const logFile = () => path.join(logDir(), "electron-" + new Date().toISOString().slice(0, 10) + ".jsonl");
+const mirrorLogs = process.platform !== "win32" || process.env.TWIX_LOG_STDOUT === "1";
 function writeMainLog(entry) {
   try {
     fs.mkdirSync(logDir(), { recursive: true });
@@ -106,7 +126,13 @@ function writeMainLog(entry) {
   } catch {}
 }
 function mainLog(level, source, message, data) {
-  writeMainLog({ ts: new Date().toISOString(), level, source, message, data });
+  const entry = { ts: new Date().toISOString(), level, source, message, data };
+  writeMainLog(entry);
+  if (!mirrorLogs) return;
+  const suffix = data && Object.keys(data).length ? " " + JSON.stringify(data) : "";
+  const line = `[Creator Studio] ${entry.ts} ${String(level).toUpperCase()} ${source}: ${message}${suffix}`;
+  if (level === "error" || level === "warning") console.error(line);
+  else console.log(line);
 }
 process.on("uncaughtException", (error) => {
   mainLog("error", "electron", "uncaughtException", { message: error?.message, stack: error?.stack });
@@ -147,6 +173,7 @@ function killTree(proc) {
 async function waitForServer(url, timeoutMs = 60000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    if (backendFailure) return false;
     try {
       const response = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(1500) });
       if (response.ok) return true;
@@ -154,6 +181,15 @@ async function waitForServer(url, timeoutMs = 60000) {
     await new Promise((resolve) => setTimeout(resolve, 350));
   }
   return false;
+}
+
+async function chooseServerPort() {
+  try {
+    return await freePort();
+  } catch (error) {
+    mainLog("warning", "electron", "free port probe failed; using 4317", { message: error?.message });
+    return 4317;
+  }
 }
 
 function dataDir() {
@@ -171,23 +207,47 @@ function defaultProjectDir() {
 
 function startServer() {
   fs.mkdirSync(dataDir(), { recursive: true });
+  backendFailure = "";
   mainLog("info", "electron", "starting backend", { serverScript, port: serverPort, dataDir: dataDir() });
-  serverProc = spawn(process.execPath, [serverScript, "--serve-dist"], {
-    cwd: appRoot,
-    env: {
-      ...process.env,
-      ELECTRON_RUN_AS_NODE: "1",
-      PORT: String(serverPort),
-      TWIX_DATA_DIR: dataDir(),
-      TWIX_DEFAULT_PROJECT_DIR: defaultProjectDir(),
-      TWIX_DESKTOP: "1",
-    },
-    windowsHide: true,
+  try {
+    serverProc = spawn(process.execPath, [serverScript, "--serve-dist"], {
+      cwd: appRoot,
+      env: {
+        ...process.env,
+        ELECTRON_RUN_AS_NODE: "1",
+        PORT: String(serverPort),
+        TWIX_DATA_DIR: dataDir(),
+        TWIX_DEFAULT_PROJECT_DIR: defaultProjectDir(),
+        TWIX_DESKTOP: "1",
+      },
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    backendFailure = `The backend process could not be started: ${error?.message || error}`;
+    mainLog("error", "electron", "backend spawn failed", { message: error?.message, stack: error?.stack });
+    return;
+  }
+  mainLog("info", "electron", "backend spawned", { pid: serverProc.pid });
+  serverProc.stdout?.on("data", (chunk) => {
+    process.stdout.write(`[server] ${chunk}`);
+    writeMainLog({ ts: new Date().toISOString(), level: "info", source: "backend.stdout", message: String(chunk).trim() });
   });
-  serverProc.stdout?.on("data", (chunk) => { process.stdout.write(`[server] ${chunk}`); mainLog("info", "backend.stdout", String(chunk).trim()); });
-  serverProc.stderr?.on("data", (chunk) => { process.stderr.write(`[server] ${chunk}`); mainLog("warning", "backend.stderr", String(chunk).trim()); });
-  serverProc.on("exit", (code) => {
-    mainLog("warning", "electron", "backend exited", { code });
+  serverProc.stderr?.on("data", (chunk) => {
+    process.stderr.write(`[server] ${chunk}`);
+    writeMainLog({ ts: new Date().toISOString(), level: "warning", source: "backend.stderr", message: String(chunk).trim() });
+  });
+  serverProc.on("error", (error) => {
+    backendFailure = `The backend process failed: ${error?.message || error}`;
+    mainLog("error", "electron", "backend process error", { message: error?.message, stack: error?.stack });
+  });
+  serverProc.on("exit", (code, signal) => {
+    mainLog("warning", "electron", "backend exited", { code, signal });
+    if (code && code !== 0 && !quitting) {
+      backendFailure = `The local backend stopped with exit code ${code}${signal ? ` (${signal})` : ""}.`;
+    } else if (!code && !quitting && !backendFailure) {
+      backendFailure = "The local backend closed unexpectedly before the window finished loading.";
+    }
     if (code && code !== 0 && mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send("twix:server-exit", code);
     }
@@ -267,6 +327,7 @@ function showMainWindow() {
       mainWindow.center();
       mainWindow.show();
       mainWindow.focus();
+      logWindowShown();
       return;
     }
     mainWindow.setResizable(false);
@@ -276,9 +337,16 @@ function showMainWindow() {
     mainWindow.setBounds({ x: area.x, y: area.y, width: area.width + 1, height: area.height + 1 }, false);
     mainWindow.show();
     mainWindow.focus();
+    logWindowShown();
   } catch (error) {
     mainLog("warning", "electron", "show window failed", { message: error?.message });
   }
+}
+
+function logWindowShown() {
+  if (windowShownLogged) return;
+  windowShownLogged = true;
+  mainLog("info", "electron", "window shown", { port: serverPort, backendFailure: backendFailure || null });
 }
 
 async function createWindow() {
@@ -331,7 +399,11 @@ async function createWindow() {
   mainWindow.setTitle("Creator Studio");
   mainLog("info", "electron", "window created", { dev: isDev, platform: process.platform, target: isDev ? "http://localhost:5173" : `http://127.0.0.1:${serverPort}` });
   mainWindow.once("ready-to-show", showMainWindow);
-  mainWindow.webContents.on("did-finish-load", showMainWindow);
+  mainWindow.webContents.on("did-finish-load", () => {
+    const loadedUrl = mainWindow?.webContents.getURL() || "";
+    mainLog("info", "electron", "page finished loading", { url: loadedUrl.startsWith("data:") ? "data: startup page" : loadedUrl });
+    showMainWindow();
+  });
   mainWindow.webContents.on("did-fail-load", (_event, code, description, url) => {
     mainLog("warning", "electron", "page load failed", { code, description, url });
     showMainWindow();
@@ -351,26 +423,36 @@ async function createWindow() {
   // Show a local loading page immediately. The backend can take a while to
   // start (or fail), and an invisible window during that wait looks like a
   // background process that did nothing.
+  const logPathHtml = logFile().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   try {
     await mainWindow.loadURL(
       `data:text/html;charset=utf-8,${encodeURIComponent(
-        `<body style="margin:0;background:#0b0a12;color:#ece8fa;font-family:Segoe UI,sans-serif;display:grid;place-items:center;height:100vh"><div style="max-width:560px;text-align:center"><h1 style="font-weight:600">Creator Studio</h1><p style="color:#9b95b2;line-height:1.6">Starting Creator Studio…</p></div></body>`,
+        `<body style="margin:0;background:#0b0a12;color:#ece8fa;font-family:Segoe UI,sans-serif;display:grid;place-items:center;height:100vh"><div style="max-width:620px;text-align:center"><h1 style="font-weight:600">Creator Studio</h1><p id="boot-status" style="color:#9b95b2;line-height:1.6">Starting Creator Studio…</p><p style="color:#6f6a82;line-height:1.6;font-size:12px;word-break:break-all">Logs: <code>${logPathHtml}</code></p></div><script>setTimeout(function(){var el=document.getElementById("boot-status");if(el)el.textContent="Still starting. The first launch can take a little longer while the local backend starts.";},12000);</script></body>`,
       )}`,
     );
   } catch {}
   showMainWindow();
 
   const target = isDev ? "http://localhost:5173" : `http://127.0.0.1:${serverPort}`;
-  const ready = await waitForServer(isDev ? target : `http://127.0.0.1:${serverPort}`, isDev ? 30000 : 60000);
+  const waitStarted = Date.now();
+  mainLog("info", "electron", "waiting for backend", { target, timeoutMs: isDev ? 30000 : 45000 });
+  const ready = await waitForServer(target, isDev ? 30000 : 45000);
+  mainLog("info", "electron", "backend wait finished", {
+    ready,
+    elapsedMs: Date.now() - waitStarted,
+    failure: backendFailure || null,
+  });
   if (ready) {
+    mainLog("info", "electron", "loading application shell", { target });
     await mainWindow.loadURL(target);
   } else {
     const message = isDev
       ? "The development server did not start. Run start.bat again or check the terminal for errors."
-      : "The TwiX backend did not start. Check the terminal log or try build.bat again.";
+      : "The local Creator Studio backend did not become ready. The window is visible so you can read this message; start the app from a terminal to see the live log, then use Try again.";
+    const detail = backendFailure ? `<p style="color:#fca5a5;line-height:1.6">${backendFailure.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>` : "";
     await mainWindow.loadURL(
       `data:text/html;charset=utf-8,${encodeURIComponent(
-        `<body style="margin:0;background:#0b0a12;color:#ece8fa;font-family:Segoe UI,sans-serif;display:grid;place-items:center;height:100vh"><div style="max-width:560px;text-align:center"><h1 style="font-weight:600">Creator Studio</h1><p style="color:#9b95b2;line-height:1.6">${message}</p></div></body>`,
+        `<body style="margin:0;background:#0b0a12;color:#ece8fa;font-family:Segoe UI,sans-serif;display:grid;place-items:center;height:100vh"><div style="max-width:660px;text-align:center"><h1 style="font-weight:600">Creator Studio</h1><p style="color:#9b95b2;line-height:1.6">${message}</p>${detail}<p style="color:#6f6a82;line-height:1.6;font-size:12px;word-break:break-all">Log: <code>${logPathHtml}</code></p><p><a href="${target}" style="display:inline-block;padding:10px 18px;border-radius:8px;background:#8b6cf6;color:#fff;text-decoration:none;font-weight:600">Try again</a></p><p style="color:#6f6a82;font-size:12px">On Linux, run <code>creator-studio</code> in a terminal to see startup messages live.</p></div></body>`,
       )}`,
     );
   }
@@ -509,25 +591,56 @@ if (!gotLock) {
     if (app.isReady()) void createWindow();
   });
 
-  mainLog("info", "electron", "app ready", { version: app.getVersion(), electron: process.versions.electron, userData: app.getPath("userData") });
+  const sessionType = process.env.XDG_SESSION_TYPE || (process.env.WAYLAND_DISPLAY ? "wayland" : process.env.DISPLAY ? "x11" : "unknown");
+  mainLog("info", "electron", "app ready", {
+    version: app.getVersion(),
+    electron: process.versions.electron,
+    platform: process.platform,
+    arch: process.arch,
+    sessionType,
+    display: process.env.DISPLAY || "",
+    wayland: process.env.WAYLAND_DISPLAY || "",
+    userData: app.getPath("userData"),
+    logFile: logFile(),
+    executable: process.execPath,
+  });
   app.on("render-process-gone", (_event, webContents, details) => mainLog("error", "electron", "render-process-gone", details));
   app.on("child-process-gone", (_event, details) => mainLog("error", "electron", "child-process-gone", details));
   app.whenReady().then(async () => {
-    const allowedPermissions = new Set(["clipboard-read", "clipboard-sanitized-write", "pointerLock"]);
-    session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-      callback(allowedPermissions.has(permission));
-    });
-    session.defaultSession.setPermissionCheckHandler((_webContents, permission) => allowedPermissions.has(permission));
+    try {
+      console.log(`[Creator Studio] v${app.getVersion()} starting on ${process.platform}/${process.arch} (${sessionType}).`);
+      console.log(`[Creator Studio] Logs: ${logFile()}`);
+      mainLog("info", "electron", "whenReady", { sessionType });
+      const allowedPermissions = new Set(["clipboard-read", "clipboard-sanitized-write", "pointerLock"]);
+      session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+        callback(allowedPermissions.has(permission));
+      });
+      session.defaultSession.setPermissionCheckHandler((_webContents, permission) => allowedPermissions.has(permission));
 
-    if (!isDev) {
-      serverPort = await freePort();
-      startServer();
+      if (!isDev) {
+        serverPort = await chooseServerPort();
+        mainLog("info", "electron", "backend port selected", { port: serverPort });
+        startServer();
+      }
+      await createWindow();
+      mainLog("info", "electron", "startup complete", { port: serverPort });
+
+      app.on("activate", () => {
+        if (BrowserWindow.getAllWindows().length === 0) {
+          void createWindow().catch((error) => mainLog("error", "electron", "activate createWindow failed", { message: error?.message }));
+        }
+      });
+    } catch (error) {
+      mainLog("error", "electron", "startup failed", { message: error?.message, stack: error?.stack });
+      console.error("[Creator Studio] Startup failed:", error);
+      try {
+        dialog.showErrorBox(
+          "Creator Studio could not start",
+          `${error?.message || error}\n\nLogs: ${logFile()}\n\nRun Creator Studio from a terminal to see the live startup log.`,
+        );
+      } catch {}
+      app.quit();
     }
-    await createWindow();
-
-    app.on("activate", () => {
-      if (BrowserWindow.getAllWindows().length === 0) void createWindow();
-    });
   });
 
   app.on("before-quit", (event) => {

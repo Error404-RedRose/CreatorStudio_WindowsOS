@@ -11451,26 +11451,53 @@ if (SERVE_DIST && fssync.existsSync(DIST_DIR)) {
   });
 }
 
+const bootStartedAt = Date.now();
+function bootLog(message, data) {
+  const suffix = data && Object.keys(data).length ? " " + JSON.stringify(data) : "";
+  console.log(`[boot +${Date.now() - bootStartedAt}ms] ${message}${suffix}`);
+}
+bootLog("Creator Studio server starting", {
+  version: APP_VERSION,
+  port: PORT,
+  serveDist: SERVE_DIST,
+  dataDir: DATA_DIR,
+  node: process.version,
+  platform: process.platform,
+  arch: process.arch,
+});
+
 await ensureDir(DATA_DIR);
 await ensureDir(LOG_DIR);
+bootLog("data directories ready");
 await migrateLegacyData();
+bootLog("legacy data check complete");
 await migrateGitHubToken();
 await pruneLogs();
+bootLog("log maintenance complete");
 await ensureDir(globalReferencesDir());
 await ensureDir(await normalizeProjectDir());
+bootLog("project and reference directories ready");
 await ensureExampleMod();
+bootLog("example mod ready");
 
 // Index saved reference folders and links as soon as the app boots. The
 // signature check keeps a warm index from being crawled again.
 scheduleReferenceIndex(2500);
 
-server.listen(PORT, "127.0.0.1", () => {
+const httpServer = server.listen(PORT, "127.0.0.1", () => {
   const url = `http://127.0.0.1:${PORT}`;
   console.log(`Creator Studio server ready on ${url}`);
+  bootLog("server listening", { url });
   log("info", "server", "ready", { url, dataDir: DATA_DIR, mcp: MCP_SERVER });
   console.log(`Data directory: ${DATA_DIR}`);
   console.log(`MCP bridge: ${MCP_SERVER}`);
   if (!SERVE_DIST) console.log(`Open the Vite dev server (usually http://localhost:5173)`);
+});
+httpServer.on("error", (error) => {
+  console.error(`[boot] Creator Studio server failed to listen on ${PORT}: ${error?.message || error}`);
+  log("error", "server", "listen failed", { port: PORT, message: error?.message, code: error?.code });
+  process.exitCode = 1;
+  setTimeout(() => process.exit(1), 50);
 });
 
 // Collaboration runs on its own LAN-facing port so the main app API is never

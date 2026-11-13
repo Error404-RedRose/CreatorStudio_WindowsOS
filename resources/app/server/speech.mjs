@@ -147,16 +147,14 @@ export function createSpeechService({ dataDir, getConfig, onTranscript }) {
       });
       appendInstallLog("Extracting the speech runtime...");
       fsSync.mkdirSync(runtimeRoot, { recursive: true });
-      const result = spawnSync(
+      // Never use spawnSync here: tar extraction runs while the backend is
+      // serving the UI, and a synchronous extract can freeze every API request
+      // (including the startup health check) for the whole extraction.
+      await runStreaming(
         "tar",
         ["-xzf", archive, "-C", runtimeRoot, "--strip-components", "1"],
-        { encoding: "utf8", timeout: 120000, windowsHide: true },
+        (line) => appendInstallLog(line),
       );
-      if (result.status !== 0) {
-        throw new Error(
-          `Could not extract the speech runtime: ${String(result.stderr || result.error || "tar failed").slice(0, 300)}`,
-        );
-      }
       if (!fsSync.existsSync(runtimePython)) {
         throw new Error("The speech runtime archive did not contain python3.11.");
       }
@@ -487,6 +485,7 @@ export function createSpeechService({ dataDir, getConfig, onTranscript }) {
       script,
       pythonFound: Boolean(python),
       scriptFound: Boolean(script),
+      runtimeAvailable: runtimeAvailable(),
       controlFile,
       venv: venvDir,
       venvPython,
@@ -1065,12 +1064,14 @@ export function createSpeechService({ dataDir, getConfig, onTranscript }) {
     }
   }
 
-  // A backend restart must not leave dictation dead until the user opens
-  // Settings. Read the saved config and warm the engine/overlay automatically.
+  // Warm an already-installed engine after the window has had time to boot.
+  // Never download or install the speech runtime during application startup:
+  // on Linux the first installation downloads Python and packages, and doing
+  // that before the UI is ready can make the app look permanently stuck.
   startupPrepareTimer = setTimeout(() => {
     startupPrepareTimer = null;
-    if (!shuttingDown) void prepare().catch(() => null);
-  }, 2500);
+    if (!shuttingDown && runtimeAvailable() && !installing) void prepare().catch(() => null);
+  }, 20000);
   startupPrepareTimer.unref?.();
 
   return { prepare, start, stop, restart, status, listDevices };
