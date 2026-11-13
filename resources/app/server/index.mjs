@@ -11097,27 +11097,165 @@ app.post("/api/studio3d/setup", async (req, res) => {
   }
 });
 
+const STUDIO3D_AI_CHUNK = 120;
+const STUDIO3D_AI_LIMIT = 600;
+
+async function studio3dAiSuggestions({ index, model, projectId }) {
+  if (!model?.providerID || !model?.modelID) return { suggestions: new Map(), used: false, error: "" };
+  const projectKey = String(projectId || "__global__");
+  let state = ocServers.get(projectKey) || ocServers.get("__global__");
+  let startError = "";
+  if (!state) {
+    // AI sort should work straight after launch even when the user has not
+    // opened Chat yet. Reuse a running server or start the selected model's
+    // OpenCode server on demand.
+    try {
+      state = await startOpenCode(projectKey, "prop", false);
+    } catch (error) {
+      startError = error.message;
+      log("warning", "studio3d", "AI sort could not start OpenCode", { message: error.message });
+    }
+  }
+  if (!state) {
+    return {
+      suggestions: new Map(),
+      used: false,
+      error: startError || "OpenCode is not connected, so the keyword sorter was used.",
+    };
+  }
+  const assets = [];
+  const seen = new Set();
+  const byPath = new Map();
+  const byName = new Map();
+  for (const asset of [...(index.models || []), ...(index.animations || []), ...(index.textures || [])]) {
+    if (!asset?.relative) continue;
+    const relative = String(asset.relative).replace(/\\/g, "/");
+    if (seen.has(relative)) continue;
+    seen.add(relative);
+    assets.push({
+      path: relative,
+      name: asset.name,
+      ext: asset.ext,
+      rigged: Boolean(asset.rig?.rigged),
+      current: `${asset.category || "Models"}/${asset.subcategory || "Other"}`,
+    });
+    byPath.set(relative.toLowerCase(), relative);
+    const nameKey = String(asset.name || "").toLowerCase();
+    byName.set(nameKey, [...(byName.get(nameKey) || []), relative]);
+    if (assets.length >= STUDIO3D_AI_LIMIT) break;
+  }
+  if (!assets.length) return { suggestions: new Map(), used: false, error: "" };
+  const allowed = Object.entries(STUDIO3D_FOLDER_TREE)
+    .map(([category, subs]) => `${category}: ${subs.join(", ")}`)
+    .join("\n");
+  const system = [
+    "You are the 3D asset librarian for Creator Studio.",
+    "Classify every file into exactly one category and subcategory from this allowed list:",
+    allowed,
+    "",
+    "Rules:",
+    "- Use the full relative path, parent folder names and filename together, not only the extension.",
+    "- Houses, homes, buildings, roofs, walls, rooms, shops, offices, stations, hotels, schools, hospitals, towers, castles, bridges and other architecture go to Models/Architecture.",
+    "- Chairs, tables, desks, sofas, shelves, beds, cabinets and lamps go to Models/Furniture.",
+    "- Cars, trucks, bikes, boats, planes, trains and similar go to Models/Vehicles.",
+    "- Swords, guns, shields and similar go to Models/Weapons.",
+    "- Trees, rocks, plants, terrain and similar go to Models/Nature.",
+    "- Characters, humans and humanoids go to Models/Characters; skeletons and rigged humanoids go to Rigged/Humanoid.",
+    "- Imported files that are already in a sensible category may keep it.",
+    "- Never return a category or subcategory outside the allowed list.",
+    'Return ONLY a JSON array with objects like {"path":"...","category":"Models","subcategory":"Architecture"}.',
+  ].join("\n");
+  const canonicalFolder = (category, subcategory) => {
+    const categoryKey = String(category || "").trim().toLowerCase();
+    const subKey = String(subcategory || "").trim().toLowerCase();
+    const categoryHit = Object.keys(STUDIO3D_FOLDER_TREE).find((value) => value.toLowerCase() === categoryKey);
+    if (!categoryHit) return null;
+    const subHit = STUDIO3D_FOLDER_TREE[categoryHit].find((value) => value.toLowerCase() === subKey);
+    return subHit ? { category: categoryHit, subcategory: subHit } : null;
+  };
+  const resolveRelative = (value) => {
+    const pathValue = String(value || "").replace(/\\/g, "/").replace(/^\/+/, "").trim();
+    if (!pathValue) return "";
+    const exact = byPath.get(pathValue.toLowerCase());
+    if (exact) return exact;
+    const base = pathValue.split("/").pop().toLowerCase();
+    const matches = byName.get(base) || [];
+    return matches.length === 1 ? matches[0] : "";
+  };
+  const suggestions = new Map();
+  let lastError = "";
+  for (let offset = 0; offset < assets.length; offset += STUDIO3D_AI_CHUNK) {
+    const chunk = assets.slice(offset, offset + STUDIO3D_AI_CHUNK);
+    try {
+      const sent = await ocSendMessage(state, {
+        sessionId: null,
+        title: "3D library AI sort",
+        body: {
+          model,
+          agent: "photo",
+          system,
+          tools: { "*": false },
+          parts: [
+            {
+              type: "text",
+              text: "Classify these files:\n" + JSON.stringify(chunk),
+            },
+          ],
+        },
+        signal: AbortSignal.timeout(180000),
+      });
+      const text = readArtAssistantText(sent.value);
+      const parsed = parseArtJson(text);
+      if (!Array.isArray(parsed)) throw new Error("The model returned no usable JSON folder list.");
+      for (const entry of parsed) {
+        const folder = canonicalFolder(entry?.category, entry?.subcategory);
+        if (!folder) continue;
+        const relative = resolveRelative(entry?.path);
+        if (!relative) continue;
+        suggestions.set(relative, folder);
+      }
+    } catch (error) {
+      lastError = error.message;
+      log("warning", "studio3d", "AI sort chunk failed; keeping the keyword sorter for the rest", {
+        message: error.message,
+        offset,
+        size: chunk.length,
+      });
+    }
+  }
+  if (!suggestions.size) {
+    return { suggestions, used: false, error: lastError || "The model did not return any valid folders." };
+  }
+  return { suggestions, used: true, error: lastError };
+}
+
 app.post("/api/studio3d/organize", async (req, res) => {
   try {
     const settings = await getSettings();
     const folder = settings.studio3d?.folder ? path.resolve(settings.studio3d.folder) : "";
     if (!folder) return res.status(400).json({ error: "Choose a 3D library folder first." });
     const dryRun = Boolean(req.body?.dryRun);
+    const model = req.body?.model || null;
+    const projectId = String(req.body?.projectId || "");
     await ensureStudio3dFolders(folder);
     const index = await scanStudio3dFolder(folder, true);
+    const ai = await studio3dAiSuggestions({ index, model, projectId });
     const seen = new Set();
     const moved = [];
     for (const asset of [...index.models, ...index.animations, ...index.textures]) {
       if (!asset?.path || seen.has(asset.path)) continue;
       seen.add(asset.path);
-      const allowed = STUDIO3D_FOLDER_TREE[asset.category];
+      const suggestion = ai.suggestions.get(String(asset.relative || "").replace(/\\/g, "/"));
+      const category = suggestion?.category || asset.category;
+      const subcategory = suggestion?.subcategory || asset.subcategory;
+      const allowed = STUDIO3D_FOLDER_TREE[category];
       if (!allowed) continue;
-      const sub = allowed.includes(asset.subcategory) ? asset.subcategory : "Other";
+      const sub = allowed.includes(subcategory) ? subcategory : "Other";
       const relative = String(asset.relative || "").replace(/\\/g, "/");
-      if (relative.startsWith(asset.category + "/" + sub + "/")) continue;
+      if (relative.startsWith(category + "/" + sub + "/")) continue;
       const from = path.resolve(asset.path);
       if (!isInside(folder, from)) continue;
-      const dir = path.join(folder, asset.category, sub);
+      const dir = path.join(folder, category, sub);
       const to = await uniqueStudio3dTarget(dir, asset.name);
       if (!dryRun) {
         await ensureDir(dir);
@@ -11131,8 +11269,8 @@ app.post("/api/studio3d/organize", async (req, res) => {
       moved.push({ from: relative, to: path.relative(folder, to).replace(/\\/g, "/") });
     }
     if (!dryRun && moved.length) await scanStudio3dFolder(folder, true);
-    if (!dryRun) log("info", "studio3d", "library auto-sorted", { folder, moved: moved.length });
-    res.json({ ok: true, dryRun, folder, moved });
+    if (!dryRun) log("info", "studio3d", "library auto-sorted", { folder, moved: moved.length, aiUsed: ai.used, aiError: ai.error });
+    res.json({ ok: true, dryRun, folder, moved, aiUsed: ai.used, aiError: ai.error });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
