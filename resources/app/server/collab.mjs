@@ -259,7 +259,7 @@ export function createCollabService({ dataDir, appRoot, log = () => null }) {
     return { room: publicRoom(room), manifest: room.manifest };
   }
 
-  async function setMember({ id, token, username, status, progress, projectName }) {
+  async function setMember({ id, token, username, status, progress, projectName, camera }) {
     const room = await requireRoom(id, token);
     const name = String(username || "Member");
     const member = (room.members || []).find((item) => item.username === name);

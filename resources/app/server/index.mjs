@@ -10667,15 +10667,22 @@ async function ensureStudio3dFolders(root) {
 }
 
 const STUDIO3D_ARCHITECTURE_WORDS = [
-  "house", "home", "building", "structure", "architecture", "architectural", "roof", "roofing", "ridge", "eave",
+  "house", "home", "building", "bldg", "structure", "architecture", "architectural", "arch", "roof", "roofing", "ridge", "eave",
   "gable", "hip", "valley", "rafter", "truss", "wall", "walls", "floor", "flooring", "ceiling", "stair", "stairs",
   "staircase", "step", "steps", "railing", "banister", "fence", "gate", "door", "doorway", "window", "frame",
   "column", "pillar", "beam", "post", "foundation", "footing", "basement", "attic", "chimney", "fireplace",
-  "patio", "deck", "porch", "balcony", "garage", "shed", "barn", "cabin", "tower", "skyscraper", "castle",
-  "church", "chapel", "temple", "ruin", "ruins", "dungeon", "bridge", "arch", "archway", "corridor", "hallway",
-  "room", "kitchen", "bathroom", "bedroom", "living", "office", "shop", "store", "warehouse", "factory",
-  "station", "airport", "school", "hospital", "hotel", "apartment", "facade", "entrance", "lobby", "elevator",
-  "modular", "kitbash", "building kit", "city", "street", "town", "village", "fort", "wall segment",
+  "patio", "deck", "porch", "balcony", "garage", "shed", "barn", "cabin", "cottage", "bungalow", "villa",
+  "mansion", "townhouse", "duplex", "condo", "condominium", "apartment", "apt", "dorm", "dormitory", "barracks",
+  "tower", "skyscraper", "highrise", "castle", "palace", "fort", "fortress", "bunker", "church", "chapel",
+  "cathedral", "temple", "mosque", "synagogue", "shrine", "monastery", "ruin", "ruins", "dungeon", "bridge",
+  "archway", "corridor", "hallway", "room", "kitchen", "bathroom", "bedroom", "living", "office", "shop", "store",
+  "warehouse", "factory", "workshop", "studio", "depot", "station", "terminal", "airport", "hangar", "school",
+  "university", "college", "library", "hospital", "clinic", "pharmacy", "hotel", "motel", "resort", "restaurant",
+  "cafe", "bakery", "market", "supermarket", "mall", "plaza", "complex", "stadium", "arena", "theater", "cinema",
+  "museum", "gallery", "bank", "courthouse", "police", "fire station", "gas station", "parking", "power plant",
+  "substation", "water tower", "clock tower", "bell tower", "lighthouse", "windmill", "watermill", "silo",
+  "greenhouse", "gazebo", "pavilion", "stable", "facade", "residential", "commercial", "industrial", "entrance",
+  "lobby", "elevator", "modular", "kitbash", "building kit", "city", "street", "town", "village", "wall segment",
 ];
 const STUDIO3D_FURNITURE_WORDS = [
   "chair", "table", "desk", "sofa", "couch", "shelf", "bookshelf", "bookcase", "cabinet", "bed", "stool",
