@@ -1,6 +1,6 @@
 # Creator Studio
 
-**By Twilight Studio** · Version **0.14.0-beta.9** · Windows x64
+**By Twilight Studio** · Version **0.14.0-beta.10** · Windows x64
 
 A native Windows creative workspace where AI agents and manual tools share the same project.
 Model in 3D, simulate cloth, format writing, code with an AI agent, drive a live Unity Editor,

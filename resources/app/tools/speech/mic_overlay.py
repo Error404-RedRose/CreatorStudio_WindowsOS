@@ -79,6 +79,7 @@ class Overlay:
         self.last_transcript = ""
         self.last_audio = None
         self.waiting_for_mic = False
+        self.last_active_at = 0.0
         self.visible = False
         self.signature = None
         self.done_until = 0.0
@@ -427,18 +428,24 @@ class Overlay:
             self.done_shown = True
         if self.active:
             self.done_shown = False
+            self.last_active_at = now
 
-        loading = bool(self.loading) and not self.ready and not self.active and not self.finishing
+        # Never show the setup/loading card on a cold app start. The overlay is
+        # reserved for an actual dictation gesture or a failure immediately
+        # after one. Installation and microphone preparation stay in Settings.
+        loading = False
         no_speech = self._no_speech()
+        recent_dictation = self.last_active_at > 0 and now - self.last_active_at < 8.0
         error = (
             bool(self.error_text)
             and now < self.error_until
             and not self.active
             and not self.finishing
+            and recent_dictation
             and not loading
             and not no_speech
         )
-        show = self.active or self.finishing or loading or error
+        show = self.active or self.finishing or error
         done = False
         if not show:
             if self.done_shown and now < self.done_until:

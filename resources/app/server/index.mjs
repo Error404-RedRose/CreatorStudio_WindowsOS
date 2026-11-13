@@ -11036,6 +11036,53 @@ app.post("/api/studio3d/file", express.raw({ type: "*/*", limit: "500mb" }), asy
   }
 });
 
+app.put("/api/studio3d/file", express.raw({ type: "*/*", limit: "500mb" }), async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const folder = settings.studio3d?.folder ? path.resolve(settings.studio3d.folder) : "";
+    if (!folder) return res.status(400).json({ error: "Choose a 3D library folder first." });
+    const relative = String(req.query.path || "").trim();
+    if (!relative) return res.status(400).json({ error: "A library file path is required." });
+    const target = path.resolve(folder, relative);
+    if (!isInside(folder, target) || target === folder) {
+      return res.status(400).json({ error: "That file is outside the 3D library folder." });
+    }
+    const stat = await fs.stat(target).catch(() => null);
+    if (!stat || !stat.isFile()) return res.status(404).json({ error: "The library file no longer exists." });
+    if (!req.body?.length) return res.status(400).json({ error: "The saved file body is empty." });
+    await fs.writeFile(target, req.body);
+    await scanStudio3dFolder(folder, true);
+    const rel = path.relative(folder, target).replace(/\\/g, "/");
+    log("info", "studio3d", "library file overwritten", { path: rel, bytes: req.body.length });
+    res.json({ ok: true, path: rel, name: path.basename(target), bytes: req.body.length });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.delete("/api/studio3d/file", async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const folder = settings.studio3d?.folder ? path.resolve(settings.studio3d.folder) : "";
+    if (!folder) return res.status(400).json({ error: "Choose a 3D library folder first." });
+    const relative = String(req.query.path || "").trim();
+    if (!relative) return res.status(400).json({ error: "A library file path is required." });
+    const target = path.resolve(folder, relative);
+    if (!isInside(folder, target) || target === folder) {
+      return res.status(400).json({ error: "That file is outside the 3D library folder." });
+    }
+    const stat = await fs.stat(target).catch(() => null);
+    if (!stat || !stat.isFile()) return res.status(404).json({ error: "The library file no longer exists." });
+    await fs.rm(target, { force: true });
+    await scanStudio3dFolder(folder, true);
+    const rel = path.relative(folder, target).replace(/\\/g, "/");
+    log("info", "studio3d", "library file deleted", { path: rel });
+    res.json({ ok: true, path: rel });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.post("/api/studio3d/setup", async (req, res) => {
   try {
     const settings = await getSettings();
