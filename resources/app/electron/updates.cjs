@@ -108,6 +108,154 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
     return args;
   }
 
+  function linuxGuiEnvironment() {
+    const keys = [
+      "HOME",
+      "USER",
+      "LOGNAME",
+      "PATH",
+      "DISPLAY",
+      "WAYLAND_DISPLAY",
+      "XAUTHORITY",
+      "XDG_RUNTIME_DIR",
+      "DBUS_SESSION_BUS_ADDRESS",
+      "XDG_SESSION_TYPE",
+      "XDG_CURRENT_DESKTOP",
+      "XDG_STATE_HOME",
+      "XDG_CONFIG_HOME",
+      "XDG_DATA_HOME",
+      "XDG_CACHE_HOME",
+      "TMPDIR",
+      "LANG",
+      "LC_ALL",
+    ];
+    const args = [];
+    for (const key of keys) {
+      const value = process.env[key];
+      if (value) args.push(`--setenv=${key}=${value}`);
+    }
+    return args;
+  }
+
+  function resolveLinuxCommand(command) {
+    try {
+      const result = spawnSync("sh", ["-lc", `command -v ${command}`], {
+        encoding: "utf8",
+        timeout: 4000,
+        windowsHide: true,
+      });
+      if (result.status === 0) {
+        const path = String(result.stdout || "").trim().split(/\r?\n/)[0];
+        if (path) return path;
+      }
+    } catch {}
+    return "";
+  }
+
+  function linuxTerminalCandidates() {
+    return [
+      { command: "xdg-terminal-exec", args: [] },
+      { command: "x-terminal-emulator", args: ["-e"] },
+      { command: "sensible-terminal", args: ["-e"] },
+      { command: "ptyxis", args: ["--"] },
+      { command: "kgx", args: ["--"] },
+      { command: "gnome-terminal", args: ["--"] },
+      { command: "konsole", args: ["-e"] },
+      { command: "xfce4-terminal", args: ["--disable-server", "-x"] },
+      { command: "mate-terminal", args: ["--"] },
+      { command: "tilix", args: ["-e"] },
+      { command: "terminator", args: ["-x"] },
+      { command: "qterminal", args: ["-e"] },
+      { command: "lxterminal", args: ["-e"] },
+      { command: "sakura", args: ["-x"] },
+      { command: "terminology", args: ["-e"] },
+      { command: "kitty", args: [] },
+      { command: "alacritty", args: ["-e"] },
+      { command: "wezterm", args: ["start", "--"] },
+      { command: "ghostty", args: ["-e"] },
+      { command: "foot", args: [] },
+      { command: "st", args: ["-e"] },
+      { command: "cosmic-term", args: ["-e"] },
+      { command: "rio", args: ["-e"] },
+      { command: "xterm", args: ["-e"] },
+      { command: "urxvt", args: ["-e"] },
+    ];
+  }
+
+  /**
+   * Open a visible terminal for the update. The script inside the terminal
+   * waits for this app to exit, runs the official one-shot curl installer,
+   * verifies the new .run package, and relaunches Creator Studio.
+   *
+   * systemd-run keeps the terminal outside Creator Studio's transient desktop
+   * scope, so the update window survives the app closing. If systemd-run is
+   * unavailable, a detached terminal is used.
+   */
+  function launchLinuxUpdateTerminal(scriptPath, scriptArgs) {
+    const files = linuxUpdateLaunchFiles();
+    const systemdRun = linuxSystemdRun();
+    for (const candidate of linuxTerminalCandidates()) {
+      const command = resolveLinuxCommand(candidate.command);
+      if (!command) continue;
+      const terminalArgs = [...candidate.args, "bash", scriptPath, ...scriptArgs, "--log-file", files.logFile];
+      if (systemdRun) {
+        const unit = `creator-studio-update-${process.pid}-${Date.now()}`;
+        const args = [
+          "--user",
+          "--no-block",
+          "--collect",
+          `--unit=${unit}`,
+          "--description=Creator Studio update",
+          ...linuxGuiEnvironment(),
+          command,
+          ...terminalArgs,
+        ];
+        const result = spawnSync(systemdRun, args, {
+          encoding: "utf8",
+          timeout: 15000,
+          windowsHide: true,
+        });
+        if (result.status === 0) {
+          return {
+            launched: true,
+            method: `terminal:${candidate.command}`,
+            unit,
+            detail: String(result.stdout || "").trim(),
+            ...files,
+          };
+        }
+        mainLog("warning", "updates", "terminal systemd launch failed; trying a detached terminal", {
+          terminal: candidate.command,
+          status: result.status,
+          error: result.error?.message || "",
+          stderr: String(result.stderr || "").slice(-1200),
+        });
+      }
+
+      const child = spawn(command, terminalArgs, {
+        cwd: app.getPath("temp"),
+        env: { ...process.env },
+        detached: true,
+        stdio: "ignore",
+      });
+      child.unref();
+      if (child.pid) {
+        return {
+          launched: true,
+          method: `terminal:${candidate.command}:detached`,
+          pid: child.pid,
+          ...files,
+        };
+      }
+    }
+    return {
+      launched: false,
+      method: "none",
+      error: "No graphical terminal emulator was found (tried gnome-terminal, kgx, ptyxis, konsole, xfce4-terminal, kitty, alacritty, foot, xterm and others).",
+      ...files,
+    };
+  }
+
   /**
    * Run the Linux updater outside this application's systemd cgroup. Desktop
    * launchers on Arch and NixOS commonly put Creator Studio in a transient
@@ -393,16 +541,7 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
         }
         launch = { launched: true, method: "powershell", pid: child.pid };
       } else {
-        try {
-          require.resolve("adm-zip");
-        } catch {
-          return { ok: false, error: "The Linux update dependency (adm-zip) is missing from this build." };
-        }
-        // Run the updater with the current Electron binary in Node mode. On
-        // systemd desktops it is started as a transient user service so the
-        // desktop's application scope cannot kill it when Creator Studio exits.
-        const helperArgs = [
-          helperSource,
+        const updateArgs = [
           "--install-dir",
           installDir,
           "--exe-name",
@@ -416,7 +555,28 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
           "--expected-version",
           String(status.remoteVersion || ""),
         ];
-        launch = launchLinuxUpdateHelper(helperSource, helperArgs);
+        // Prefer a visible terminal so the user can watch the official one-shot
+        // curl installer. It survives this app closing through systemd-run.
+        const terminalScript = path.join(__dirname, "linux-update-terminal.sh");
+        if (fs.existsSync(terminalScript)) {
+          launch = launchLinuxUpdateTerminal(terminalScript, updateArgs);
+          if (!launch.launched) {
+            mainLog("warning", "updates", "no visible terminal could be opened; using headless updater", {
+              reason: launch.error || "",
+            });
+          }
+        }
+        if (!launch?.launched) {
+          try {
+            require.resolve("adm-zip");
+          } catch {
+            return { ok: false, error: "The Linux update dependency (adm-zip) is missing from this build." };
+          }
+          // Headless fallback for systems with no terminal emulator. On
+          // systemd desktops it runs as a transient user service so the
+          // desktop's application scope cannot kill it when Creator Studio exits.
+          launch = launchLinuxUpdateHelper(helperSource, [helperSource, ...updateArgs]);
+        }
         if (!launch.launched) {
           return {
             ok: false,
@@ -443,7 +603,10 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
       return {
         ok: true,
         remoteVersion: status.remoteVersion,
-        message: `Updating Creator Studio to ${status.remoteVersion}...`,
+        message:
+          process.platform === "linux" && String(launch.method || "").startsWith("terminal:")
+            ? `A terminal window is finishing the update to ${status.remoteVersion}. Creator Studio will reopen when it completes.`
+            : `Updating Creator Studio to ${status.remoteVersion}...`,
       };
     } catch (error) {
       const message = String(error?.message || error);
