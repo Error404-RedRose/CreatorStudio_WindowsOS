@@ -14,16 +14,45 @@ const distDir = path.join(appRoot, "dist");
 // the Chromium sandbox disabled avoids requiring a root-owned setuid
 // chrome-sandbox helper on every user machine, so the folder works identically
 // after a clone, a ZIP extraction or an in-app update.
+let softwareRendering = false;
 if (process.platform === "linux") {
   app.commandLine.appendSwitch("no-sandbox");
   // Chromium's shared-memory allocator can wait forever on small containers
   // and some NixOS sandboxes. /tmp is always available for this user process.
   app.commandLine.appendSwitch("disable-dev-shm-usage");
+  // NixOS puts the real GPU libraries in the Nix store and exposes the active
+  // set through /run/opengl-driver. Without this path Chromium falls back to
+  // SwiftShader, which makes the whole UI and 3D viewport extremely slow.
+  const nixGpuLib = "/run/opengl-driver/lib";
+  const nixGpuDri = "/run/opengl-driver/lib/dri";
+  const nixEglVendors = "/run/opengl-driver/share/glvnd/egl_vendor.d";
+  const hasNixGpu = (() => {
+    try {
+      return fs.existsSync(path.join(nixGpuLib, "libEGL.so.1"));
+    } catch {
+      return false;
+    }
+  })();
+  if (hasNixGpu) {
+    const prepend = (name, directory) => {
+      try {
+        if (!fs.existsSync(directory)) return;
+        process.env[name] = [directory, process.env[name] || ""].filter(Boolean).join(":");
+      } catch {}
+    };
+    prepend("LD_LIBRARY_PATH", nixGpuLib);
+    if (fs.existsSync(nixGpuDri)) {
+      process.env.LIBGL_DRIVERS_PATH = [nixGpuDri, process.env.LIBGL_DRIVERS_PATH || ""].filter(Boolean).join(":");
+    }
+    if (fs.existsSync(nixEglVendors)) process.env.__EGL_VENDOR_LIBRARY_DIRS = nixEglVendors;
+    console.log(`[Creator Studio] NixOS GPU libraries found at ${nixGpuLib}; hardware rendering is available.`);
+  }
   // NixOS and minimal distributions do not have an FHS libEGL.so.1. Chromium's
   // ANGLE backend otherwise dies before a window is painted. Use the bundled
-  // SwiftShader software renderer when the system EGL library is absent, or
-  // when the user explicitly asks for software rendering. WebGL still works.
+  // SwiftShader software renderer only when no usable EGL library exists, or
+  // when the user explicitly asks for software rendering.
   const eglCandidates = [
+    path.join(nixGpuLib, "libEGL.so.1"),
     "/usr/lib/x86_64-linux-gnu/libEGL.so.1",
     "/usr/lib64/libEGL.so.1",
     "/usr/lib/libEGL.so.1",
@@ -37,13 +66,6 @@ if (process.platform === "linux") {
       return false;
     }
   });
-  const nixos = (() => {
-    try {
-      return fs.existsSync("/etc/NIXOS");
-    } catch {
-      return false;
-    }
-  })() || Boolean(process.env.NIX_STORE);
   const disableGpu = process.env.CREATOR_STUDIO_DISABLE_GPU === "1";
   if (disableGpu) {
     app.commandLine.appendSwitch("disable-gpu");
@@ -57,11 +79,12 @@ if (process.platform === "linux") {
   } else {
     app.commandLine.appendSwitch("ozone-platform-hint", "auto");
   }
-  const softwareRendering =
-    !disableGpu &&
-    process.env.CREATOR_STUDIO_GPU !== "1" &&
-    (nixos || !hasSystemEgl || process.env.CREATOR_STUDIO_SOFTWARE_GL === "1");
-  if (softwareRendering) {
+  softwareRendering =
+    disableGpu ||
+    (process.env.CREATOR_STUDIO_GPU !== "1" &&
+      (!hasSystemEgl || process.env.CREATOR_STUDIO_SOFTWARE_GL === "1"));
+  process.env.TWIX_SOFTWARE_RENDERING = softwareRendering ? "1" : "0";
+  if (softwareRendering && !disableGpu) {
     try {
       process.chdir(appRoot);
     } catch {}
@@ -82,8 +105,12 @@ if (process.platform === "linux") {
     app.commandLine.appendSwitch("ignore-gpu-blocklist");
     app.commandLine.appendSwitch("enable-webgl");
     console.log(
-      "[Creator Studio] Starting with the bundled SwiftShader renderer because a system libEGL was not found or software rendering was requested.",
+      "[Creator Studio] Starting with the bundled SwiftShader renderer because no usable system EGL library was found or software rendering was requested.",
     );
+  } else if (disableGpu) {
+    console.log("[Creator Studio] GPU acceleration is disabled; the interface is using the low-effects performance mode.");
+  } else {
+    console.log("[Creator Studio] GPU acceleration enabled with the system EGL/OpenGL driver.");
   }
 }
 

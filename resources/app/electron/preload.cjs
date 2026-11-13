@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld("twixDesktop", {
   isDesktop: true,
   platform: process.platform,
   nativeFrame: process.platform === "linux",
+  softwareRendering: process.env.TWIX_SOFTWARE_RENDERING === "1",
   minimize: () => ipcRenderer.send("win:minimize"),
   fill: () => ipcRenderer.send("win:fill"),
   close: () => ipcRenderer.send("win:close"),
