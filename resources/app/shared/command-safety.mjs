@@ -507,6 +507,9 @@ function deletionAssessment(flat, cwd = "") {
     severity = "high";
     reasons.push("The recursive delete has no clear target and could affect a large area.");
   }
+  if (targets.length) {
+    reasons.push("It is trying to delete these exact path(s): " + targets.slice(0, 10).join(", "));
+  }
   return { destructive: true, recursive, wildcard, targets, severity, reasons };
 }
 
@@ -577,6 +580,9 @@ export function assessCommand(command, options = {}) {
     }
     if (deletion.severity === "medium") {
       result.safeTargets = deletion.targets;
+    }
+    if (deletion.targets.length) {
+      result.summary = `${result.summary} Target: ${deletion.targets.slice(0, 4).join(", ")}`;
     }
   }
 

@@ -79,6 +79,22 @@ export const tools = [
     },
   },
   {
+    name: "library_geometry",
+    category: "inspect",
+    mutating: false,
+    description:
+      "Load a 3D Library FBX/GLB/GLTF/OBJ as a reference and return its real vertex count, triangle count, Z-up bounds and up to 240 sampled world-space vertex points. Use this to learn the actual silhouette, proportions and vertex distribution of a tree, building, prop or character before generating a new model with sketch tools.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Library model name or relative path fragment, e.g. Tree or Baron." },
+        relative: { type: "string", description: "Exact relative path from library_inspect." },
+        limit: { type: "number", description: "Maximum sampled points (default 240)." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "library_inspect",
     category: "inspect",
     mutating: false,

@@ -655,6 +655,13 @@ const defaultSettings = () => ({
     tripo: { apiKey: "", model: "v3.1-20260211" },
     local3d: { url: "", model: "hunyuan3d" },
   },
+  modeler: {
+    snapIncrement: 0.1,
+    rotationSnap: 15,
+    uvWrapSpacing: 2,
+    bevelSegments: 1,
+    bevelOffset: 0.02,
+  },
   keybindings: {
     objectMesh: "Tab",
     move: "e",
@@ -1505,6 +1512,9 @@ the appropriate \`twix_*\` tool.
    \`twix_sketch_polygon\` takes explicit world-space points; for horizontal faces order them
    counter-clockwise viewed from above (+Z green normal). Call \`twix_library_inspect\` to use the
    user's 3D Library architecture references, then reproduce their proportions with new sketch faces.
+   Use \`twix_library_geometry\` to sample the actual vertex cloud of a matching FBX/GLB before
+   generating trees, props or buildings.
+   Never change the scene background, atmosphere or environment unless the user explicitly asks.
 4. **Model like a professional 3D artist.** A finished asset is a continuous vertex-built surface,
    not a pile of cubes, spheres and capsules. Use \`twix_humanoid_create\` for every human character
    (it outputs one smooth lofted body mesh with head, neck, fingers, toes, feet, a skeleton and skin
@@ -2455,9 +2465,9 @@ async function ocFetchWithProviderWatch(state, sessionId, pathname, options = {}
   }, 250);
   const timeout = setTimeout(() => {
     providerError =
-      "The model did not answer within 120 seconds. The provider may be unavailable or out of quota. Choose another model and try again.";
+      "The model did not answer within 15 minutes. The provider may be unavailable or out of quota. Choose another model or cancel the request.";
     controller.abort();
-  }, 120000);
+  }, 15 * 60 * 1000);
   try {
     return await ocFetch(state, pathname, { ...options, signal: controller.signal });
   } catch (error) {
@@ -7316,6 +7326,31 @@ app.post("/api/ai3d/generate", async (req, res) => {
   }
 });
 
+app.post("/api/ai3d/abort", async (req, res) => {
+  try {
+    const { projectId, sessionId } = req.body || {};
+    const state = ocServers.get(String(projectId || ""));
+    if (!state?.ready) return res.json({ ok: true, aborted: false });
+    if (sessionId) {
+      await ocFetch(state, `/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }).catch(() => null);
+    } else {
+      const sessions = await ocFetch(state, "/session").catch(() => []);
+      const ids = (Array.isArray(sessions) ? sessions : [])
+        .slice()
+        .sort((a, b) => new Date(b.time?.updated || b.updated || 0).getTime() - new Date(a.time?.updated || a.updated || 0).getTime())
+        .slice(0, 4)
+        .map((session) => session.id)
+        .filter(Boolean);
+      for (const id of ids) {
+        await ocFetch(state, `/session/${encodeURIComponent(id)}/abort`, { method: "POST" }).catch(() => null);
+      }
+    }
+    res.json({ ok: true, aborted: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post("/api/ai3d/prompt", async (req, res) => {
   const { prompt, projectId, model, sessionId } = req.body || {};
   const text = String(prompt || "").trim();
@@ -7326,8 +7361,15 @@ app.post("/api/ai3d/prompt", async (req, res) => {
   }
 
   const abort = new AbortController();
+  let abortState = null;
+  let abortSessionId = sessionId || "";
   res.on("close", () => {
-    if (!res.writableEnded) abort.abort();
+    if (!res.writableEnded) {
+      abort.abort();
+      if (abortState?.ready && abortSessionId) {
+        void ocFetch(abortState, `/session/${encodeURIComponent(abortSessionId)}/abort`, { method: "POST" }).catch(() => null);
+      }
+    }
   });
   const signal = AbortSignal.any
     ? AbortSignal.any([abort.signal, AbortSignal.timeout(10 * 60 * 1000)])
@@ -7339,6 +7381,8 @@ app.post("/api/ai3d/prompt", async (req, res) => {
       state = await startOpenCode(String(projectId), "prop", false);
     }
     if (!state) throw new Error("OpenCode could not start for this project.");
+    abortState = state;
+    if (sessionId) abortSessionId = sessionId;
 
     const system = [
       "You are the AI 3D builder inside Creator Studio's SketchUp-style 3D editor.",
@@ -7350,7 +7394,8 @@ app.post("/api/ai3d/prompt", async (req, res) => {
       "- Before drawing, write a short internal coordinate plan: footprint corners, floor height, wall height, openings and roof ridge. Reuse exact numbers between tools instead of guessing.",
       "- Use twix_sketch_polygon when rectangle/circle cannot express the shape. Pass every vertex explicitly and close the loop. Horizontal faces must be ordered counter-clockwise viewed from above so their green normal points +Z.",
       "- Example 6x4 m room floor: [{x:0,y:0,z:0},{x:6,y:0,z:0},{x:6,y:4,z:0},{x:0,y:4,z:0}]. Push/Pull that face by 0.15 for a slab, or draw walls as vertical polygons and Push/Pull them by their thickness.",
-      "- Use twix_library_inspect to read the user's 3D Library categories and architectural references before designing. Use those proportions and styles, but build new editable sketch geometry rather than copying a library file.",
+      "- Do not change the scene background, atmosphere, environment, lighting, camera projection or renderer look unless the user explicitly asks for that. Building geometry must not repaint the scene.",
+      "- Use twix_library_inspect to read the user's 3D Library categories and architectural references before designing. Then use twix_library_geometry on a matching FBX/GLB to sample its real vertex cloud, bounds and polygon mix. Use those proportions and styles, but build new editable sketch geometry rather than copying a library file.",
       "- After building, call twix_sketch_inspect or twix_scene_inspect to verify face count, bounds and normals, then frame the viewport.",
       "Sketch workflow (prefer this for architecture, furniture, openings and anything the user must keep editing):",
       "1. Use twix_sketch_inspect to see existing faces, groups and selection.",
@@ -10679,6 +10724,7 @@ app.post("/api/github/sync", async (req, res) => {
       deleteMissing = true,
       clean = true,
       dryRun = false,
+      excludedPaths = [],
     } = req.body || {};
     if ((!projectId && !requestedRoot) || !owner || !repo) {
       return res.status(400).json({ error: "A workspace root (or projectId), owner and repo are required." });
@@ -10776,9 +10822,16 @@ app.post("/api/github/sync", async (req, res) => {
       }));
     // Every file is eligible now. Files above the LFS threshold are uploaded to
     // Git LFS and committed as small pointer files.
-    const allowed = files
+    const excluded = (Array.isArray(excludedPaths) ? excludedPaths : [])
+      .map((value) => String(value || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""))
+      .filter(Boolean);
+    const isExcluded = (relativePath) =>
+      excluded.some((prefix) => relativePath === prefix || relativePath.startsWith(prefix + "/"));
+    const eligible = files
       .filter((item) => item.bytes <= GITHUB_LFS_MAX_BYTES)
       .sort((a, b) => a.path.localeCompare(b.path));
+    const excludedFiles = eligible.filter((item) => isExcluded(item.path));
+    const allowed = eligible.filter((item) => !isExcluded(item.path));
     // Large workspaces are pushed through the incremental tree builder below,
     // which splits GitHub's tree API into small requests. This guard is only a
     // runaway-workspace stop; it is not the old one-request 4,000-file limit.
@@ -10787,6 +10840,9 @@ app.post("/api/github/sync", async (req, res) => {
     const selected = filesTruncated ? allowed.slice(0, MAX_SYNC_FILES) : allowed;
     const cappedFiles = filesTruncated ? allowed.slice(MAX_SYNC_FILES) : [];
     const localPaths = new Set(selected.map((item) => item.path));
+    // Excluded paths stay on GitHub in clean mode; they are deliberately not
+    // pushed or deleted.
+    for (const item of excludedFiles) localPaths.add(item.path);
     // The generated report is always part of the workspace and must survive
     // clean-mode deletion.
     localPaths.add("github_notpushed.txt");
@@ -11088,6 +11144,8 @@ app.post("/api/github/sync", async (req, res) => {
       notPushed: notPushed.slice(0, 200),
       notPushedTotal: notPushed.length,
       notPushedFile: manifestWritten ? "github_notpushed.txt" : "",
+      excluded: excludedFiles.map((item) => item.path),
+      excludedCount: excludedFiles.length,
       pushedBytes,
       totalFiles: allowed.length,
       totalBytes,
@@ -11673,11 +11731,15 @@ async function inspectStudio3dModel(target, ext, bytes) {
       }
       const raw = head.toString("latin1");
       const count = (re) => (raw.match(re) || []).length;
-      rig.bones = count(/Deformer:\s*\d+,\s*"Cluster"/g) || count(/LimbNode/g);
-      rig.clips = count(/AnimationStack:/g);
+      const clusters = count(/\bCluster\b/g);
+      const limbNodes = count(/\bLimbNode\b/g);
+      const deformers = count(/\bDeformer\b/g);
+      const curves = count(/\bAnimationCurve(?:Node)?\b/g);
+      rig.bones = Math.max(clusters, limbNodes) || (deformers > 0 ? 1 : 0);
+      rig.clips = curves > 0 ? count(/AnimationStack:/g) : 0;
       rig.morphs = count(/BlendShapeChannel:/g);
       rig.meshes = count(/Geometry:/g);
-      rig.rigged = rig.bones > 0 || /Deformer:/.test(raw);
+      rig.rigged = rig.bones > 0 || deformers > 0 || /\bSkin\b/.test(raw);
       return rig;
     }
   } catch {
@@ -11702,7 +11764,7 @@ async function scanStudio3dFolder(folder, force = false) {
   let visited = 0;
 
   const walk = async (dir, rel, depth) => {
-    if (depth > 10 || visited > 5000) return;
+    if (depth > 20 || visited > 50000) return;
     let entries = [];
     try {
       entries = await fs.readdir(dir, { withFileTypes: true });
@@ -11711,7 +11773,7 @@ async function scanStudio3dFolder(folder, force = false) {
       return;
     }
     for (const entry of entries) {
-      if (visited > 5000) break;
+      if (visited > 50000) break;
       if (entry.name.startsWith(".") || STUDIO3D_SKIP.has(entry.name)) continue;
       const absolute = path.join(dir, entry.name);
       const relative = rel ? rel + "/" + entry.name : entry.name;
