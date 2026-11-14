@@ -6901,6 +6901,103 @@ app.post("/api/ai3d/generate", async (req, res) => {
   }
 });
 
+app.post("/api/ai3d/prompt", async (req, res) => {
+  const { prompt, projectId, model, sessionId } = req.body || {};
+  const text = String(prompt || "").trim();
+  if (!text) return res.status(400).json({ ok: false, error: "Describe what you want the AI to build." });
+  if (!projectId) return res.status(400).json({ ok: false, error: "Open a project before asking the 3D AI." });
+  if (!model?.providerID || !model?.modelID) {
+    return res.status(400).json({ ok: false, error: "Select an AI model in the header first." });
+  }
+
+  const abort = new AbortController();
+  res.on("close", () => {
+    if (!res.writableEnded) abort.abort();
+  });
+  const signal = AbortSignal.any
+    ? AbortSignal.any([abort.signal, AbortSignal.timeout(10 * 60 * 1000)])
+    : abort.signal;
+
+  try {
+    let state = ocServers.get(String(projectId));
+    if (!state || state.stopped || !state.ready) {
+      state = await startOpenCode(String(projectId), "prop", false);
+    }
+    if (!state) throw new Error("OpenCode could not start for this project.");
+
+    const system = [
+      "You are the AI 3D builder inside Creator Studio's SketchUp-style 3D editor.",
+      "The live 3D scene is connected through the twix_* tools. Use those tools to complete the request directly.",
+      "",
+      "Rules:",
+      "- Work on the currently open scene and keep the result fully editable.",
+      "- Inspect the scene before changing it when useful.",
+      "- Use twix_foliage_create for trees, plants, hedges and organic foliage.",
+      "- Use twix_humanoid_create for people and humanoids. Never assemble a person from cubes or capsules.",
+      "- Use twix_mesh_create and twix_prop_create for curved or organic props, weapons, furniture and detailed objects.",
+      "- Use twix_building_create for floors, walls, roofs and architectural elements.",
+      "- Use twix_object_create only for simple blockouts; refine blockouts into continuous vertex-built surfaces before finishing.",
+      "- Apply materials, UVs and smooth shading where appropriate, validate the scene and frame the viewport at the end.",
+      "- Do not ask the user to confirm. Do not only describe the steps: call the tools and build it.",
+      "- When finished, reply with a short summary of what was created and which tools were used.",
+    ].join("\n");
+
+    const sent = await ocSendMessage(state, {
+      sessionId: sessionId || null,
+      title: "3D AI builder",
+      body: {
+        model,
+        agent: "build",
+        system,
+        tools: { "*": false, "twix_*": true },
+        parts: [{ type: "text", text }],
+      },
+      signal,
+    });
+
+    const response = sent.value;
+    const parts = Array.isArray(response?.parts) ? response.parts : [];
+    const responseText = cleanAssistantText(
+      parts.filter((part) => part?.type === "text" && part.text).map((part) => String(part.text)).join("\n\n"),
+    );
+    const tools = parts
+      .filter((part) => part?.type === "tool")
+      .map((part) => ({
+        name: String(part.tool || "tool"),
+        status: part.state?.status ? String(part.state.status) : "",
+        error: part.state?.error ? String(part.state.error).slice(0, 300) : "",
+      }));
+    const responseError =
+      response?.info?.error?.data?.message ||
+      response?.info?.error?.message ||
+      response?.error?.data?.message ||
+      response?.error?.message ||
+      "";
+    if (responseError) throw new Error(String(responseError));
+    if (!responseText && !tools.length) {
+      throw new Error("The AI model returned no result. Choose a tool-capable model and try again.");
+    }
+
+    const summary =
+      responseText ||
+      (tools.length
+        ? `The AI finished working in the 3D scene (${tools.length} tool call${tools.length === 1 ? "" : "s"}).`
+        : "The AI finished working in the 3D scene.");
+    log("info", "ai3d", "prompt complete", {
+      projectId,
+      model: `${model.providerID}/${model.modelID}`,
+      tools: tools.length,
+      textLength: summary.length,
+    });
+    res.json({ ok: true, text: summary, sessionId: sent.sessionId || sessionId || "", tools });
+  } catch (error) {
+    log("warning", "ai3d", "prompt failed", { projectId, message: error?.message });
+    if (!res.headersSent) {
+      res.status(502).json({ ok: false, error: error?.message || "The 3D AI request failed." });
+    }
+  }
+});
+
 app.get("/api/search", async (req, res) => {
   try {
     const query = String(req.query.q || "").trim();

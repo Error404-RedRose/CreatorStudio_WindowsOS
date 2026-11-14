@@ -1,6 +1,6 @@
 # Creator Studio
 
-**By Twilight Studio** · Version **0.14.0-beta.16** · Windows x64
+**By Twilight Studio** · Version **0.14.0-beta.17** · Windows x64
 
 A native Windows creative workspace where AI agents and manual tools share the same project.
 Model in 3D, simulate cloth, format writing, code with an AI agent, drive a live Unity Editor,
@@ -160,7 +160,8 @@ Real-time modeling with object and mesh modes, move/rotate/scale gizmos, rectang
 vertex editing, measurement, decimation, smooth/flat shading, and scene presets. Import FBX, GLB,
 GLTF, and OBJ; export GLB, OBJ, STL, and FBX. Materials include full PBR maps, procedural
 patterns, a Material Lab, UV generation, and a stretch-colored UV viewer. Rigging, blend shapes,
-lighting, cameras, and six viewport modes are included.
+lighting, cameras, and six viewport modes are included. The bottom AI section opens a persistent
+prompt that lets the selected AI model build directly in the live scene with the full 3D tool set.
 
 ### Clothworks
 A real-time cloth simulator with Curtain, Blanket, Towel, and Pillow presets. Adjust gravity,
