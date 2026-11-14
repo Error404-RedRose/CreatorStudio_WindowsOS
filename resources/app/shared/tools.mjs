@@ -237,12 +237,12 @@ export const tools = [
     category: "modeling",
     mutating: true,
     description:
-      "Generate a high-quality textured GLB with Meshy or Tripo (the same class of AI 3D service as Meshy/Tripo), then import it into the live scene. Use this for characters, creatures, props, weapons, furniture, vehicles, buildings and any organic detail that procedural surfaces cannot reach. Requires a Meshy or Tripo API key in Settings > Providers. Generation takes about 1-4 minutes. Prefer this when the user asks for a polished, realistic, game-ready model.",
+      "Generate a high-quality textured GLB with a configured local Hunyuan3D server, Meshy or Tripo (the same class of AI 3D service as Meshy/Tripo), then import it into the live scene. Use this for characters, creatures, props, weapons, furniture, vehicles, buildings and any organic detail that procedural surfaces cannot reach. A local Hunyuan3D api_server.py URL is configured in Settings > Providers; cloud use requires a Meshy or Tripo API key. Generation takes about 1-4 minutes. Prefer this when the user asks for a polished, realistic, game-ready model.",
     inputSchema: {
       type: "object",
       properties: {
         prompt: { type: "string", description: "Detailed description of the model, including style, materials and silhouette." },
-        provider: { type: "string", enum: ["meshy", "tripo"], description: "Omit to use whichever key is configured (Meshy first)." },
+        provider: { type: "string", enum: ["local", "meshy", "tripo"], description: "Omit to use the configured local server first, then Meshy, then Tripo." },
         name: { type: "string", description: "Scene object name." },
         height: { type: "number", description: "Optional target height in metres; the imported model is scaled uniformly to match." },
         scale: { type: "number", description: "Extra import scale (default 1)." },

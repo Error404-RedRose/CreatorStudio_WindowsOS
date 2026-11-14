@@ -7,8 +7,9 @@ import fs from "node:fs/promises";
 import fssync from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createLicenseService } from "./license.mjs";
+import { createModService } from "./mods.mjs";
 import { createSpeechService } from "./speech.mjs";
 import { discoverLocalAiEndpoints, ensureHermesApiServer, readHermesDirectProviders } from "./ai-endpoints.mjs";
 import { assessCommand } from "../shared/command-safety.mjs";
@@ -189,6 +190,17 @@ const APP_VERSION = (() => {
     return "0.0.0";
   }
 })();
+
+const modService = createModService({
+  dataDir: DATA_DIR,
+  appRoot: APP_ROOT,
+  version: APP_VERSION,
+  license: () => licenseService.status(),
+  isPackaged: process.env.TWIX_PACKAGED === "1",
+  log,
+});
+const MODDING_DIR = modService.modsDir;
+const IS_PACKAGED = process.env.TWIX_PACKAGED === "1";
 
 const LOG_DIR = path.join(DATA_DIR, "logs");
 const LOG_MAX_BYTES = 8 * 1024 * 1024;
@@ -639,6 +651,7 @@ const defaultSettings = () => ({
     ollama: { apiKey: "" },
     meshy: { apiKey: "", model: "meshy-6" },
     tripo: { apiKey: "", model: "v3.1-20260211" },
+    local3d: { url: "", model: "hunyuan3d" },
   },
   keybindings: {
     objectMesh: "Tab",
@@ -1497,11 +1510,12 @@ the appropriate \`twix_*\` tool.
 
 ## Modelling standard (important)
 
-- **Highest quality:** when a Meshy or Tripo key is configured in Settings > Providers, call
-  \`twix_ai_model_generate\` for characters, creatures, props, vehicles, buildings and detailed organic
-  assets. It generates a textured GLB through Tripo/Meshy-class AI and imports it into the live scene.
-  This is the standard the user expects for finished models. Use the procedural tools for blockouts,
-  edits and offline work, and never claim a primitive build is Tripo/Meshy quality.
+- **Highest quality:** when a local Hunyuan3D server or a Meshy/Tripo key is configured in
+  Settings > Providers, call \`twix_ai_model_generate\` for characters, creatures, props,
+  vehicles, buildings and detailed organic assets. It generates a textured GLB through the
+  local or cloud 3D backend and imports it into the live scene. This is the standard the user
+  expects for finished models. Use the procedural tools for blockouts, edits and offline work,
+  and never claim a primitive build is Hunyuan3D/Tripo/Meshy quality.
 - **Humans and creatures:** never assemble a character from primitives. Prefer
   \`twix_ai_model_generate\`, or call \`twix_humanoid_create\` for a fast single-mesh offline body.
   Add clothing with \`twix_garment_create\` (fitted shell) and \`twix_garment_bind\`.
@@ -3069,30 +3083,11 @@ async function ensureExampleMod() {
 }
 
 async function listMods() {
-  const settings = await getSettings();
-  const enabled = new Set(settings.mods?.enabled || []);
-  const dir = modsDirectory();
-  await ensureDir(dir);
-  const mods = [];
-  for (const name of await fs.readdir(dir)) {
-    const folder = path.join(dir, name);
-    const stat = await fs.stat(folder).catch(() => null);
-    if (!stat?.isDirectory()) continue;
-    const manifest = await readJson(path.join(folder, "mod.json"), null);
-    if (!manifest) continue;
-    mods.push({
-      id: manifest.id || name,
-      folder: name,
-      name: manifest.name || name,
-      version: manifest.version || "1.0.0",
-      description: manifest.description || "",
-      author: manifest.author || "",
-      main: manifest.main || "index.js",
-      enabled: enabled.has(manifest.id || name),
-    });
-  }
-  mods.sort((a, b) => a.name.localeCompare(b.name));
-  return { mods, dir };
+  // One mod inventory is shared by the Add-ons panel, Settings > Mods and the
+  // licensed runtime. Keep the legacy { mods, dir } shape alongside the richer
+  // licence/documentation fields.
+  const result = await modService.list();
+  return { ...result, dir: result.root };
 }
 
 
@@ -3198,14 +3193,12 @@ app.get("/api/mods", async (req, res) => {
 
 app.get("/api/mods/:id/source", async (req, res) => {
   try {
-    const { mods, dir } = await listMods();
+    const { mods } = await listMods();
     const mod = mods.find((item) => item.id === req.params.id);
     if (!mod) return res.status(404).json({ error: "Mod not found" });
-    const folder = path.join(dir, mod.folder);
-    const target = path.resolve(folder, mod.main);
-    if (!isInside(folder, target)) return res.status(400).json({ error: "Invalid mod entry" });
-    const source = await fs.readFile(target, "utf8");
-    res.type("text/javascript").send(source);
+    const result = await modService.file(mod.id, mod.main);
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+    res.type("text/javascript").sendFile(result.absolute);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3216,12 +3209,9 @@ app.post("/api/mods/:id/toggle", async (req, res) => {
     const { mods } = await listMods();
     const mod = mods.find((item) => item.id === req.params.id);
     if (!mod) return res.status(404).json({ error: "Mod not found" });
-    const settings = await getSettings();
-    const enabled = new Set(settings.mods?.enabled || []);
-    if (req.body?.enabled === false) enabled.delete(mod.id);
-    else enabled.add(mod.id);
-    await saveSettings({ mods: { enabled: [...enabled] } });
-    res.json({ ok: true, enabled: enabled.has(mod.id) });
+    const result = await modService.toggle(mod.id, req.body?.enabled !== false);
+    if (!result.ok) return res.status(403).json(result);
+    res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -6060,6 +6050,318 @@ app.post("/api/coding/open-folder", async (req, res) => {
   }
 });
 
+app.get("/api/mods", async (_req, res) => {
+  try {
+    res.json(await modService.list());
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/mods/toggle", async (req, res) => {
+  try {
+    const result = await modService.toggle(String(req.body?.id || ""), Boolean(req.body?.enabled));
+    if (!result.ok) return res.status(403).json(result);
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/mods/create", async (req, res) => {
+  try {
+    const result = await modService.create(String(req.body?.name || "My Mod"));
+    if (!result.ok) return res.status(403).json(result);
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/mods/file", async (req, res) => {
+  try {
+    const result = await modService.file(String(req.query.mod || ""), String(req.query.path || ""));
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+    res.setHeader("Content-Type", result.mime);
+    res.setHeader("Cache-Control", "no-store");
+    res.sendFile(result.absolute);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/mods/docs", async (_req, res) => {
+  try {
+    res.type("text/markdown").send(await modService.docs());
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/mods/prompt", async (_req, res) => {
+  try {
+    res.type("text/plain").send(await modService.prompt());
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/mods/entry", async (req, res) => {
+  try {
+    const gate = await modService.requireLicense();
+    if (!gate.ok) return res.status(403).json({ error: gate.message });
+    const content = await modService.readEntry(String(req.query.mod || ""), String(req.query.path || ""));
+    res.json({ ok: true, content });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.put("/api/mods/entry", async (req, res) => {
+  try {
+    const gate = await modService.requireLicense();
+    if (!gate.ok) return res.status(403).json({ error: gate.message });
+    const result = await modService.writeEntry(
+      String(req.body?.mod || ""),
+      String(req.body?.path || ""),
+      req.body?.content,
+    );
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/mods/open-folder", async (_req, res) => {
+  try {
+    await modService.ensure();
+    const command = process.platform === "win32" ? "explorer.exe" : process.platform === "darwin" ? "open" : "xdg-open";
+    const child = spawn(command, [MODDING_DIR], { detached: true, stdio: "ignore" });
+    child.unref();
+    res.json({ ok: true, dir: MODDING_DIR });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/mods/backend", async (req, res) => {
+  try {
+    const gate = await modService.requireLicense();
+    if (!gate.ok) return res.status(403).json({ error: gate.message });
+    const mod = String(req.body?.mod || "");
+    const moduleName = String(req.body?.module || "backend.mjs");
+    const action = String(req.body?.action || "default");
+    const payload = req.body?.payload ?? null;
+    const file = await modService.file(mod, moduleName);
+    if (!file.ok) return res.status(400).json({ error: file.error });
+    const imported = await import(pathToFileURL(file.absolute).href + "?t=" + Date.now());
+    const handler = imported.default || imported.run || imported.backend;
+    if (typeof handler !== "function") {
+      return res.status(400).json({ error: "The backend module has no default async function export." });
+    }
+    const result = await handler({
+      action,
+      payload,
+      context: {
+        dataDir: DATA_DIR,
+        appRoot: APP_ROOT,
+        modsDir: MODDING_DIR,
+        version: APP_VERSION,
+        log,
+      },
+    });
+    res.json({ ok: true, result });
+  } catch (error) {
+    log("warning", "mods", "backend failed", { message: error.message });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/mods/python", async (req, res) => {
+  try {
+    const gate = await modService.requireLicense();
+    if (!gate.ok) return res.status(403).json({ error: gate.message });
+    const mod = String(req.body?.mod || "");
+    const scriptName = String(req.body?.script || "");
+    const args = Array.isArray(req.body?.args) ? req.body.args.map((item) => String(item)) : [];
+    const file = await modService.file(mod, scriptName);
+    if (!file.ok) return res.status(400).json({ error: file.error });
+    const python = process.env.TWIX_PYTHON || (process.platform === "win32" ? "python" : "python3");
+    const result = await new Promise((resolve) => {
+      const child = spawn(python, [file.absolute, ...args], {
+        cwd: path.dirname(file.absolute),
+        windowsHide: true,
+        env: { ...process.env, PYTHONUNBUFFERED: "1" },
+      });
+      let stdout = "";
+      let stderr = "";
+      const timer = setTimeout(() => {
+        try { child.kill(); } catch {}
+        resolve({ code: -1, stdout, stderr: stderr + "\nTimed out after 60 seconds." });
+      }, 60000);
+      child.stdout?.on("data", (chunk) => { stdout += String(chunk).slice(0, 1024 * 1024); });
+      child.stderr?.on("data", (chunk) => { stderr += String(chunk).slice(0, 1024 * 1024); });
+      child.on("error", (error) => {
+        clearTimeout(timer);
+        resolve({ code: -1, stdout, stderr: error.message });
+      });
+      child.on("exit", (code) => {
+        clearTimeout(timer);
+        resolve({ code: code ?? -1, stdout, stderr });
+      });
+    });
+    res.json({ ok: result.code === 0, ...result });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/app/uninstall-status", async (_req, res) => {
+  res.json({
+    ok: true,
+    packaged: IS_PACKAGED,
+    platform: process.platform,
+    version: APP_VERSION,
+    dataDir: DATA_DIR,
+    globalProjectRoot: GLOBAL_PROJECT_ROOT,
+    artRoot: ART_ROOT,
+    installRoot: process.env.TWIX_UNINSTALL_ROOT || "",
+    executable: process.env.TWIX_UNINSTALL_EXE || process.execPath,
+    uninstallDisabled: !IS_PACKAGED,
+  });
+});
+
+async function deletePath(target) {
+  if (!target) return false;
+  const resolved = path.resolve(target);
+  const protectedRoots = new Set([path.parse(resolved).root.toLowerCase(), os.homedir().toLowerCase(), DOCUMENTS_DIR.toLowerCase()]);
+  if (protectedRoots.has(resolved.toLowerCase())) throw new Error("Refusing to delete a system or home folder.");
+  await fs.rm(resolved, { recursive: true, force: true, maxRetries: 3 });
+  return true;
+}
+
+function launchTerminalScript(scriptPath, platform) {
+  if (platform === "win32") {
+    const child = spawn("cmd.exe", ["/c", "start", "", "cmd.exe", "/k", scriptPath], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false,
+    });
+    child.unref();
+    return;
+  }
+  if (platform === "darwin") {
+    const child = spawn("open", ["-a", "Terminal", scriptPath], { detached: true, stdio: "ignore" });
+    child.unref();
+    return;
+  }
+  const command = [
+    `if command -v x-terminal-emulator >/dev/null 2>&1; then x-terminal-emulator -e bash '${scriptPath}'`,
+    `elif command -v gnome-terminal >/dev/null 2>&1; then gnome-terminal -- bash '${scriptPath}'`,
+    `elif command -v konsole >/dev/null 2>&1; then konsole -e bash '${scriptPath}'`,
+    `elif command -v xterm >/dev/null 2>&1; then xterm -e bash '${scriptPath}'`,
+    `else bash '${scriptPath}'`,
+    "fi",
+  ].join("; ");
+  const child = spawn("bash", ["-lc", command], { detached: true, stdio: "ignore" });
+  child.unref();
+}
+
+app.post("/api/app/uninstall", async (req, res) => {
+  try {
+    if (!IS_PACKAGED) {
+      return res.status(403).json({
+        error: "Uninstall is disabled in the developer build. Use the packaged Creator Studio build to uninstall.",
+      });
+    }
+    const installRoot = String(process.env.TWIX_UNINSTALL_ROOT || "");
+    const executable = String(process.env.TWIX_UNINSTALL_EXE || process.execPath || "");
+    if (!installRoot && !executable) return res.status(400).json({ error: "The installation path is unknown." });
+    const stamp = Date.now();
+    if (process.platform === "win32") {
+      const scriptPath = path.join(os.tmpdir(), `creator-studio-uninstall-${stamp}.cmd`);
+      const lines = [
+        "@echo off",
+        "title Creator Studio Uninstall",
+        "echo Closing Creator Studio...",
+        "timeout /t 2 /nobreak >nul",
+        'taskkill /IM "Creator Studio.exe" /T /F >nul 2>&1',
+        "timeout /t 2 /nobreak >nul",
+      ];
+      if (installRoot) lines.push(`if exist "${installRoot}" rmdir /s /q "${installRoot}"`);
+      if (executable && (!installRoot || !executable.toLowerCase().startsWith(installRoot.toLowerCase()))) {
+        lines.push(`if exist "${executable}" del /f /q "${executable}"`);
+      }
+      lines.push(
+        'echo.',
+        'if exist "' + (installRoot || executable) + '" (echo Uninstall did not finish. Close Creator Studio and run this window again.) else (echo Creator Studio was removed. Your documents and user data were kept.)',
+        'echo.',
+        'del "%~f0" >nul 2>&1',
+      );
+      await fs.writeFile(scriptPath, lines.join("\r\n"), "utf8");
+      res.json({ ok: true, message: "Creator Studio is closing and the uninstall terminal is opening." });
+      setTimeout(() => launchTerminalScript(scriptPath, "win32"), 400);
+      return;
+    }
+    const scriptPath = path.join(os.tmpdir(), `creator-studio-uninstall-${stamp}.sh`);
+    const lines = [
+      "#!/bin/bash",
+      'echo "Closing Creator Studio..."',
+      "sleep 2",
+      'pkill -x creator-studio 2>/dev/null || true',
+      "sleep 2",
+    ];
+    if (installRoot) lines.push(`rm -rf "${installRoot}"`);
+    if (executable && (!installRoot || !executable.startsWith(installRoot + "/"))) lines.push(`rm -f "${executable}"`);
+    lines.push(
+      'if [ -e "' + (installRoot || executable) + '" ]; then',
+      '  echo "Uninstall did not finish. Close Creator Studio and run this script again."',
+      "else",
+      '  echo "Creator Studio was removed. Your documents and user data were kept."',
+      "fi",
+      'rm -f "$0"',
+      'read -r -p "Press Enter to close this terminal..." _',
+    );
+    await fs.writeFile(scriptPath, lines.join("\n"), { encoding: "utf8", mode: 0o755 });
+    res.json({ ok: true, message: "Creator Studio is closing and the uninstall terminal is opening." });
+    setTimeout(() => launchTerminalScript(scriptPath, process.platform), 400);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/app/delete-data", async (req, res) => {
+  try {
+    if (!IS_PACKAGED) {
+      return res.status(403).json({ error: "Destructive cleanup is disabled in the developer build." });
+    }
+    if (String(req.body?.confirm || "") !== "DELETE") {
+      return res.status(400).json({ error: 'Type DELETE to confirm this action.' });
+    }
+    const target = String(req.body?.target || "");
+    if (target === "user") {
+      await deletePath(DATA_DIR);
+      res.json({ ok: true, target, path: DATA_DIR, message: "User data, settings, activation data and mods were deleted." });
+      return;
+    }
+    if (target === "projects") {
+      await deletePath(GLOBAL_PROJECT_ROOT);
+      await deletePath(ART_ROOT);
+      res.json({
+        ok: true,
+        target,
+        path: GLOBAL_PROJECT_ROOT,
+        artPath: ART_ROOT,
+        message: "Global Learning and Art Projects folders were deleted.",
+      });
+      return;
+    }
+    res.status(400).json({ error: "Unknown cleanup target." });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.put("/api/coding/file", async (req, res) => {
   try {
     const { dir, path: relative, content } = req.body || {};
@@ -6882,6 +7184,85 @@ async function tripoTextTo3D(apiKey, prompt, options, signal) {
   throw new Error("Tripo task timed out.");
 }
 
+async function hunyuanLocalTextTo3D(baseUrl, prompt, options, signal) {
+  const base = String(baseUrl || "").replace(/\/+$/, "");
+  if (!/^https?:\/\//i.test(base)) throw new Error("The local 3D server URL must start with http:// or https://.");
+  const body = {
+    text: prompt,
+    texture: options.texture !== false,
+    octree_resolution: Number(options.octree ?? 192),
+    num_inference_steps: Number(options.steps ?? 24),
+    guidance_scale: Number(options.guidance ?? 5.5),
+    seed: Math.floor(Math.random() * 2147483647),
+    type: "glb",
+    face_count: Number(options.polycount || 40000),
+  };
+  let response = await fetch(base + "/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  }).catch(() => null);
+  if (response?.ok) {
+    const submit = await response.json().catch(() => ({}));
+    const uid = submit.uid || submit.task_id || submit.id;
+    if (uid) {
+      for (let attempt = 0; attempt < 95; attempt += 1) {
+        await ai3dSleep(3000, signal);
+        const statusResponse = await fetch(base + "/status/" + encodeURIComponent(uid), { signal });
+        const status = await statusResponse.json().catch(() => ({}));
+        const value = String(status.status || "").toLowerCase();
+        if (value === "completed" || value === "success" || value === "succeeded") {
+          const base64 = status.model_base64 || status.model || status.data;
+          if (!base64) throw new Error("The local 3D server finished without a model.");
+          return {
+            url: `data:model/gltf-binary;base64,${String(base64).replace(/^data:[^,]+,/, "")}`,
+            taskId: String(uid),
+            provider: "local",
+            model: "hunyuan3d",
+          };
+        }
+        if (["failed", "error", "cancelled", "canceled"].includes(value)) {
+          throw new Error(status.error || status.message || "The local 3D job failed.");
+        }
+      }
+      throw new Error("The local 3D job timed out. Check the Hunyuan3D terminal.");
+    }
+  }
+  // Older/simple local wrappers return the GLB directly from /generate.
+  response = await fetch(base + "/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`The local 3D server did not accept the job (HTTP ${response.status}). ${text.slice(0, 200)}`);
+  }
+  const type = response.headers.get("content-type") || "";
+  if (type.includes("application/json")) {
+    const json = await response.json().catch(() => ({}));
+    const base64 = json.model_base64 || json.model || json.data;
+    if (base64) {
+      return {
+        url: `data:model/gltf-binary;base64,${String(base64).replace(/^data:[^,]+,/, "")}`,
+        taskId: json.uid || "",
+        provider: "local",
+        model: "hunyuan3d",
+      };
+    }
+    throw new Error(json.error || json.message || "The local 3D server returned no model.");
+  }
+  const bytes = Buffer.from(await response.arrayBuffer());
+  return {
+    url: `data:model/gltf-binary;base64,${bytes.toString("base64")}`,
+    taskId: "",
+    provider: "local",
+    model: "hunyuan3d",
+  };
+}
+
 async function downloadAi3dModel(projectId, url, extension = "glb") {
   const entry = await loadProjectById(projectId);
   const refs = path.join(entry.path, "references");
@@ -6903,15 +7284,22 @@ app.post("/api/ai3d/generate", async (req, res) => {
     if (!projectId) return res.status(400).json({ error: "A project is required." });
     const meshyKey = settings.providers?.meshy?.apiKey || "";
     const tripoKey = settings.providers?.tripo?.apiKey || "";
-    const chosen = provider || (meshyKey ? "meshy" : tripoKey ? "tripo" : "");
+    const localUrl = settings.providers?.local3d?.url || "";
+    const chosen = provider || (localUrl ? "local" : meshyKey ? "meshy" : tripoKey ? "tripo" : "");
     if (!chosen) {
       return res.status(400).json({
-        error: "Add a Meshy or Tripo API key in Settings > Providers to generate AI 3D models.",
+        error: "Add a local Hunyuan3D server URL, or a Meshy or Tripo API key, in Settings > Providers to generate AI 3D models.",
       });
     }
     const signal = AbortSignal.timeout(285000);
     let result;
-    if (chosen === "meshy") {
+    if (chosen === "local") {
+      if (!localUrl) return res.status(400).json({ error: "The local 3D server URL is not configured." });
+      result = await hunyuanLocalTextTo3D(localUrl, String(prompt), {
+        texture,
+        polycount,
+      }, signal);
+    } else if (chosen === "meshy") {
       if (!meshyKey) return res.status(400).json({ error: "Meshy API key is not configured." });
       result = await meshyTextTo3D(meshyKey, String(prompt), {
         texture,
@@ -6926,7 +7314,7 @@ app.post("/api/ai3d/generate", async (req, res) => {
         polycount,
       }, signal);
     } else {
-      return res.status(400).json({ error: "Unsupported 3D provider. Use meshy or tripo." });
+      return res.status(400).json({ error: "Unsupported 3D provider. Use local, meshy or tripo." });
     }
     const saved = await downloadAi3dModel(projectId, result.url, "glb");
     log("info", "ai3d", "generated", { provider: chosen, taskId: result.taskId, bytes: saved.bytes });
@@ -9552,6 +9940,186 @@ function githubRefPath(branch) {
  * A failed file is recorded and skipped instead of aborting the whole commit:
  * every file that is under the limits still gets pushed.
  */
+function runGit(args, cwd, timeoutMs = 600000) {
+  return new Promise((resolve) => {
+    const child = spawn("git", args, { cwd, windowsHide: true, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      resolve({ code: -1, stdout, stderr: stderr + "\nGit timed out." });
+    }, timeoutMs);
+    child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolve({ code: -1, stdout, stderr: stderr + "\n" + error.message });
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve({ code: code ?? -1, stdout, stderr });
+    });
+  });
+}
+
+let gitProbe = null;
+async function gitAvailable() {
+  if (gitProbe !== null) return gitProbe;
+  const result = await runGit(["--version"], APP_ROOT, 15000);
+  gitProbe = result.code === 0;
+  return gitProbe;
+}
+
+async function gitLfsAvailable() {
+  const result = await runGit(["lfs", "version"], APP_ROOT, 15000);
+  return result.code === 0;
+}
+
+function redactGitError(text, token) {
+  let value = String(text || "");
+  if (token) value = value.split(token).join("[redacted]");
+  return value.replace(/https:\/\/[^@\s]+@github\.com/g, "https://[redacted]@github.com");
+}
+
+async function githubGitCliPush({ owner, repo, branch, files, cleanMode, deleteMissing, message, token, log }) {
+  if (!(await gitAvailable())) return { ok: false, fallback: true, error: "Git is not installed." };
+  if (!token) return { ok: false, fallback: true, error: "No GitHub token is configured." };
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "creator-studio-push-"));
+  const repoDir = path.join(temp, "repo");
+  const authUrl = `https://x-access-token:${encodeURIComponent(token)}@github.com/${owner}/${repo}.git`;
+  try {
+    let cloned = await runGit(["clone", "--depth", "1", "--branch", branch, "--single-branch", authUrl, repoDir], temp, 1800000);
+    if (cloned.code !== 0) {
+      cloned = await runGit(["clone", "--depth", "1", authUrl, repoDir], temp, 1800000);
+      if (cloned.code !== 0) {
+        throw new Error("Git clone failed: " + redactGitError(cloned.stderr || cloned.stdout, token));
+      }
+      await runGit(["checkout", "-b", branch], repoDir, 60000);
+    }
+
+    if (cleanMode || deleteMissing) {
+      const entries = await fs.readdir(repoDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name === ".git") continue;
+        await fs.rm(path.join(repoDir, entry.name), { recursive: true, force: true });
+      }
+    }
+
+    for (const item of files) {
+      const target = path.join(repoDir, item.path);
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.copyFile(item.absolute, target);
+    }
+
+    const large = files.filter((item) => Number(item.bytes || 0) > GITHUB_LFS_THRESHOLD_BYTES);
+    if (large.length) {
+      if (!(await gitLfsAvailable())) {
+        return { ok: false, fallback: true, error: "Large files need Git LFS for a Git CLI push." };
+      }
+      await runGit(["lfs", "install", "--local"], repoDir, 60000);
+      const extensions = [...new Set(large.map((item) => path.extname(item.path)))].filter(Boolean);
+      for (const extension of extensions) {
+        await runGit(["lfs", "track", `*${extension}`], repoDir, 60000);
+      }
+    }
+
+    const added = await runGit(["add", "-A"], repoDir, 180000);
+    if (added.code !== 0) throw new Error("git add failed: " + redactGitError(added.stderr, token));
+    const commit = await runGit(
+      [
+        "-c", "user.name=Creator Studio",
+        "-c", "user.email=creator-studio@users.noreply.github.com",
+        "commit", "-m", message,
+      ],
+      repoDir,
+      300000,
+    );
+    if (commit.code !== 0 && !/nothing to commit|no changes added/i.test(commit.stdout + commit.stderr)) {
+      throw new Error("git commit failed: " + redactGitError(commit.stderr || commit.stdout, token));
+    }
+    const pushed = await runGit(["push", "origin", `HEAD:${branch}`], repoDir, 1800000);
+    if (pushed.code !== 0) {
+      throw new Error("git push failed: " + redactGitError(pushed.stderr || pushed.stdout, token));
+    }
+    const head = await runGit(["rev-parse", "HEAD"], repoDir, 30000);
+    const sha = head.stdout.trim();
+    log("info", "github", "git cli push complete", { owner, repo, branch, files: files.length, cleanMode, sha });
+    return {
+      ok: true,
+      commitSha: sha,
+      commitUrl: sha ? `https://github.com/${owner}/${repo}/commit/${sha}` : "",
+      pushed: files.map((item) => item.path),
+      deleted: [],
+    };
+  } finally {
+    await fs.rm(temp, { recursive: true, force: true, maxRetries: 2 }).catch(() => null);
+  }
+}
+
+async function githubGitCliPull({ owner, repo, branch, entries, prefix, root, overwrite, token, settings }) {
+  if (!(await gitAvailable())) return { ok: false, fallback: true, error: "Git is not installed." };
+  if (!token) return { ok: false, fallback: true, error: "No GitHub token is configured." };
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "creator-studio-pull-"));
+  const repoDir = path.join(temp, "repo");
+  const authUrl = `https://x-access-token:${encodeURIComponent(token)}@github.com/${owner}/${repo}.git`;
+  const pulled = [];
+  const skipped = [];
+  const failed = [];
+  let bytes = 0;
+  try {
+    const cloned = await runGit(["clone", "--depth", "1", "--branch", branch, "--single-branch", authUrl, repoDir], temp, 1800000);
+    if (cloned.code !== 0) {
+      throw new Error("Git clone failed: " + redactGitError(cloned.stderr || cloned.stdout, token));
+    }
+    if (await gitLfsAvailable()) {
+      await runGit(["lfs", "pull"], repoDir, 1800000);
+    }
+    for (const entry of entries) {
+      const relative =
+        prefix && entry.path === prefix
+          ? path.basename(entry.path)
+          : prefix
+            ? entry.path.slice(prefix.length + 1)
+            : entry.path;
+      if (String(relative).split(/[\\/]/).some((part) => part === "node_modules" || part === ".git")) {
+        skipped.push({ path: entry.path, reason: "Ignored folder." });
+        continue;
+      }
+      const source = path.join(repoDir, entry.path);
+      const dest = path.resolve(root, relative);
+      if (dest !== root && !dest.startsWith(root + path.sep)) {
+        failed.push({ path: entry.path, reason: "Invalid path." });
+        continue;
+      }
+      if (!overwrite && fssync.existsSync(dest)) {
+        skipped.push({ path: entry.path, reason: "Already exists locally." });
+        continue;
+      }
+      try {
+        let buffer = await fs.readFile(source);
+        if (isLfsPointer(buffer)) {
+          const pointer = parseLfsPointer(buffer);
+          if (pointer && token) buffer = await lfsDownloadObject(owner, repo, token, pointer.oid, pointer.size);
+        }
+        if (buffer.length > GITHUB_LFS_MAX_BYTES) {
+          skipped.push({ path: entry.path, bytes: buffer.length, reason: "Larger than the 2 GB limit." });
+          continue;
+        }
+        await fs.mkdir(path.dirname(dest), { recursive: true });
+        await fs.writeFile(dest, buffer);
+        pulled.push(relative);
+        bytes += buffer.length;
+      } catch (error) {
+        failed.push({ path: entry.path, reason: error.message });
+      }
+    }
+    log("info", "github", "git cli pull complete", { owner, repo, branch, files: pulled.length });
+    return { ok: true, pulled, skipped, failed, bytes };
+  } finally {
+    await fs.rm(temp, { recursive: true, force: true, maxRetries: 2 }).catch(() => null);
+  }
+}
+
 async function githubUploadBlobs(owner, repo, changes, options = {}) {
   const settings = options.settings || (await getSettings());
   const token = githubPrimaryToken(settings);
@@ -9858,13 +10426,41 @@ app.post("/api/github/pull", async (req, res) => {
         error: prefix ? "No files were found at " + prefix + "." : "The repository is empty.",
       });
     }
-    if (selected.length > 4000) {
-      return res.status(413).json({
-        error:
-          "This pull contains " +
-          selected.length +
-          " files. The safe limit is 4000 files per pull; select a subfolder instead.",
-      });
+    // Pull files in one pass. Very large repositories are limited by the byte
+    // guard below, not by an arbitrary file count.
+    // Very large pulls use a single Git pack transfer instead of thousands of
+    // rate-limited blob requests. The API path remains the fallback.
+    if (selected.length > 2000) {
+      const pullSettingsFast = await getSettings();
+      const token = githubPrimaryToken(pullSettingsFast);
+      if (token) {
+        const fast = await githubGitCliPull({
+          owner,
+          repo,
+          branch: targetBranch,
+          entries: selected,
+          prefix,
+          root,
+          overwrite: Boolean(overwrite),
+          token,
+          settings: pullSettingsFast,
+        });
+        if (fast.ok) {
+          return res.json({
+            ok: true,
+            ref: targetBranch,
+            path: prefix,
+            root,
+            pulled: fast.pulled,
+            skipped: fast.skipped,
+            failed: fast.failed,
+            bytes: fast.bytes,
+            total: selected.length,
+            transport: "git",
+          });
+        }
+        log("warning", "github", "git cli pull fallback", { message: fast.error });
+      }
     }
 
     const pulled = [];
@@ -10185,20 +10781,11 @@ app.post("/api/github/sync", async (req, res) => {
     const allowed = files
       .filter((item) => item.bytes <= GITHUB_LFS_MAX_BYTES)
       .sort((a, b) => a.path.localeCompare(b.path));
-    // A single tree commit comfortably handles a few thousand entries; this is a
-    // guard rail, not a target.
-    const MAX_SYNC_FILES = 4000;
+    // Large workspaces are pushed through the incremental tree builder below,
+    // which splits GitHub's tree API into small requests. This guard is only a
+    // runaway-workspace stop; it is not the old one-request 4,000-file limit.
+    const MAX_SYNC_FILES = 100000;
     const filesTruncated = allowed.length > MAX_SYNC_FILES;
-    if (cleanMode && filesTruncated) {
-      return res.status(413).json({
-        error:
-          "This workspace has " +
-          allowed.length +
-          " eligible files, above the " +
-          MAX_SYNC_FILES +
-          "-file limit for one clean push. Nothing was changed. Raise the limit or exclude folders first.",
-      });
-    }
     const selected = filesTruncated ? allowed.slice(0, MAX_SYNC_FILES) : allowed;
     const cappedFiles = filesTruncated ? allowed.slice(MAX_SYNC_FILES) : [];
     const localPaths = new Set(selected.map((item) => item.path));
@@ -10254,6 +10841,57 @@ app.post("/api/github/sync", async (req, res) => {
         lfsFiles: largeFiles,
         skippedIgnored,
       });
+    }
+
+    // Very large clean pushes use one Git pack transfer. The REST blob path
+    // remains the fallback when Git/LFS is unavailable.
+    const syncSettings = await getSettings();
+    const syncToken = githubPrimaryToken(syncSettings);
+    if (allowed.length > 2000 && syncToken) {
+      const fast = await githubGitCliPush({
+        owner,
+        repo,
+        branch: targetBranch,
+        files: allowed,
+        cleanMode,
+        deleteMissing,
+        message: message + " (Git CLI, " + allowed.length + " files)",
+        token: syncToken,
+        log,
+      });
+      if (fast.ok) {
+        const deletedFast = cleanMode
+          ? [...state.remote.keys()].filter((remotePath) => !localPaths.has(remotePath))
+          : [];
+        return res.json({
+          ok: true,
+          clean: cleanMode,
+          workspace: root,
+          branch: targetBranch,
+          commit: fast.commitSha,
+          commitUrl: fast.commitUrl,
+          pushed: fast.pushed,
+          failed: [],
+          unchanged: [],
+          deleted: deletedFast,
+          notPushed: [],
+          notPushedTotal: 0,
+          notPushedFile: "",
+          pushedBytes: totalBytes,
+          totalFiles: allowed.length,
+          totalBytes,
+          truncated: false,
+          maxFiles: MAX_SYNC_FILES,
+          repoSizeKb: Math.max(1, Math.ceil(totalBytes / 1024)),
+          repoSizeEstimated: true,
+          remoteTreeTruncated: state.truncated,
+          deleteSkipped: false,
+          lfsFiles: largeFiles,
+          skippedIgnored,
+          transport: "git",
+        });
+      }
+      log("warning", "github", "git cli push fallback", { message: fast.error });
     }
 
     const { entries, failed, lfsPaths } = await githubUploadBlobs(owner, repo, changed);
@@ -10664,7 +11302,7 @@ app.post("/api/opencode/prompt", async (req, res) => {
 
     const system = [
       "You are operating the live TwiX 3D scene. Use twix_* tools to inspect and change the scene.",
-      "Finish models as continuous vertex-built surfaces. Use twix_ai_model_generate for Tripo/Meshy-class results when a provider key exists; otherwise use twix_humanoid_create for people and twix_mesh_create/twix_prop_create for props. Primitives are blockout-only; never build a character from cubes, capsules or spheres.",
+      "Finish models as continuous vertex-built surfaces. Use twix_ai_model_generate for local Hunyuan3D or Meshy/Tripo-class results when a backend is configured; otherwise use twix_humanoid_create for people and twix_mesh_create/twix_prop_create for props. Primitives are blockout-only; never build a character from cubes, capsules or spheres.",
       `Active studio: ${workspace}. Project units: ${context.units || "m"}.`,
       context.selection?.length ? `Current selection: ${context.selection.join(", ")}.` : "Nothing is selected.",
       context.sceneSummary ? `Scene summary:\n${context.sceneSummary}` : "",

@@ -1,0 +1,9 @@
+/* Example theme: a subtle accent change. Replace or extend freely. */
+:root {
+  --accent: #ff5cc8;
+  --accent-soft: color-mix(in srgb, #ff5cc8 18%, transparent);
+}
+
+.modeler-tb-btn.active {
+  box-shadow: 0 0 0 1px var(--mod-accent, #ff5cc8);
+}

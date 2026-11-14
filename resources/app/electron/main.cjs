@@ -246,6 +246,11 @@ function startServer() {
         TWIX_DATA_DIR: dataDir(),
         TWIX_DEFAULT_PROJECT_DIR: defaultProjectDir(),
         TWIX_DESKTOP: "1",
+        TWIX_PACKAGED: isDev ? "0" : "1",
+        TWIX_UNINSTALL_ROOT:
+          isDev || process.env.PORTABLE_EXECUTABLE_FILE ? "" : path.dirname(process.execPath),
+        TWIX_UNINSTALL_EXE:
+          isDev ? "" : process.env.PORTABLE_EXECUTABLE_FILE || process.execPath,
       },
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],

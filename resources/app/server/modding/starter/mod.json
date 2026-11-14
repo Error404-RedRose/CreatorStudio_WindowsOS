@@ -1,0 +1,9 @@
+{
+  "id": "example-theme",
+  "name": "Example Theme",
+  "version": "1.0.0",
+  "author": "Creator Studio",
+  "description": "A small starter mod: accent colours, a header button and a tool override example.",
+  "main": "main.js",
+  "styles": ["style.css"]
+}
