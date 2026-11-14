@@ -191,9 +191,11 @@ const APP_VERSION = (() => {
   }
 })();
 
+const modsRoot = process.env.TWIX_MODS_DIR || path.join(APP_ROOT, "mods");
 const modService = createModService({
   dataDir: DATA_DIR,
   appRoot: APP_ROOT,
+  modsRoot,
   version: APP_VERSION,
   license: () => licenseService.status(),
   isPackaged: process.env.TWIX_PACKAGED === "1",
@@ -630,7 +632,7 @@ const defaultSettings = () => ({
   exportFormat: "fbx",
   exportDir: "exports",
   includeTextures: true,
-  mods: { enabled: ["example-hello"] },
+  mods: { enabled: [] },
   references: { links: [], folders: [] },
   github: {
     token: "",
@@ -1496,10 +1498,13 @@ the appropriate \`twix_*\` tool.
    **The live editor is Z-up:** the ground is the XY plane, height runs along +Z, and procedural
    buildings, foliage, props and humanoids are automatically stood upright on that grid.
    For editable architecture and cut-outs, use the sketch tools: \`twix_sketch_inspect\`,
-   \`twix_sketch_rectangle\`, \`twix_sketch_circle\`, \`twix_sketch_offset\`, \`twix_sketch_push_pull\`,
-   \`twix_sketch_select_faces\`, \`twix_sketch_paint_faces\` and \`twix_sketch_uv_wrap\`. Keep caps and
-   openings as single editable n-gons; never hand-triangulate them. UV Wrap adds hidden triangles
-   without breaking the face.
+   \`twix_sketch_rectangle\`, \`twix_sketch_circle\`, \`twix_sketch_polygon\`,
+   \`twix_sketch_offset\`, \`twix_sketch_push_pull\`, \`twix_sketch_select_faces\`,
+   \`twix_sketch_paint_faces\` and \`twix_sketch_uv_wrap\`. Keep caps and openings as single editable
+   n-gons; never hand-triangulate them. UV Wrap adds hidden triangles without breaking the face.
+   \`twix_sketch_polygon\` takes explicit world-space points; for horizontal faces order them
+   counter-clockwise viewed from above (+Z green normal). Call \`twix_library_inspect\` to use the
+   user's 3D Library architecture references, then reproduce their proportions with new sketch faces.
 4. **Model like a professional 3D artist.** A finished asset is a continuous vertex-built surface,
    not a pile of cubes, spheres and capsules. Use \`twix_humanoid_create\` for every human character
    (it outputs one smooth lofted body mesh with head, neck, fingers, toes, feet, a skeleton and skin
@@ -3042,45 +3047,6 @@ function scheduleCodingRestart(projectId, state, previousAttempt = 0) {
 /* ------------------------------------------------------------------ */
 /* API: mods                                                           */
 /* ------------------------------------------------------------------ */
-
-function modsDirectory() {
-  return path.join(DATA_DIR, "mods");
-}
-
-async function ensureExampleMod() {
-  const dir = modsDirectory();
-  await ensureDir(dir);
-  const example = path.join(dir, "example-hello");
-  if (fssync.existsSync(example)) return;
-  await ensureDir(example);
-  await writeJsonAtomic(path.join(example, "mod.json"), {
-    id: "example-hello",
-    name: "Example: Add Cube",
-    version: "1.0.0",
-    description: "A tiny example mod that registers a button in the Add-ons panel.",
-    main: "index.js",
-    author: "Twilight Studio",
-  });
-  await fs.writeFile(
-    path.join(example, "index.js"),
-    `twixMod.registerButton({
-  id: "example-add-cube",
-  label: "Mod: Add Cube",
-  icon: "cube",
-  run() {
-    twixMod.runTool("object_create", {
-      name: "Mod Cube",
-      primitive: "box",
-      dimensions: { x: 0.5, y: 0.5, z: 0.5 },
-      position: { x: 0, y: 0.25, z: 0 },
-      color: "#c084fc",
-    });
-  },
-});
-`,
-    "utf8",
-  );
-}
 
 async function listMods() {
   // One mod inventory is shared by the Add-ons panel, Settings > Mods and the
@@ -6036,6 +6002,31 @@ app.post("/api/coding/folder", async (req, res) => {
   }
 });
 
+app.post("/api/coding/rename", async (req, res) => {
+  try {
+    const root = resolveCodingRoot(String(req.body?.dir || ""));
+    const source = path.resolve(root, String(req.body?.path || ""));
+    if (!isInside(root, source) || source === root) {
+      return res.status(400).json({ error: "Path outside workspace" });
+    }
+    const stat = await fs.stat(source).catch(() => null);
+    if (!stat) return res.status(404).json({ error: "The file or folder no longer exists." });
+    const name = String(req.body?.name || "").trim();
+    if (!name || name === "." || name === ".." || /[\\/]/.test(name)) {
+      return res.status(400).json({ error: "Enter a name without slashes." });
+    }
+    const target = path.join(path.dirname(source), name);
+    if (!isInside(root, target)) return res.status(400).json({ error: "Path outside workspace" });
+    if (target !== source && fssync.existsSync(target)) {
+      return res.status(409).json({ error: "A file or folder with that name already exists." });
+    }
+    await fs.rename(source, target);
+    res.json({ ok: true, path: path.relative(root, target).replace(/\\/g, "/"), name });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.post("/api/coding/open-folder", async (req, res) => {
   try {
     const root = resolveCodingRoot(String(req.body?.dir || ""));
@@ -7354,6 +7345,13 @@ app.post("/api/ai3d/prompt", async (req, res) => {
       "The live 3D scene is connected through the twix_* tools. Use those tools to complete the request directly.",
       "",
       "Coordinate system: the editor is Z-up. The ground is the XY plane, height goes along +Z, and the Rectangle/Circle tools draw on XY unless you pass a different normal. All procedural buildings, trees, props and humanoids are automatically stood upright on the grid.",
+      "Spatial reasoning rules:",
+      "- Units are metres. The world origin is (0,0,0), the floor is z=0, and every vertex you create must use absolute world coordinates.",
+      "- Before drawing, write a short internal coordinate plan: footprint corners, floor height, wall height, openings and roof ridge. Reuse exact numbers between tools instead of guessing.",
+      "- Use twix_sketch_polygon when rectangle/circle cannot express the shape. Pass every vertex explicitly and close the loop. Horizontal faces must be ordered counter-clockwise viewed from above so their green normal points +Z.",
+      "- Example 6x4 m room floor: [{x:0,y:0,z:0},{x:6,y:0,z:0},{x:6,y:4,z:0},{x:0,y:4,z:0}]. Push/Pull that face by 0.15 for a slab, or draw walls as vertical polygons and Push/Pull them by their thickness.",
+      "- Use twix_library_inspect to read the user's 3D Library categories and architectural references before designing. Use those proportions and styles, but build new editable sketch geometry rather than copying a library file.",
+      "- After building, call twix_sketch_inspect or twix_scene_inspect to verify face count, bounds and normals, then frame the viewport.",
       "Sketch workflow (prefer this for architecture, furniture, openings and anything the user must keep editing):",
       "1. Use twix_sketch_inspect to see existing faces, groups and selection.",
       "2. Use twix_sketch_rectangle and twix_sketch_circle to draw exact faces in metres.",
@@ -12313,7 +12311,8 @@ bootLog("log maintenance complete");
 await ensureDir(globalReferencesDir());
 await ensureDir(await normalizeProjectDir());
 bootLog("project and reference directories ready");
-await ensureExampleMod();
+// Generated demo mods are intentionally not created. The mods folder ships
+// with documentation and users add their own folders.
 bootLog("example mod ready");
 
 // Index saved reference folders and links as soon as the app boots. The

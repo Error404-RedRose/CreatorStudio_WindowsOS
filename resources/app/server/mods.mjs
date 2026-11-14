@@ -73,8 +73,10 @@ async function readJson(file, fallback) {
   }
 }
 
-export function createModService({ dataDir, appRoot, version, license, isPackaged, log }) {
-  const modsDir = path.join(dataDir, "mods");
+export function createModService({ dataDir, appRoot, modsRoot, version, license, isPackaged, log }) {
+  const modsDir = modsRoot || path.join(appRoot, "mods");
+  const legacyModsDir = path.join(dataDir, "mods");
+  const docsDir = path.join(modsDir, "docs");
   const statePath = path.join(dataDir, "mods-state.json");
   let licenseCache = { at: 0, status: null };
 
@@ -87,15 +89,31 @@ export function createModService({ dataDir, appRoot, version, license, isPackage
 
   async function ensure() {
     await fs.mkdir(modsDir, { recursive: true });
-    await copyFileIfDifferent(path.join(BUNDLED_ROOT, "MODDING.md"), path.join(modsDir, "MODDING.md"), true);
+    await fs.mkdir(docsDir, { recursive: true });
+    await copyFileIfDifferent(path.join(BUNDLED_ROOT, "MODDING.md"), path.join(docsDir, "MODDING.md"), true);
     await copyFileIfDifferent(
       path.join(BUNDLED_ROOT, "AI_MODDING_PROMPT.txt"),
-      path.join(modsDir, "AI_MODDING_PROMPT.txt"),
+      path.join(docsDir, "AI_MODDING_PROMPT.txt"),
       true,
     );
-    const starterDir = path.join(modsDir, "example-theme");
-    if (!fssync.existsSync(starterDir)) {
-      await copyStarter(path.join(BUNDLED_ROOT, "starter"), starterDir);
+    await copyFileIfDifferent(path.join(BUNDLED_ROOT, "EXAMPLES.md"), path.join(docsDir, "EXAMPLES.md"), true);
+    await copyFileIfDifferent(path.join(BUNDLED_ROOT, "README.txt"), path.join(modsDir, "README.txt"), true);
+    // Remove only the old generated demo mods from the previous user-data
+    // folder. User-created folders in the shipped mods directory are kept.
+    if (legacyModsDir !== modsDir) await removeGeneratedExamples(legacyModsDir);
+  }
+
+  async function removeGeneratedExamples(dir) {
+    for (const name of ["example-hello", "example-theme"]) {
+      const folder = path.join(dir, name);
+      const manifest = await readJson(path.join(folder, "mod.json"), null);
+      if (!manifest) continue;
+      const author = String(manifest.author || "").toLowerCase();
+      const id = String(manifest.id || "");
+      if (!/^example-/.test(id)) continue;
+      if (!/creator studio|twilight studio/.test(author)) continue;
+      await fs.rm(folder, { recursive: true, force: true }).catch(() => null);
+      log("info", "mods", "removed generated example mod", { path: folder });
     }
   }
 
@@ -113,26 +131,32 @@ export function createModService({ dataDir, appRoot, version, license, isPackage
   async function list() {
     await ensure();
     const state = await readState();
-    const entries = await fs.readdir(modsDir, { withFileTypes: true }).catch(() => []);
     const mods = [];
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const folder = path.join(modsDir, entry.name);
-      const manifest = await readJson(path.join(folder, "mod.json"), null);
-      if (!manifest || typeof manifest !== "object") continue;
-      const id = String(manifest.id || entry.name);
-      mods.push({
-        id,
-        folder: entry.name,
-        name: String(manifest.name || id),
-        version: String(manifest.version || "1.0.0"),
-        description: String(manifest.description || ""),
-        author: String(manifest.author || ""),
-        main: String(manifest.main || "main.js"),
-        styles: Array.isArray(manifest.styles) ? manifest.styles.map(String) : [],
-        enabled: state.enabled[id] !== false,
-        manifest,
-      });
+    const seen = new Set();
+    for (const dir of [modsDir, legacyModsDir]) {
+      const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const folder = path.join(dir, entry.name);
+        const manifest = await readJson(path.join(folder, "mod.json"), null);
+        if (!manifest || typeof manifest !== "object") continue;
+        const id = String(manifest.id || entry.name);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        mods.push({
+          id,
+          folder: entry.name,
+          root: dir,
+          name: String(manifest.name || id),
+          version: String(manifest.version || "1.0.0"),
+          description: String(manifest.description || ""),
+          author: String(manifest.author || ""),
+          main: String(manifest.main || "main.js"),
+          styles: Array.isArray(manifest.styles) ? manifest.styles.map(String) : [],
+          enabled: state.enabled[id] !== false,
+          manifest,
+        });
+      }
     }
     mods.sort((a, b) => a.name.localeCompare(b.name));
     const status = await licenseStatus();
@@ -141,8 +165,9 @@ export function createModService({ dataDir, appRoot, version, license, isPackage
       licensed: Boolean(status?.licensed),
       licenseStatus: status?.status || "inactive",
       root: modsDir,
-      docs: path.join(modsDir, "MODDING.md"),
-      aiPrompt: path.join(modsDir, "AI_MODDING_PROMPT.txt"),
+      legacyRoot: legacyModsDir,
+      docs: path.join(docsDir, "MODDING.md"),
+      aiPrompt: path.join(docsDir, "AI_MODDING_PROMPT.txt"),
       version,
       packaged: Boolean(isPackaged),
       mods,
@@ -192,15 +217,17 @@ export function createModService({ dataDir, appRoot, version, license, isPackage
   async function findFolder(id) {
     const wanted = String(id || "");
     if (!wanted) return "";
-    const direct = path.join(modsDir, slugify(wanted));
-    if (fssync.existsSync(path.join(direct, "mod.json"))) return direct;
-    const entries = await fs.readdir(modsDir, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const manifest = await readJson(path.join(modsDir, entry.name, "mod.json"), null);
-      if (manifest && String(manifest.id || entry.name) === wanted) return path.join(modsDir, entry.name);
+    for (const dir of [modsDir, legacyModsDir]) {
+      const direct = path.join(dir, slugify(wanted));
+      if (fssync.existsSync(path.join(direct, "mod.json"))) return direct;
+      const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const manifest = await readJson(path.join(dir, entry.name, "mod.json"), null);
+        if (manifest && String(manifest.id || entry.name) === wanted) return path.join(dir, entry.name);
+      }
     }
-    return direct;
+    return path.join(modsDir, slugify(wanted));
   }
 
   async function resolveFile(id, relative) {
@@ -229,12 +256,12 @@ export function createModService({ dataDir, appRoot, version, license, isPackage
 
   async function docs() {
     await ensure();
-    return fs.readFile(path.join(modsDir, "MODDING.md"), "utf8");
+    return fs.readFile(path.join(docsDir, "MODDING.md"), "utf8");
   }
 
   async function prompt() {
     await ensure();
-    return fs.readFile(path.join(modsDir, "AI_MODDING_PROMPT.txt"), "utf8");
+    return fs.readFile(path.join(docsDir, "AI_MODDING_PROMPT.txt"), "utf8");
   }
 
   async function readEntry(id, relative) {
@@ -257,6 +284,8 @@ export function createModService({ dataDir, appRoot, version, license, isPackage
 
   return {
     modsDir,
+    legacyModsDir,
+    docsDir,
     ensure,
     list,
     toggle,

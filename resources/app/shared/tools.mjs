@@ -79,6 +79,40 @@ export const tools = [
     },
   },
   {
+    name: "library_inspect",
+    category: "inspect",
+    mutating: false,
+    description:
+      "List the user's 3D Library models and textures with names, categories, subcategories and file paths. Use architectural structure assets as proportion/style references before drawing with sketch_polygon. This does not import or modify any library file.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Maximum entries to return (default 150)." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_polygon",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Draw an exact editable face from explicit world-space points. Points are metres in the Z-up editor; order horizontal floor/roof points counter-clockwise viewed from above so the green normal faces +Z. Use this for precise architecture, stair profiles, lot boundaries, cut-out shapes and any structure where rectangle/circle are not enough. The point loop is closed automatically.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        points: {
+          type: "array",
+          description: "World-space points in order; the loop closes back to the first point.",
+          items: vec3,
+        },
+        face: { type: "boolean", description: "Create the filled face (default true). Set false for edges only." },
+      },
+      required: ["points"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "sketch_inspect",
     category: "inspect",
     mutating: false,

@@ -412,7 +412,7 @@ class Transcriber:
         # Creator Studio's React inputs re-render on every keystroke, which is
         # slow for long dictation. Paste long text in one native event there;
         # external apps keep the per-character keyboard cadence.
-        if "creator studio" in foreground_title().lower() and len(text) > 24:
+        if "creator studio" in foreground_title().lower():
             if self._paste_text(text):
                 log("[PROGRESS] 95")
                 log("[TYPE] pasted into Creator Studio")

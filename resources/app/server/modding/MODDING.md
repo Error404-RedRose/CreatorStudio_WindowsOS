@@ -18,17 +18,17 @@ licence server is temporarily unreachable (the normal cached-license behavior).
 
 ## Folder layout
 
-The **Mods** tab in Settings > Mods shows the exact folder. The default is:
+The **Mods** tab in Settings > Mods shows the exact folder. In a packaged
+Windows/Linux build it is the `mods` folder beside the application files; in the
+developer build it is the repository's `mods` folder. The default layout is:
 
 ```text
-Documents/3D Creator Studio/mods/
-  MODDING.md                  <- this file
-  AI_MODDING_PROMPT.txt       <- paste into an AI coding chat
-  example-theme/
-    mod.json
-    main.js
-    style.css
-    README.md
+mods/
+  README.txt
+  docs/
+    MODDING.md                <- this file
+    EXAMPLES.md
+    AI_MODDING_PROMPT.txt     <- paste into an AI coding chat
   your-mod/
     mod.json
     main.js
@@ -36,6 +36,10 @@ Documents/3D Creator Studio/mods/
     backend.mjs               <- optional server-side Node module
     tools/anything.py         <- optional Python helpers
 ```
+
+Create your own folder next to `docs`; do not put mod files directly in the
+mods root. Existing `Documents/3D Creator Studio/mods` folders are also read for
+backwards compatibility.
 
 Mods may contain any JS, CSS, JSON, image, font, Markdown, Python or data file.
 They are served through the gated `/api/mods/file` route, never from the app bundle.

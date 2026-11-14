@@ -247,6 +247,11 @@ function startServer() {
         TWIX_DEFAULT_PROJECT_DIR: defaultProjectDir(),
         TWIX_DESKTOP: "1",
         TWIX_PACKAGED: isDev ? "0" : "1",
+        TWIX_MODS_DIR: isDev
+          ? path.join(appRoot, "mods")
+          : process.env.PORTABLE_EXECUTABLE_FILE
+            ? path.join(app.getPath("documents"), "3D Creator Studio", "mods")
+            : path.join(path.dirname(process.execPath), "mods"),
         TWIX_UNINSTALL_ROOT:
           isDev || process.env.PORTABLE_EXECUTABLE_FILE ? "" : path.dirname(process.execPath),
         TWIX_UNINSTALL_EXE:
