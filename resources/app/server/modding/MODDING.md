@@ -18,9 +18,8 @@ licence server is temporarily unreachable (the normal cached-license behavior).
 
 ## Folder layout
 
-The **Mods** tab in Settings > Mods shows the exact folder. In a packaged
-Windows/Linux build it is the `mods` folder beside the application files; in the
-developer build it is the repository's `mods` folder. The default layout is:
+The application ships a `mods` folder beside its files; the developer build uses
+the repository's `mods` folder. Documentation lives in `mods/docs`.
 
 ```text
 mods/
