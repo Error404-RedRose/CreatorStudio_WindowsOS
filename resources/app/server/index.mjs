@@ -1514,6 +1514,9 @@ the appropriate \`twix_*\` tool.
    user's 3D Library architecture references, then reproduce their proportions with new sketch faces.
    Use \`twix_library_geometry\` to sample the actual vertex cloud of a matching FBX/GLB before
    generating trees, props or buildings.
+   Every created object must be a named group: a house is a group, and each chair, table, plate,
+   shelf, individual book and tree is its own group. Furniture stays upright on z=0; chairs face the
+   table. Rebuild malformed geometry instead of stacking corrections.
    Never change the scene background, atmosphere or environment unless the user explicitly asks.
 4. **Model like a professional 3D artist.** A finished asset is a continuous vertex-built surface,
    not a pile of cubes, spheres and capsules. Use \`twix_humanoid_create\` for every human character
@@ -7395,6 +7398,10 @@ app.post("/api/ai3d/prompt", async (req, res) => {
       "- Use twix_sketch_polygon when rectangle/circle cannot express the shape. Pass every vertex explicitly and close the loop. Horizontal faces must be ordered counter-clockwise viewed from above so their green normal points +Z.",
       "- Example 6x4 m room floor: [{x:0,y:0,z:0},{x:6,y:0,z:0},{x:6,y:4,z:0},{x:0,y:4,z:0}]. Push/Pull that face by 0.15 for a slab, or draw walls as vertical polygons and Push/Pull them by their thickness.",
       "- Do not change the scene background, atmosphere, environment, lighting, camera projection or renderer look unless the user explicitly asks for that. Building geometry must not repaint the scene.",
+      "Grouping and placement rules (always apply):",
+      "- Every created object must be a named group. A house is a group; each chair, table, plate, shelf, individual book and tree is its own group. Use twix_object_group after creating loose objects. Never leave a finished asset as loose ungrouped parts.",
+      "- Keep furniture upright and on the ground (z=0). Chairs must face the table, not away from it. Plates sit on the table, books sit on their shelf/stack, trees stand upright with the trunk base at z=0.",
+      "- Rebuild malformed geometry instead of stacking corrections. Validate with twix_scene_inspect/twix_scene_validate and report every group name in the final summary.",
       "- Use twix_library_inspect to read the user's 3D Library categories and architectural references before designing. Then use twix_library_geometry on a matching FBX/GLB to sample its real vertex cloud, bounds and polygon mix. Use those proportions and styles, but build new editable sketch geometry rather than copying a library file.",
       "- After building, call twix_sketch_inspect or twix_scene_inspect to verify face count, bounds and normals, then frame the viewport.",
       "Sketch workflow (prefer this for architecture, furniture, openings and anything the user must keep editing):",
