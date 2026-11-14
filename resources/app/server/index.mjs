@@ -1480,6 +1480,13 @@ the appropriate \`twix_*\` tool.
    Use the real object ids returned by tools; never invent ids.
 2. **Plan briefly** for multi-step work, then execute. Keep messages short.
 3. **Units are meters.** All dimensions, positions and offsets are in meters, rotations in degrees.
+   **The live editor is Z-up:** the ground is the XY plane, height runs along +Z, and procedural
+   buildings, foliage, props and humanoids are automatically stood upright on that grid.
+   For editable architecture and cut-outs, use the sketch tools: \`twix_sketch_inspect\`,
+   \`twix_sketch_rectangle\`, \`twix_sketch_circle\`, \`twix_sketch_offset\`, \`twix_sketch_push_pull\`,
+   \`twix_sketch_select_faces\`, \`twix_sketch_paint_faces\` and \`twix_sketch_uv_wrap\`. Keep caps and
+   openings as single editable n-gons; never hand-triangulate them. UV Wrap adds hidden triangles
+   without breaking the face.
 4. **Model like a professional 3D artist.** A finished asset is a continuous vertex-built surface,
    not a pile of cubes, spheres and capsules. Use \`twix_humanoid_create\` for every human character
    (it outputs one smooth lofted body mesh with head, neck, fingers, toes, feet, a skeleton and skin
@@ -6024,6 +6031,35 @@ app.get("/api/coding/size", async (req, res) => {
   }
 });
 
+app.post("/api/coding/folder", async (req, res) => {
+  try {
+    const { dir, path: relative } = req.body || {};
+    const root = resolveCodingRoot(String(dir || ""));
+    const target = path.resolve(root, String(relative || ""));
+    if (!isInside(root, target) || target === root) {
+      return res.status(400).json({ error: "Path outside workspace" });
+    }
+    await fs.mkdir(target, { recursive: true });
+    res.json({ ok: true, path: path.relative(root, target).replace(/\\/g, "/") });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/coding/open-folder", async (req, res) => {
+  try {
+    const root = resolveCodingRoot(String(req.body?.dir || ""));
+    const stat = await fs.stat(root).catch(() => null);
+    if (!stat?.isDirectory()) return res.status(400).json({ error: "Workspace folder does not exist." });
+    const command = process.platform === "win32" ? "explorer.exe" : process.platform === "darwin" ? "open" : "xdg-open";
+    const child = spawn(command, [root], { detached: true, stdio: "ignore", windowsHide: false });
+    child.unref();
+    res.json({ ok: true, dir: root });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.put("/api/coding/file", async (req, res) => {
   try {
     const { dir, path: relative, content } = req.body || {};
@@ -6929,13 +6965,20 @@ app.post("/api/ai3d/prompt", async (req, res) => {
       "You are the AI 3D builder inside Creator Studio's SketchUp-style 3D editor.",
       "The live 3D scene is connected through the twix_* tools. Use those tools to complete the request directly.",
       "",
-      "Rules:",
-      "- Work on the currently open scene and keep the result fully editable.",
-      "- Inspect the scene before changing it when useful.",
+      "Coordinate system: the editor is Z-up. The ground is the XY plane, height goes along +Z, and the Rectangle/Circle tools draw on XY unless you pass a different normal. All procedural buildings, trees, props and humanoids are automatically stood upright on the grid.",
+      "Sketch workflow (prefer this for architecture, furniture, openings and anything the user must keep editing):",
+      "1. Use twix_sketch_inspect to see existing faces, groups and selection.",
+      "2. Use twix_sketch_rectangle and twix_sketch_circle to draw exact faces in metres.",
+      "3. Use twix_sketch_offset to create frames, reveals and door/window trim.",
+      "4. Use twix_sketch_push_pull to extrude walls, columns, openings and solids along a face normal.",
+      "5. Use twix_sketch_select_faces, twix_sketch_paint_faces and twix_sketch_uv_wrap for presentation and texture-ready detail.",
+      "Keep sketch faces as one editable n-gon: never triangulate a cap by hand. UV Wrap adds hidden triangles without breaking the face.",
+      "",
+      "Object workflow:",
       "- Use twix_foliage_create for trees, plants, hedges and organic foliage.",
       "- Use twix_humanoid_create for people and humanoids. Never assemble a person from cubes or capsules.",
       "- Use twix_mesh_create and twix_prop_create for curved or organic props, weapons, furniture and detailed objects.",
-      "- Use twix_building_create for floors, walls, roofs and architectural elements.",
+      "- Use twix_building_create for floors, walls, roofs and architectural elements that do not need custom sketch openings.",
       "- Use twix_object_create only for simple blockouts; refine blockouts into continuous vertex-built surfaces before finishing.",
       "- Apply materials, UVs and smooth shading where appropriate, validate the scene and frame the viewport at the end.",
       "- Do not ask the user to confirm. Do not only describe the steps: call the tools and build it.",
@@ -11148,6 +11191,9 @@ app.put("/api/studio3d/file", express.raw({ type: "*/*", limit: "500mb" }), asyn
     if (!stat || !stat.isFile()) return res.status(404).json({ error: "The library file no longer exists." });
     if (!req.body?.length) return res.status(400).json({ error: "The saved file body is empty." });
     await fs.writeFile(target, req.body);
+    // The Creator Studio client writes a fresh sidecar right after this call;
+    // remove any stale one first so old hidden lines cannot attach to new geometry.
+    await fs.rm(target + ".twix", { force: true });
     await scanStudio3dFolder(folder, true);
     const rel = path.relative(folder, target).replace(/\\/g, "/");
     log("info", "studio3d", "library file overwritten", { path: rel, bytes: req.body.length });
@@ -11171,10 +11217,55 @@ app.delete("/api/studio3d/file", async (req, res) => {
     const stat = await fs.stat(target).catch(() => null);
     if (!stat || !stat.isFile()) return res.status(404).json({ error: "The library file no longer exists." });
     await fs.rm(target, { force: true });
+    await fs.rm(target + ".twix", { force: true });
     await scanStudio3dFolder(folder, true);
     const rel = path.relative(folder, target).replace(/\\/g, "/");
     log("info", "studio3d", "library file deleted", { path: rel });
     res.json({ ok: true, path: rel });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/studio3d/sidecar", async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const folder = settings.studio3d?.folder ? path.resolve(settings.studio3d.folder) : "";
+    if (!folder) return res.status(400).json({ error: "Choose a 3D library folder first." });
+    const relative = String(req.query.path || "").trim();
+    if (!relative) return res.status(400).json({ error: "A library file path is required." });
+    const target = path.resolve(folder, relative);
+    if (!isInside(folder, target) || target === folder) {
+      return res.status(400).json({ error: "That file is outside the 3D library folder." });
+    }
+    const sidecar = target + ".twix";
+    const text = await fs.readFile(sidecar, "utf8").catch(() => "");
+    if (!text) return res.status(404).json({ ok: false, error: "No Creator Studio sidecar exists for this file." });
+    const data = JSON.parse(text);
+    res.json({ ok: true, path: path.relative(folder, sidecar).replace(/\\/g, "/"), data });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/studio3d/sidecar", async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const folder = settings.studio3d?.folder ? path.resolve(settings.studio3d.folder) : "";
+    if (!folder) return res.status(400).json({ error: "Choose a 3D library folder first." });
+    const relative = String(req.query.path || "").trim();
+    if (!relative) return res.status(400).json({ error: "A library file path is required." });
+    const target = path.resolve(folder, relative);
+    if (!isInside(folder, target) || target === folder) {
+      return res.status(400).json({ error: "That file is outside the 3D library folder." });
+    }
+    if (!req.body || typeof req.body !== "object") {
+      return res.status(400).json({ error: "The .twix sidecar body is invalid." });
+    }
+    const sidecar = target + ".twix";
+    await fs.writeFile(sidecar, JSON.stringify(req.body), "utf8");
+    log("info", "studio3d", "sidecar saved", { path: path.relative(folder, sidecar).replace(/\\/g, "/") });
+    res.json({ ok: true, path: path.relative(folder, sidecar).replace(/\\/g, "/") });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
@@ -11361,6 +11452,16 @@ app.post("/api/studio3d/organize", async (req, res) => {
         } catch {
           await fs.copyFile(from, to);
           await fs.unlink(from);
+        }
+        const fromSidecar = from + ".twix";
+        const toSidecar = to + ".twix";
+        if (fssync.existsSync(fromSidecar)) {
+          try {
+            await fs.rename(fromSidecar, toSidecar);
+          } catch {
+            await fs.copyFile(fromSidecar, toSidecar);
+            await fs.unlink(fromSidecar).catch(() => {});
+          }
         }
       }
       moved.push({ from: relative, to: path.relative(folder, to).replace(/\\/g, "/") });

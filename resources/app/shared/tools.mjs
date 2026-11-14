@@ -79,6 +79,136 @@ export const tools = [
     },
   },
   {
+    name: "sketch_inspect",
+    category: "inspect",
+    mutating: false,
+    description:
+      "Inspect the editable SketchUp sketch document: face ids, group ids, area, normal, centre, UV Wrap state and current face selection. Call this before editing sketch geometry. The editor is Z-up: the ground is the XY plane and height runs along Z.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Maximum faces to return (default 120)." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_rectangle",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Draw an exact editable rectangle face, like the Rectangle tool. origin is one corner in metres. width runs along the plane U axis and depth along V. Optional normal selects the plane; omit it to draw on the ground (Z-up normal). The rectangle participates in splitting, push/pull, offset and painting.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        origin: vec3,
+        width: { type: "number", description: "Width in metres." },
+        depth: { type: "number", description: "Depth in metres." },
+        normal: vec3,
+      },
+      required: ["origin", "width", "depth"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_circle",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Draw an exact editable circle or polygon face, like the Circle tool. Use 24+ sides for a smooth cylinder cap and lower counts for columns. Optional normal selects the drawing plane; omit it for the ground plane.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        center: vec3,
+        radius: { type: "number" },
+        sides: { type: "number", description: "3-128 sides (default 24)." },
+        normal: vec3,
+      },
+      required: ["center", "radius"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_push_pull",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Push/Pull one sketch face by an exact distance along its normal. This is the tool that turns a rectangle or circle into a wall, column, door opening or solid. Positive values follow the face normal.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        faceId: { type: "string", description: "Face id from sketch_inspect or a prior sketch_rectangle/sketch_circle call." },
+        distance: { type: "number", description: "Distance in metres." },
+      },
+      required: ["faceId", "distance"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_offset",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Offset one sketch face inward or outward by an exact distance, like the Offset tool. Use it to create door/window reveals, frames, trim and inset panels before push/pull.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        faceId: { type: "string" },
+        distance: { type: "number", description: "Metres; positive offsets inward." },
+      },
+      required: ["faceId", "distance"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_select_faces",
+    category: "selection",
+    mutating: false,
+    description: "Select sketch faces by id so the user can see the target and later tools can act on the selection.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        faceIds: { type: "array", items: { type: "string" } },
+        additive: { type: "boolean", description: "Add to the current face selection instead of replacing it." },
+      },
+      required: ["faceIds"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_paint_faces",
+    category: "material",
+    mutating: true,
+    description: "Paint sketch faces with a hex colour, roughness, metalness or opacity. Applies directly to the face material paint.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        faceIds: { type: "array", items: { type: "string" } },
+        color: color,
+        roughness: { type: "number" },
+        metalness: { type: "number" },
+        opacity: { type: "number" },
+      },
+      required: ["faceIds"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_uv_wrap",
+    category: "material",
+    mutating: true,
+    description:
+      "Adaptively triangulate sketch faces for texture mapping, like the Paint > UV Wrap tool. Adds dense hidden triangles at the requested spacing without changing the editable face boundary. Omit faceIds to wrap the current face selection, or the whole object when nothing is selected.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        faceIds: { type: "array", items: { type: "string" } },
+        spacing: { type: "number", description: "Triangle edge target in metres (default 0.5)." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "object_create",
     category: "modeling",
     mutating: true,
