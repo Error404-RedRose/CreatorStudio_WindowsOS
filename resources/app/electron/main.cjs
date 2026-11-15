@@ -4,6 +4,11 @@ const fs = require("node:fs");
 const net = require("node:net");
 const { spawn } = require("node:child_process");
 const { registerUpdateHandlers } = require("./updates.cjs");
+const {
+  startDiscordPresence,
+  setDiscordActivity,
+  stopDiscordPresence,
+} = require("./discord-presence.cjs");
 
 const isDev = process.env.TWIX_DEV === "1";
 const appRoot = path.join(__dirname, "..");
@@ -170,6 +175,7 @@ process.on("unhandledRejection", (error) => {
   console.error(error);
 });
 ipcMain.on("app:log", (_event, entry) => writeMainLog(entry));
+ipcMain.on("discord:activity", (_event, activity) => setDiscordActivity(activity));
 
 registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog });
 
@@ -693,6 +699,7 @@ if (!gotLock) {
         startServer();
       }
       await createWindow();
+      startDiscordPresence();
       mainLog("info", "electron", "startup complete", { port: serverPort });
 
       app.on("activate", () => {
@@ -719,6 +726,7 @@ if (!gotLock) {
     if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.destroy();
     overlayWindow = null;
     mainLog("info", "electron", "before-quit");
+    stopDiscordPresence();
     if (quitting) return;
     quitting = true;
     event.preventDefault();

@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld("twixDesktop", {
   checkForUpdates: (force) => ipcRenderer.invoke("updates:check", Boolean(force)),
   applyUpdate: (force) => ipcRenderer.invoke("updates:apply", Boolean(force)),
   setZoomFactor: (factor) => ipcRenderer.send("app:set-zoom", Number(factor)),
+  setDiscordActivity: (activity) => ipcRenderer.send("discord:activity", activity),
   log: (entry) => ipcRenderer.send("app:log", entry),
   onHome: (callback) => {
     const handler = () => callback();
