@@ -1,4 +1,5 @@
 import express from "express";
+import AdmZip from "adm-zip";
 import { WebSocketServer } from "ws";
 import { spawn, exec as execCommand } from "node:child_process";
 import { createServer as createHttpServer } from "node:http";
@@ -1552,9 +1553,9 @@ the appropriate \`twix_*\` tool.
    \`twix_garment_create\`, then \`twix_weights_inspect\` and report cleanup needs.
 8. **Validate before export** with \`twix_scene_validate\`; export with \`twix_export_scene\` and report
    the written path and warnings.
-9. **Show your work.** Select the objects you are editing so the user sees them, and use
-   \`twix_viewport_set\` to frame the result. The user can see your reasoning, so keep it concise and
-   purposeful.
+9. **Show your work.** Select the objects you are editing so the user sees them. Never move the
+   user's editor camera. Use \`twix_scene_snapshot\` with its own hidden camera to inspect the
+   result, then report what you changed.
 10. **Respect the active studio.** Current studio: **${workspace}**. Use the specialist tools that fit.
 11. If a tool returns \`ok: false\`, read the error, adjust and retry once; then explain the blocker.
 12. The app owns approval prompts. Do not pause in text waiting for permission; call the tool and the
@@ -3931,6 +3932,36 @@ app.post(
       const name = base.toLowerCase().endsWith(`.${format}`) ? base : `${base}.${format}`;
       const folder = path.join(entry.path, "exports");
       await ensureDir(folder);
+      if (req.query.extract === "1") {
+        const zip = new AdmZip(req.body);
+        const baseName = path.basename(name, `.${format}`) || "export";
+        let outDir = path.join(folder, baseName);
+        let n = 2;
+        while (fssync.existsSync(outDir)) outDir = path.join(folder, `${baseName} ${n++}`);
+        await fs.mkdir(outDir, { recursive: true });
+        let mainFile = "";
+        for (const item of zip.getEntries()) {
+          const relative = item.entryName.replace(/\\/g, "/");
+          if (!relative || relative.endsWith("/")) continue;
+          if (relative.split("/").includes("..")) continue;
+          const target = path.resolve(outDir, relative);
+          if (!isInside(outDir, target)) continue;
+          await fs.mkdir(path.dirname(target), { recursive: true });
+          await fs.writeFile(target, item.getData());
+          if (!mainFile && relative.toLowerCase().endsWith(`.${format}`)) mainFile = target;
+        }
+        if (!mainFile) throw new Error(`The ${format.toUpperCase()} bundle did not contain a .${format} file.`);
+        const relativeMain = path.relative(entry.path, mainFile).replace(/\\/g, "/");
+        res.json({
+          ok: true,
+          path: relativeMain,
+          absolutePath: mainFile,
+          folder: path.relative(entry.path, outDir).replace(/\\/g, "/"),
+          bytes: req.body.length,
+          url: `/api/project/${entry.id}/file?path=${encodeURIComponent(relativeMain)}`,
+        });
+        return;
+      }
       let target = path.join(folder, name);
       let n = 2;
       while (fssync.existsSync(target)) {
@@ -7425,9 +7456,17 @@ function ai3dSystemPrompt(materialContext) {
     "- Use twix_sketch_polygon when rectangle/circle cannot express the shape. Pass every vertex explicitly and close the loop. Horizontal faces must be ordered counter-clockwise viewed from above so their green normal points +Z.",
     "- Example 6x4 m room floor: [{x:0,y:0,z:0},{x:6,y:0,z:0},{x:6,y:4,z:0},{x:0,y:4,z:0}]. Push/Pull that face by 0.15 for a slab, or draw walls as vertical polygons and Push/Pull them by their thickness.",
     "- Do not change the scene background, atmosphere, environment, lighting, camera projection or renderer look unless the user explicitly asks for that. Building geometry must not repaint the scene.",
+    "- Never move or reframe the user's editor camera. Do not call viewport_set or any camera tool to look at your work. The user's view stays exactly where they left it. Use twix_scene_snapshot with your own hidden camera when you need to inspect placement.",
+    "Visual inspection rules:",
+    "- Call twix_scene_snapshot before starting and after major stages. It renders from a hidden camera and saves a PNG to the project references without touching the editor camera.",
+    "- You may request perspective or orthographic projection, any FOV, and shaded, textured, hidden, xrayhidden, normal or UV looks. Use orthographic top views for room layout and perspective views for proportions.",
+    "- Use twix_scene_inspect for object names, groups, bounds and materials, then compare it with your snapshots. Never guess placement after a snapshot shows overlap or floating objects.",
     "Grouping and placement rules (always apply):",
     "- Every created object must be a named group. A house is a group; each chair, table, plate, shelf, individual book and tree is its own group. Use twix_sketch_group for each finished sketch object and twix_object_group for loose imported objects. Never leave a finished asset as loose ungrouped parts.",
     "- Finish each group at its final world position. Do not group objects and then move the group into place unless you verify the resulting bounds.",
+    "- Use twix_library_import to place an existing library FBX/GLB/OBJ as one grouped asset when it fits better than procedural geometry. It preserves the asset hierarchy, gets a base-centre pivot and accepts exact position/rotation/scale.",
+    "- Build each asset as a complete named group at a staging location outside the house first, then position the group inside or around the house. Do not assemble a chair inside a wall or in the doorway.",
+    "- Scale every asset to the house and room it belongs in. A chair, table, bed, shelf, door and tree must have believable real-world dimensions; never stretch everything to one arbitrary size.",
     "- Keep furniture upright, resting on the floor or on the supporting surface. Chairs face the table, plates sit on the table, books sit on their shelf, and every tree trunk starts at z=0.",
     "- Keep at least 0.9 m walkways between furniture groups and walls. Do not overlap groups, beds, tables or trees. No furniture inside walls, no assets floating above the floor.",
     "- Build one coherent scene only. Do not add filler props the user did not request. Stop adding objects once the requested layout exists.",
@@ -7446,6 +7485,8 @@ function ai3dSystemPrompt(materialContext) {
     "- Use these real library materials whenever a surface needs texture:",
     materialContext,
     "- Apply materials with twix_library_material to selected faces or objects. It sets base colour, normal, AO, roughness and metallic maps together, and materializes any missing maps.",
+    "- Choose materials by construction logic, not by whatever name appears first. Exterior walls: brick, siding, plaster or stone. Roofs: roof shingles, clay tile, slate or metal. Foundations: concrete or stone. Interior floors: finished wood or tile. Furniture: finished wood, metal, fabric or leather. Do not use bark, ash, forest-floor, paint-splash or generic PBR textures on built surfaces unless the user asks for that look.",
+    "- Set realistic textureScale for every material: bricks about 0.5-0.8 m per tile, siding 0.3-0.6, roof shingles 0.4-0.8, wood planks 1-2, concrete 1-2, fabric 0.5-1. A material that is too large or too small is a failed material application.",
     "- If the user asks to materialize the scene, call twix_materialize_scene. If they ask to materialize the library, call twix_materialize_library in batches and report remaining. Never just say it was done; run the tool and report the counts.",
     "- Give every major surface a material. Do not leave the whole scene default grey.",
     "Sketch workflow (prefer this for architecture, furniture, openings and anything the user must keep editing):",
@@ -7462,7 +7503,7 @@ function ai3dSystemPrompt(materialContext) {
     "- Use twix_mesh_create and twix_prop_create for curved or organic props, weapons, furniture and detailed objects.",
     "- Use twix_building_create for floors, walls, roofs and architectural elements that do not need custom sketch openings.",
     "- Use twix_object_create only for simple blockouts; refine blockouts before finishing.",
-    "- Apply materials, UVs and smooth shading where appropriate, validate the scene and frame the viewport at the end.",
+    "- Apply materials, UVs and smooth shading where appropriate, validate the scene and take a hidden-camera snapshot at the end. Never reframe the editor camera.",
     "- Do not ask the user to confirm. Do not only describe the steps: call the tools and build it.",
     "- When finished, reply with a short summary of what was created, the final group count and which materials were used.",
   ].join("\n");

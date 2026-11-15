@@ -121,6 +121,7 @@ export const tools = [
         relative: { type: "string", description: "Exact base-colour relative path from library_inspect." },
         faceIds: { type: "array", items: { type: "string" }, description: "Sketch face ids. Defaults to the current face selection." },
         objectIds: { type: "array", items: { type: "string" }, description: "Imported object ids. Defaults to the current object selection." },
+        textureScale: { type: "number", description: "World size in metres for one texture tile (default 1). Use 0.5 for small bricks, 2 for large stone." },
         materialize: { type: "boolean", description: "Generate missing normal/AO/roughness/metallic maps (default true)." },
       },
       additionalProperties: false,
@@ -137,6 +138,24 @@ export const tools = [
       properties: {
         name: { type: "string" },
         faceIds: { type: "array", items: { type: "string" }, description: "Sketch face ids. Defaults to the current selection." },
+      },
+      required: ["name"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "library_import",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Import a 3D Library model as one grouped asset at an exact scene position. The imported FBX/GLB/OBJ keeps its own hierarchy and gets a base-centre pivot for snapping. Use library assets for furniture, vegetation and props when the library has a better model than procedural geometry.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Library model name or relative path." },
+        position: vec3,
+        rotation: vec3,
+        scale: { type: "number", description: "Uniform scale (default 1)." },
       },
       required: ["name"],
       additionalProperties: false,
@@ -550,6 +569,26 @@ export const tools = [
       type: "object",
       properties: { objectIds: { type: "array", items: { type: "string" } } },
       required: ["objectIds"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "scene_snapshot",
+    category: "inspect",
+    mutating: false,
+    description:
+      "Render a clean scene snapshot from the AI's own hidden camera without moving the user's editor camera. Choose eye/target in metres, perspective or orthographic projection, FOV, and a look such as shaded, textured, hidden, xrayhidden, normal or uv. The PNG is saved to the project references so the AI can inspect the build and placement between steps.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        eye: vec3,
+        target: vec3,
+        fov: { type: "number", description: "Vertical FOV in degrees (12-100)." },
+        projection: { type: "string", enum: ["perspective", "orthographic"] },
+        look: { type: "string", description: "shaded, textured, hidden, xrayhidden, normal, uv, flat or wireframe." },
+        width: { type: "number", description: "Snapshot width in pixels (default 768)." },
+        height: { type: "number", description: "Snapshot height in pixels (default 432)." },
+      },
       additionalProperties: false,
     },
   },
