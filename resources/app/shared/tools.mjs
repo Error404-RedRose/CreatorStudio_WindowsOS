@@ -115,6 +115,46 @@ export const tools = [
             additionalProperties: true,
           },
         },
+        openings: {
+          type: "array",
+          description:
+            "Door, window and opening schedule. Every cutout must appear here with its wall/zone, exact position and size. For renovations, map each existing cutout instead of adding a second opening.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              kind: { type: "string", enum: ["door", "window", "opening", "garage", "arch"] },
+              level: { type: "string" },
+              wall: { type: "string", description: "Wall, room or zone name that owns this opening." },
+              x: { type: "number" },
+              y: { type: "number" },
+              z: { type: "number", description: "Sill height for windows; 0 for doors." },
+              width: { type: "number" },
+              height: { type: "number" },
+              sill: { type: "number" },
+              head: { type: "number", description: "Top of the opening above finished floor." },
+              exterior: { type: "boolean" },
+              open: { type: "boolean", description: "True when the door leaf is modelled open." },
+              notes: { type: "string" },
+            },
+            required: ["kind", "width", "height"],
+            additionalProperties: true,
+          },
+        },
+        circulation: {
+          type: "array",
+          description: "Paths and corridors that connect rooms to the front door, with clear widths.",
+          items: {
+            type: "object",
+            properties: {
+              from: { type: "string" },
+              to: { type: "string" },
+              width: { type: "number" },
+              notes: { type: "string" },
+            },
+            additionalProperties: true,
+          },
+        },
         assets: {
           type: "array",
           description: "Every group/object to build with its final size and world position.",

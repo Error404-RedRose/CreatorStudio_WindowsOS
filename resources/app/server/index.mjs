@@ -2475,11 +2475,26 @@ async function ocFetchWithProviderWatch(state, sessionId, pathname, options = {}
       return;
     }
   }, 250);
-  const timeout = setTimeout(() => {
+  // Use an inactivity watchdog instead of a fixed wall-clock timeout. Big
+  // saved scenes can legitimately run for well over 15 minutes while tool
+  // calls keep streaming, but a provider that goes silent must not hang the
+  // request forever. Every OpenCode event for this session refreshes the
+  // window, so long active builds are never cut off mid-transaction.
+  let lastActivityAt = startedAt;
+  const inactivityLimit = 20 * 60 * 1000;
+  const watchdog = setInterval(() => {
+    const events = Array.isArray(state.events) ? state.events : [];
+    for (const event of events) {
+      if (event?.sessionID !== sessionId) continue;
+      const at = Number(event.at) || 0;
+      if (at > lastActivityAt) lastActivityAt = at;
+    }
+    if (Date.now() - lastActivityAt < inactivityLimit) return;
     providerError =
-      "The model did not answer within 15 minutes. The provider may be unavailable or out of quota. Choose another model or cancel the request.";
+      "The model stopped responding for 20 minutes. The provider may be unavailable or out of quota. Choose another model or cancel the request.";
     controller.abort();
-  }, 15 * 60 * 1000);
+    clearInterval(watchdog);
+  }, 5000);
   try {
     return await ocFetch(state, pathname, { ...options, signal: controller.signal });
   } catch (error) {
@@ -2491,7 +2506,7 @@ async function ocFetchWithProviderWatch(state, sessionId, pathname, options = {}
     throw error;
   } finally {
     clearInterval(watcher);
-    clearTimeout(timeout);
+    clearInterval(watchdog);
     try {
       external?.removeEventListener?.("abort", forwardAbort);
     } catch {}
@@ -7628,22 +7643,34 @@ function ai3dActivityFinish(projectId, item, result, started) {
   item.error = result?.ok === false ? String(result.error || "Tool failed").slice(0, 240) : "";
 }
 
-function ai3dFriendlyError(error, projectId) {
-  const raw = String(error?.message || "The 3D AI request failed.");
+function ai3dActivitySummary(projectId) {
   const activity = ai3dActivityList(projectId);
   const completed = activity.filter((item) => item.status === "done").length;
   const failed = activity.filter((item) => item.status === "error").length;
-  const suffix = activity.length
-    ? ` ${completed} tool call${completed === 1 ? "" : "s"} completed${failed ? `, ${failed} failed` : ""}; completed scene changes are kept.`
+  return activity.length
+    ? `${completed} tool call${completed === 1 ? "" : "s"} completed${failed ? `, ${failed} failed` : ""}; completed scene changes are kept.`
     : "";
-  if (/fetch failed|network|ECONNRESET|socket|terminated|aborted by the provider/i.test(raw)) {
+}
+
+function ai3dFriendlyError(error, projectId) {
+  const raw = String(error?.message || "The 3D AI request failed.");
+  const summary = ai3dActivitySummary(projectId);
+  const suffix = summary ? ` ${summary}` : "";
+  if (/context (?:window|length)|too many tokens|maximum.*tokens|prompt is too (?:long|large)|input is too (?:long|large)|token limit/i.test(raw)) {
+    return (
+      "The previous AI session grew past the model's context window." +
+      suffix +
+      " Retry; Creator Studio will continue in a fresh session from the live scene."
+    );
+  }
+  if (/fetch failed|network|ECONNRESET|socket|terminated|aborted by the provider|operation was aborted|abort/i.test(raw)) {
     return (
       "The AI provider connection was interrupted before the request finished." +
       suffix +
       " Retry, or choose a more reliable tool-capable model. The AI panel keeps this conversation and its progress."
     );
   }
-  if (/timed? out|timeout/i.test(raw)) {
+  if (/timed? out|timeout|did not answer within|stopped responding/i.test(raw)) {
     return "The 3D AI request timed out." + suffix + " The scene is not cleared; retry or ask for a smaller change.";
   }
   return raw + suffix;
@@ -7714,7 +7741,7 @@ function ai3dSystemPrompt(materialContext, mode = "build") {
     "- Never move or reframe the user's editor camera. Do not call viewport_set or any camera tool to look at your work. The user's view stays exactly where they left it. Use twix_scene_snapshot with your own hidden camera when you need to inspect placement.",
     "Blueprint-first rule (mandatory for every build or scene edit):",
     "- Before the first geometry, material or scene call, inspect first with twix_scene_inspect (and twix_sketch_inspect when a sketch exists), then call twix_scene_blueprint exactly once.",
-    "- The blueprint must be deep and complete: site envelope, every level, every room/zone, every asset with its final width, depth, height and world position, the material and colour plan, the colour swatches, and the ordered build phases. Compute exact numbers, not adjectives.",
+    "- The blueprint must be deep and complete: site envelope, every level, every room/zone, the door/window/opening schedule, circulation paths, every asset with its final width, depth, height and world position, the material and colour plan, the colour swatches, and the ordered build phases. Compute exact numbers, not adjectives.",
     "- For edits to an existing scene, include the existing groups, bounds and materials you are keeping in the blueprint, and list exactly which groups/faces change.",
     "- Follow the blueprint exactly with the 3D tools. If you must change a dimension or position, update the blueprint with twix_scene_blueprint again before building the changed part.",
     "Colour-only palette rule (mandatory):",
@@ -7747,6 +7774,35 @@ function ai3dSystemPrompt(materialContext, mode = "build") {
     "4. Use exact coordinates and verify with twix_object_inspect that each group has sensible bounds and sits on a surface.",
     "5. Keep doors and windows clear. Never place a chair or table in a doorway or through a wall.",
     "",
+    "Architectural standards (use these defaults unless the user gives exact dimensions):",
+    "- Storey height 2.7 m clear; external wall 0.23 m thick; internal partition 0.12 m; floor slab 0.15 m; roof structure 0.2 m.",
+    "- External/front door 1.0-1.2 x 2.1 m; internal door 0.8 x 2.05 m. Window head at 2.1 m; sill 0.9 m in living rooms and bedrooms, 1.1 m in kitchens and bathrooms, 0.6 m for full-height glazing.",
+    "- A door or window must be a real opening cut through the wall, with jambs, head, sill, trim and threshold where appropriate. Never place a door or window panel flat on an uncut wall.",
+    "- Keep 0.9-1.0 m clear at a door opening and on the swing side. Align window heads on each facade and keep a consistent opening rhythm.",
+    "- Corridors at least 1.0 m wide (1.2 m main circulation). Bedrooms at least 2.8 x 3.0 m; bathrooms 1.8 x 2.2 m; kitchens 2.4 x 3.0 m.",
+    "- Keep 0.9 m at the foot of a bed, 0.75 m around dining chairs, 1.0 m in front of kitchen counters, 0.6 m beside a toilet and 0.7 m in front of a sink.",
+    "- Stairs: riser 0.17-0.18 m, tread 0.26-0.30 m, width 0.9-1.1 m, headroom 2.0 m. Landings at every 2.4 m of rise.",
+    "- Pitched roof 30-45 degrees with a 0.4-0.6 m overhang. Snap repeated corners, window heads and door heads to a 0.05 m module.",
+    "",
+    "Renovation and conversion workflow (existing shell, barn, warehouse or unfinished building):",
+    "- Survey first: twix_scene_inspect, twix_sketch_inspect and a top orthographic snapshot. Record the existing footprint, wall lines, roof, floor levels and every existing opening.",
+    "- Treat the existing envelope as fixed unless the user asks to change it. Reuse the current walls, roof and openings; never rebuild or duplicate the shell on top of itself.",
+    "- Map every existing cutout to a scheduled door, window or opening. If one is too small or misplaced, resize that exact face or hole instead of drawing a second opening beside it.",
+    "- Add partitions, floors, ceilings, stairs, joinery, trim and furniture inside the existing shell. Keep the barn character where the user asked for it.",
+    "- If the front door should be open, build the frame plus an open door leaf at a believable swing angle with a clear threshold; never leave a blank hole.",
+    "- Finish with room names, grouped joinery, a circulation check and a validation pass.",
+    "",
+    "Interior planning (no decorative filler assets):",
+    "- Start from a room schedule: room, level, clear size, area, doors, windows and furniture. Every room must have a circulation path to the front door.",
+    "- Group wet rooms (kitchen, bathrooms, laundry) near each other and against external walls. Keep bedrooms away from the noisiest shared space.",
+    "- Every habitable room needs daylight; every bathroom needs a window or planned extract vent.",
+    "- Use blueprint zones for rooms and the openings schedule for doors and windows. Do not invent rooms or assets outside the blueprint.",
+    "",
+    "Quality gates (run these before saying the job is complete):",
+    "- After shell and openings: twix_scene_validate plus top orthographic and eye-level snapshots. Check closed walls, cut-through openings, seated joinery and no floating geometry.",
+    "- After interior: validate again, then check every door swing, walkway, bed/table/sofa clearance and wall intersection. Fix errors before the final reply.",
+    "- Report validation counts, room names, the door/window schedule and the final group count.",
+    "",
     "Library geometry rules:",
     "- Use twix_library_inspect to read the user's 3D Library categories before designing.",
     "- Use twix_library_geometry on at most two representative FBX/GLB models. If it fails, do not retry; continue from the metadata and proportions. Never let a library inspection failure stop the build.",
@@ -7756,8 +7812,8 @@ function ai3dSystemPrompt(materialContext, mode = "build") {
     "Sketch workflow (prefer this for architecture, furniture, openings and anything the user must keep editing):",
     "1. Use twix_sketch_inspect to see existing faces, groups and selection.",
     "2. Use twix_sketch_rectangle and twix_sketch_circle to draw exact faces in metres.",
-    "3. Use twix_sketch_offset to create frames, reveals and door/window trim.",
-    "4. Use twix_sketch_push_pull to extrude walls, columns, openings and solids along a face normal.",
+    "3. To cut a door or window, draw the opening face on the wall, push/pull it through the full wall thickness, delete the cut slug, then offset and extrude the reveal and add the frame, sill and trim. Never draw an opening on one side only.",
+    "4. Use twix_sketch_offset to create frames, reveals and door/window trim, and twix_sketch_push_pull to extrude walls, columns, openings and solids along a face normal.",
     "5. Use twix_sketch_select_faces and twix_sketch_uv_wrap before applying textures.",
     "Keep sketch faces as one editable n-gon: never triangulate a cap by hand. UV Wrap adds hidden triangles without breaking the face.",
     "",
@@ -7773,7 +7829,80 @@ function ai3dSystemPrompt(materialContext, mode = "build") {
   ].join("\n");
 }
 
-async function runAi3dPrompt({ projectId, text, model, sessionId, signal, images = [], jobId = "", mode = "build" }) {
+function ai3dConversationBlock(history) {
+  const items = Array.isArray(history) ? history.slice(-10) : [];
+  const lines = [];
+  for (const item of items) {
+    const role = item?.role === "assistant" ? "Assistant" : item?.role === "user" ? "User" : "";
+    const text = String(item?.text || "").replace(/\s+/g, " ").trim();
+    if (!role || !text) continue;
+    lines.push(`${role}: ${text.slice(0, 1400)}`);
+  }
+  if (!lines.length) return "";
+  return (
+    "Recent conversation for continuity (most recent last; do not repeat work that is already finished):\n" +
+    lines.join("\n").slice(0, 10000)
+  );
+}
+
+function ai3dContextText({ sceneContext, sceneDetails, blueprint, history, fresh }) {
+  const blocks = [];
+  const survey = String(sceneContext || "").trim().slice(0, 16000);
+  if (survey) {
+    blocks.push(
+      "Live scene survey at request start. Use it to plan; re-inspect before destructive edits:\n" + survey,
+    );
+  }
+  if (blueprint && typeof blueprint === "object") {
+    try {
+      const plan = JSON.stringify(blueprint).slice(0, 10000);
+      if (plan && plan !== "{}") {
+        blocks.push(
+          "Current build blueprint for this scene. Follow it unless the user asks to change the plan:\n" + plan,
+        );
+      }
+    } catch {
+      /* ignore an unserializable blueprint */
+    }
+  }
+  if (fresh) {
+    const details = String(sceneDetails || "").trim().slice(0, 24000);
+    if (details) {
+      blocks.push(
+        "Detailed sketch document at request start (face ids, groups, normals, areas, centres and selection):\n" +
+          details,
+      );
+    }
+    const conversation = ai3dConversationBlock(history);
+    if (conversation) blocks.push(conversation);
+  }
+  return blocks.join("\n\n");
+}
+
+function ai3dResponseErrorMessage(response) {
+  return String(
+    response?.info?.error?.data?.message ||
+      response?.info?.error?.message ||
+      response?.error?.data?.message ||
+      response?.error?.message ||
+      "",
+  );
+}
+
+async function runAi3dPrompt({
+  projectId,
+  text,
+  model,
+  sessionId,
+  signal,
+  images = [],
+  jobId = "",
+  mode = "build",
+  history = [],
+  sceneContext = "",
+  sceneDetails = "",
+  blueprint = null,
+}) {
   let state = ocServers.get(String(projectId));
   if (!state || state.stopped || !state.ready) {
     state = await startOpenCode(String(projectId), "prop", false);
@@ -7782,6 +7911,11 @@ async function runAi3dPrompt({ projectId, text, model, sessionId, signal, images
   await ai3dTerminateStaleWork(projectId, state).catch(() => null);
   const materialContext = mode === "materialize" ? await ai3dMaterialContext() : "";
   const system = ai3dSystemPrompt(materialContext, mode);
+  const requestText = (body, fresh) => {
+    const context = ai3dContextText({ sceneContext, sceneDetails, blueprint, history, fresh });
+    return context ? `${context}\n\nCurrent request:\n${body}` : body;
+  };
+  const resumedSession = Boolean(sessionId);
   let activeSessionId = sessionId ? String(sessionId) : "";
   if (!activeSessionId) activeSessionId = await ocNewSession(state, AI3D_JOB_TITLE);
   if (jobId) {
@@ -7796,7 +7930,7 @@ async function runAi3dPrompt({ projectId, text, model, sessionId, signal, images
   // A restored session can still have an old run attached to it. Stop that run
   // before sending the new prompt so two builds never edit the same scene.
   await ai3dAbortOpenCodeSession(state, activeSessionId);
-  const messageParts = [{ type: "text", text }];
+  const messageParts = [{ type: "text", text: requestText(text, !resumedSession) }];
   for (const [index, image] of (Array.isArray(images) ? images : []).slice(0, 8).entries()) {
     const dataUrl = String(image?.dataUrl || "");
     if (!dataUrl.startsWith("data:image/")) continue;
@@ -7822,7 +7956,7 @@ async function runAi3dPrompt({ projectId, text, model, sessionId, signal, images
   let attempt = 0;
   while (!sent) {
     try {
-      sent = await ocSendMessage(state, {
+      const candidate = await ocSendMessage(state, {
         sessionId: activeSessionId,
         title: AI3D_JOB_TITLE,
         body: {
@@ -7834,29 +7968,63 @@ async function runAi3dPrompt({ projectId, text, model, sessionId, signal, images
         },
         signal,
       });
+      // A provider can also return its failure inside the completed message
+      // instead of rejecting the fetch. Route that through the same retry
+      // path so an aborted or context-limited run is not shown raw.
+      const candidateError = ai3dResponseErrorMessage(candidate.value);
+      if (candidateError) throw new Error(candidateError);
+      sent = candidate;
     } catch (error) {
-      const transient = /fetch failed|network|ECONNRESET|socket|terminated|stream error|interrupted|operation was aborted/i.test(
-        String(error?.message || ""),
-      );
-      if (!transient || attempt >= 1 || signal?.aborted) throw error;
-      attempt += 1;
-      log("warning", "ai3d", "provider interrupted; retrying once", {
+      const raw = String(error?.message || "");
+      const contextProblem =
+        /context (?:window|length)|too many tokens|maximum.*tokens|prompt is too (?:long|large)|input is too (?:long|large)|token limit/i.test(
+          raw,
+        );
+      const transient =
+        contextProblem ||
+        /fetch failed|network|ECONNRESET|socket|terminated|stream error|interrupted|operation was aborted|abort/i.test(
+          raw,
+        );
+      if (!transient || attempt >= 2 || signal?.aborted) throw error;
+      if (contextProblem) attempt = 2;
+      else attempt += 1;
+      log("warning", "ai3d", contextProblem ? "session context is full; retrying in a fresh session" : "provider interrupted; retrying", {
         projectId,
         sessionId: activeSessionId,
-        message: String(error?.message || "").slice(0, 300),
+        attempt,
+        message: raw.slice(0, 300),
       });
-      await new Promise((resolve) => setTimeout(resolve, 1200));
-      // Keep the same OpenCode session and ask the model to inspect what
-      // already landed instead of replaying the whole build. Completed tool
-      // calls stay in the scene, so a continuation is safer than a duplicate.
-      messageParts.splice(0, messageParts.length, {
-        type: "text",
-        text:
-          "The previous request was interrupted before it finished. Continue from the current live scene. " +
-          "Inspect existing groups, faces and paint swatches and finish only the unfinished parts; do not repeat " +
-          "objects, groups or swatches that already exist. Original request:\n" +
-          text,
-      });
+      await new Promise((resolve) => setTimeout(resolve, contextProblem ? 400 : 1200 * attempt));
+      if (attempt >= 2) {
+        // A restored scene often carries a very old OpenCode session whose
+        // transcript has grown past the model's context window. Keep the local
+        // chat and the live scene, but continue in a fresh provider session.
+        activeSessionId = "";
+        messageParts.splice(0, messageParts.length, {
+          type: "text",
+          text: requestText(
+            "Start a fresh 3D AI session for this request. The live scene may already contain partially completed " +
+              "work, so inspect it first and continue only the unfinished parts. Do not repeat objects, groups or " +
+              "swatches that already exist. Original request:\n" +
+              text,
+            true,
+          ),
+        });
+      } else {
+        // Keep the same OpenCode session and ask the model to inspect what
+        // already landed instead of replaying the whole build. Completed tool
+        // calls stay in the scene, so a continuation is safer than a duplicate.
+        messageParts.splice(0, messageParts.length, {
+          type: "text",
+          text: requestText(
+            "The previous request was interrupted before it finished. Continue from the current live scene. " +
+              "Inspect existing groups, faces and paint swatches and finish only the unfinished parts; do not repeat " +
+              "objects, groups or swatches that already exist. Original request:\n" +
+              text,
+            false,
+          ),
+        });
+      }
     }
   }
   if (jobId && sent.sessionId && sent.sessionId !== activeSessionId) {
@@ -7880,12 +8048,7 @@ async function runAi3dPrompt({ projectId, text, model, sessionId, signal, images
       status: part.state?.status ? String(part.state.status) : "",
       error: part.state?.error ? String(part.state.error).slice(0, 300) : "",
     }));
-  const responseError =
-    response?.info?.error?.data?.message ||
-    response?.info?.error?.message ||
-    response?.error?.data?.message ||
-    response?.error?.message ||
-    "";
+  const responseError = ai3dResponseErrorMessage(response);
   if (responseError) throw new Error(String(responseError));
   if (!responseText && !tools.length) {
     throw new Error("The AI model returned no result. Choose a tool-capable model and try again.");
@@ -7970,7 +8133,19 @@ app.post("/api/ai3d/job/:id/terminate", async (req, res) => {
 });
 
 app.post("/api/ai3d/prompt", async (req, res) => {
-  const { prompt, projectId, model, sessionId, async: asyncJob, images = [], mode: rawMode } = req.body || {};
+  const {
+    prompt,
+    projectId,
+    model,
+    sessionId,
+    async: asyncJob,
+    images = [],
+    mode: rawMode,
+    history = [],
+    sceneContext = "",
+    sceneDetails = "",
+    blueprint = null,
+  } = req.body || {};
   const mode = rawMode === "materialize" ? "materialize" : "build";
   const text = String(prompt || "").trim();
   if (!text) return res.status(400).json({ ok: false, error: "Describe what you want the AI to build." });
@@ -7980,7 +8155,9 @@ app.post("/api/ai3d/prompt", async (req, res) => {
   }
 
   const abort = new AbortController();
-  const timeout = AbortSignal.timeout(10 * 60 * 1000);
+  // Hard safety cap only. The provider watcher already stops silent models
+  // after 20 minutes of no events, so active long builds can run to completion.
+  const timeout = AbortSignal.timeout(60 * 60 * 1000);
   const signal = AbortSignal.any ? AbortSignal.any([abort.signal, timeout]) : abort.signal;
 
   if (asyncJob) {
@@ -8010,6 +8187,10 @@ app.post("/api/ai3d/prompt", async (req, res) => {
           images,
           jobId: job.id,
           mode: job.mode,
+          history,
+          sceneContext,
+          sceneDetails,
+          blueprint,
         });
         job.status = "done";
         job.text = result.text;
@@ -8025,6 +8206,12 @@ app.post("/api/ai3d/prompt", async (req, res) => {
         if (abort.signal.aborted) {
           job.status = "cancelled";
           job.error = "The AI request was cancelled. Completed scene changes are kept.";
+        } else if (signal.aborted) {
+          job.status = "error";
+          job.error =
+            "The 3D AI build stopped at the 60 minute safety limit. Completed scene changes are kept. Retry, or ask for a smaller change. " +
+            ai3dActivitySummary(job.projectId);
+          log("warning", "ai3d", "job hit the hard time limit", { projectId: job.projectId });
         } else {
           job.status = "error";
           job.error = ai3dFriendlyError(error, job.projectId);
@@ -8070,6 +8257,10 @@ app.post("/api/ai3d/prompt", async (req, res) => {
       images,
       jobId: syncJobId,
       mode,
+      history,
+      sceneContext,
+      sceneDetails,
+      blueprint,
     });
     res.json({ ok: true, text: result.text, sessionId: result.sessionId, tools: result.tools });
   } catch (error) {
