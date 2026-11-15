@@ -1,6 +1,6 @@
 # Creator Studio
 
-**By Twilight Studio** · Version **0.14.0-beta.57** · Windows x64
+**By Twilight Studio** · Version **0.14.0-beta.58** · Windows x64
 
 A native Windows creative workspace where AI agents and manual tools share the same project.
 Model in 3D, simulate cloth, format writing, code with an AI agent, drive a live Unity Editor,
@@ -231,6 +231,24 @@ tokens redacted.
 
 Back up `Documents\3D Creator Studio` if you want to keep your settings, references, and learning
 notes. Projects should be backed up separately.
+
+### Live diagnostics and lag reports
+
+The built app normally opens without a terminal. To watch the live main, backend, renderer, GPU and
+driver log in a shell window, run **`run-with-logs.bat`** from this folder. It starts Creator Studio
+with verbose logging and streams the structured log plus stdout and stderr. Close the terminal when
+you are finished; Creator Studio keeps running.
+
+- Console and driver output is saved as `console-*.out.log` and `console-*.err.log` in
+  `%APPDATA%\Creator Studio\data\logs\`, next to the structured `electron-<date>.jsonl` log.
+- Every run records the app, Electron, Chrome and Node versions, OS build, CPU, memory, display
+  layout, Windows/Linux session type, GPU feature status, GPU driver details, renderer warnings and
+  errors, preload errors, crashed or unresponsive processes, long main-thread tasks and event-loop
+  stalls.
+- For a lag report, run `run-with-logs.bat`, reproduce the lag, close Creator Studio, then send the
+  newest `console-*.out.log`, `console-*.err.log` and `electron-*.jsonl` files.
+- To do the same manually from PowerShell, set `TWIX_LOG_STDOUT=1`, `TWIX_VERBOSE=1` and
+  `CREATOR_STUDIO_VERBOSE=1` before launching the executable.
 
 ---
 

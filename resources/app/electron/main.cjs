@@ -1,10 +1,12 @@
-const { app, BrowserWindow, ipcMain, shell, session, dialog, screen, clipboard } = require("electron");
+const { app, BrowserWindow, ipcMain, shell, session, dialog, screen, clipboard, powerMonitor } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs");
 const net = require("node:net");
+const os = require("node:os");
 const { spawn } = require("node:child_process");
 const { registerUpdateHandlers } = require("./updates.cjs");
 const {
+  setDiscordLogger,
   startDiscordPresence,
   setDiscordActivity,
   stopDiscordPresence,
@@ -161,6 +163,11 @@ function mainLog(level, source, message, data) {
   const entry = { ts: new Date().toISOString(), level, source, message, data };
   writeMainLog(entry);
   if (!mirrorLogs) return;
+  // Keep normal Linux terminal output readable. Debug entries (AI heartbeats,
+  // performance samples and presence acknowledgements) still go to the JSONL
+  // file and appear in the shell when the diagnostic wrapper enables verbose
+  // logging.
+  if (level === "debug" && process.env.TWIX_VERBOSE !== "1") return;
   const suffix = data && Object.keys(data).length ? " " + JSON.stringify(data) : "";
   const line = `[Creator Studio] ${entry.ts} ${String(level).toUpperCase()} ${source}: ${message}${suffix}`;
   if (level === "error" || level === "warning") console.error(line);
@@ -170,12 +177,33 @@ process.on("uncaughtException", (error) => {
   mainLog("error", "electron", "uncaughtException", { message: error?.message, stack: error?.stack });
   console.error(error);
 });
+process.on("warning", (warning) => {
+  mainLog("warning", "node", "process warning", {
+    message: warning?.message,
+    stack: warning?.stack,
+    name: warning?.name,
+  });
+});
 process.on("unhandledRejection", (error) => {
   mainLog("error", "electron", "unhandledRejection", { message: error?.message, stack: error?.stack });
   console.error(error);
 });
-ipcMain.on("app:log", (_event, entry) => writeMainLog(entry));
-ipcMain.on("discord:activity", (_event, activity) => setDiscordActivity(activity));
+ipcMain.on("app:log", (_event, entry) => {
+  if (!entry || typeof entry !== "object") return;
+  const levels = new Set(["debug", "info", "warning", "error"]);
+  const level = levels.has(entry.level) ? entry.level : "info";
+  const source = String(entry.source || "renderer").slice(0, 80);
+  const message = String(entry.message || "").slice(0, 4000);
+  mainLog(level, source, message, entry.data);
+});
+ipcMain.on("discord:activity", (_event, activity) => {
+  mainLog("debug", "discord", "renderer activity", {
+    details: String(activity?.details || "").slice(0, 128),
+    state: String(activity?.state || "").slice(0, 128),
+  });
+  setDiscordActivity(activity);
+});
+setDiscordLogger((level, source, message, data) => mainLog(level, source, message, data));
 
 registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog });
 
@@ -458,6 +486,35 @@ async function createWindow() {
 
   mainWindow.webContents.on("render-process-gone", (_event, details) => mainLog("error", "electron", "render-process-gone", details));
   mainWindow.webContents.on("unresponsive", () => mainLog("warning", "electron", "window unresponsive"));
+  mainWindow.webContents.on("responsive", () => mainLog("info", "electron", "window responsive again"));
+  mainWindow.webContents.on("preload-error", (_event, preloadPath, error) => {
+    mainLog("error", "electron", "preload-error", {
+      preloadPath,
+      message: error?.message,
+      stack: error?.stack,
+    });
+  });
+  mainWindow.webContents.on("console-message", (_event, ...args) => {
+    let level = 0;
+    let message = "";
+    let line = 0;
+    let sourceId = "";
+    const first = args[0];
+    if (first && typeof first === "object") {
+      level = Number(first.level) || 0;
+      message = String(first.message || "");
+      line = Number(first.lineNumber) || 0;
+      sourceId = String(first.sourceId || "");
+    } else {
+      level = Number(args[0]) || 0;
+      message = String(args[1] || "");
+      line = Number(args[2]) || 0;
+      sourceId = String(args[3] || "");
+    }
+    const severity = level >= 3 ? "error" : level === 2 ? "warning" : "info";
+    if (severity === "info") return;
+    mainLog(severity, "renderer.console", message, { line, sourceId });
+  });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/i.test(url)) shell.openExternal(url);
     return { action: "deny" };
@@ -687,6 +744,116 @@ if (!gotLock) {
       console.log(`[Creator Studio] v${app.getVersion()} starting on ${process.platform}/${process.arch} (${sessionType}).`);
       console.log(`[Creator Studio] Logs: ${logFile()}`);
       mainLog("info", "electron", "whenReady", { sessionType });
+      mainLog("info", "system", "runtime", {
+        appVersion: app.getVersion(),
+        electron: process.versions.electron,
+        chrome: process.versions.chrome,
+        node: process.versions.node,
+        platform: process.platform,
+        arch: process.arch,
+        release: os.release(),
+        totalMemory: os.totalmem(),
+        freeMemory: os.freemem(),
+        cpu: os.cpus()?.[0]?.model || "",
+        cpuCount: os.cpus()?.length || 0,
+      });
+      mainLog("info", "system", "session environment", {
+        sessionType,
+        softwareRendering,
+        display: process.env.DISPLAY || "",
+        waylandDisplay: process.env.WAYLAND_DISPLAY || "",
+        xdgSessionType: process.env.XDG_SESSION_TYPE || "",
+        desktop: process.env.XDG_CURRENT_DESKTOP || "",
+        sessionDesktop: process.env.XDG_SESSION_DESKTOP || "",
+        libglAlwaysSoftware: process.env.LIBGL_ALWAYS_SOFTWARE || "",
+        mesaLoaderDriverOverride: process.env.MESA_LOADER_DRIVER_OVERRIDE || "",
+        gpuDisabled: process.env.CREATOR_STUDIO_DISABLE_GPU === "1",
+        forceSoftwareGl: process.env.CREATOR_STUDIO_SOFTWARE_GL === "1",
+      });
+      try {
+        const systemMemory = process.getSystemMemoryInfo?.();
+        if (systemMemory) mainLog("info", "system", "memory", systemMemory);
+      } catch (error) {
+        mainLog("warning", "system", "system memory unavailable", { message: error?.message, stack: error?.stack });
+      }
+      try {
+        mainLog(
+          "info",
+          "display",
+          "displays",
+          screen.getAllDisplays().map((display) => ({
+            id: display.id,
+            label: display.label,
+            bounds: display.bounds,
+            workArea: display.workArea,
+            scaleFactor: display.scaleFactor,
+            rotation: display.rotation,
+            internal: display.internal,
+            touchSupport: display.touchSupport,
+          })),
+        );
+      } catch (error) {
+        mainLog("warning", "display", "display info unavailable", { message: error?.message, stack: error?.stack });
+      }
+      mainLog("info", "gpu", "feature status", app.getGPUFeatureStatus());
+      app
+        .getGPUInfo("complete")
+        .then((info) => mainLog("info", "gpu", "hardware info", info))
+        .catch((error) =>
+          mainLog("warning", "gpu", "GPU info unavailable", {
+            message: error?.message,
+            stack: error?.stack,
+          }),
+        );
+
+      // Always keep a slow performance heartbeat so a lag report has process
+      // CPU and memory history. The diagnostic wrapper raises the frequency.
+      const verbosePerf = process.env.TWIX_VERBOSE === "1";
+      const perfTimer = setInterval(() => {
+        const memory = process.memoryUsage();
+        let systemMemory = null;
+        try {
+          systemMemory = process.getSystemMemoryInfo?.() || null;
+        } catch {}
+        mainLog("debug", "perf", "memory", {
+          rss: memory.rss,
+          heapTotal: memory.heapTotal,
+          heapUsed: memory.heapUsed,
+          external: memory.external,
+          system: systemMemory,
+        });
+        const metrics = app.getAppMetrics().map((metric) => ({
+          pid: metric.pid,
+          type: metric.type,
+          cpu: metric.cpu,
+          memory: metric.memory,
+        }));
+        mainLog("debug", "perf", "processes", { metrics });
+      }, verbosePerf ? 10000 : 60000);
+      perfTimer.unref?.();
+
+      session.defaultSession.webRequest.onErrorOccurred((details) => {
+        const url = String(details.url || "");
+        if (!/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//i.test(url)) return;
+        if (details.error === "net::ERR_ABORTED") return;
+        mainLog("warning", "network", "local request failed", {
+          url,
+          error: details.error,
+          method: details.method,
+          resourceType: details.resourceType,
+          fromCache: details.fromCache,
+        });
+      });
+
+      try {
+        powerMonitor.on("suspend", () => mainLog("info", "power", "system suspended"));
+        powerMonitor.on("resume", () => mainLog("info", "power", "system resumed"));
+        powerMonitor.on("shutdown", () => mainLog("warning", "power", "system shutdown"));
+        powerMonitor.on("lock-screen", () => mainLog("debug", "power", "screen locked"));
+        powerMonitor.on("unlock-screen", () => mainLog("info", "power", "screen unlocked"));
+      } catch (error) {
+        mainLog("warning", "power", "power monitor unavailable", { message: error?.message });
+      }
       const allowedPermissions = new Set(["clipboard-read", "clipboard-sanitized-write", "pointerLock"]);
       session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
         callback(allowedPermissions.has(permission));

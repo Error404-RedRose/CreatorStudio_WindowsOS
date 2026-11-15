@@ -21,7 +21,13 @@ let lastActivity = null;
 let reconnectTimer = null;
 let readBuffer = Buffer.alloc(0);
 let lastSentAt = 0;
+let lastScanLoggedAt = 0;
+let logger = () => {};
 const sessionStartedAt = Date.now();
+
+function setDiscordLogger(next) {
+  logger = typeof next === "function" ? next : () => {};
+}
 
 function ipcCandidates() {
   const candidates = [];
@@ -30,11 +36,39 @@ function ipcCandidates() {
       candidates.push(`\\\\?\\pipe\\discord-ipc-${index}`);
       candidates.push(`\\\\.\\pipe\\discord-ipc-${index}`);
     }
-  } else {
-    const bases = [process.env.XDG_RUNTIME_DIR, process.env.TMPDIR, os.tmpdir(), "/tmp"].filter(Boolean);
-    for (const base of bases) {
+    return [...new Set(candidates)];
+  }
+
+  const bases = [
+    process.env.XDG_RUNTIME_DIR,
+    process.env.TMPDIR,
+    process.env.TMP,
+    process.env.TEMP,
+    os.tmpdir(),
+    typeof process.getuid === "function" ? `/run/user/${process.getuid()}` : "",
+    "/tmp",
+  ].filter(Boolean);
+
+  // Discord normally creates its socket directly in XDG_RUNTIME_DIR or /tmp.
+  // Flatpak and Snap installs keep it inside their sandbox runtime folder, and
+  // Discord forks such as WebCord use their own application folder. Scanning
+  // all of them keeps presence working for every Linux packaging style.
+  const sandboxFolders = [
+    "",
+    "app/com.discordapp.Discord",
+    "app/io.github.spacedrive.discord",
+    "app/de.shorsh.discord-screenaudio",
+    "snap.discord",
+    "snap.discord-canary",
+    "Discord",
+    "discord",
+  ];
+
+  for (const base of bases) {
+    for (const folder of sandboxFolders) {
+      const directory = folder ? path.join(base, folder) : base;
       for (let index = 0; index < 10; index += 1) {
-        candidates.push(path.join(base, `discord-ipc-${index}`));
+        candidates.push(path.join(directory, `discord-ipc-${index}`));
       }
     }
   }
@@ -79,11 +113,13 @@ function flushActivity(force = false) {
   const now = Date.now();
   if (!force && now - lastSentAt < 1200) return;
   lastSentAt = now;
-  send(1, {
+  const sent = send(1, {
     cmd: "SET_ACTIVITY",
     args: { pid: process.pid, activity: lastActivity },
     nonce: `${now}-${Math.random().toString(36).slice(2)}`,
   });
+  if (sent) logger("debug", "discord", "activity sent", { state: lastActivity.state });
+  else logger("warning", "discord", "activity write failed");
 }
 
 function scheduleReconnect() {
@@ -98,22 +134,51 @@ function handleFrame(opcode, payload) {
   if (opcode === 0) {
     // READY / handshake response.
     connected = true;
+    logger("info", "discord", "rich presence connected");
     flushActivity(true);
     return;
   }
   if (opcode === 1 && payload?.cmd === "DISPATCH" && payload?.evt === "READY") {
     connected = true;
+    logger("info", "discord", "rich presence ready", {
+      user: payload?.data?.user?.username || "",
+      app: payload?.data?.application?.name || "",
+    });
     flushActivity(true);
+    return;
+  }
+  if (opcode === 1 && payload?.evt === "ERROR") {
+    logger("warning", "discord", "rich presence command failed", {
+      command: payload?.cmd,
+      code: payload?.data?.code,
+      message: payload?.data?.message,
+    });
+    return;
+  }
+  if (opcode === 1 && payload?.cmd === "SET_ACTIVITY" && !payload?.evt) {
+    logger("debug", "discord", "activity acknowledged", {
+      name: payload?.data?.name || "",
+      details: payload?.data?.details || "",
+      state: payload?.data?.state || "",
+    });
     return;
   }
   if (opcode === 2) {
-    // PING from Discord.
-    send(3, payload);
+    // Discord closed the connection. The socket close handler reconnects.
+    logger("warning", "discord", "Discord closed the presence connection");
+    try {
+      socket?.end();
+    } catch {}
     return;
   }
   if (opcode === 3) {
-    connected = true;
-    flushActivity(true);
+    // Discord RPC: 3 is PING, 4 is PONG, 2 is CLOSE. Send the matching PONG
+    // directly so keep-alives work even during the handshake.
+    if (socket) {
+      try {
+        socket.write(encodeFrame(4, payload));
+      } catch {}
+    }
   }
 }
 
@@ -138,8 +203,21 @@ function handleData(chunk) {
 }
 
 function connect() {
-  if (!CLIENT_ID || socket || connected) return;
+  if (!CLIENT_ID) {
+    logger("warning", "discord", "rich presence disabled: no Discord client id");
+    return;
+  }
+  if (socket || connected) return;
   const candidates = ipcCandidates();
+  const now = Date.now();
+  if (now - lastScanLoggedAt > 60000) {
+    lastScanLoggedAt = now;
+    logger("debug", "discord", "looking for Discord IPC", {
+      candidates: candidates.length,
+      platform: process.platform,
+      xdgRuntimeDir: process.env.XDG_RUNTIME_DIR || "",
+    });
+  }
   let index = 0;
 
   const tryNext = () => {
@@ -154,13 +232,17 @@ function connect() {
       socket = candidate;
       connected = false;
       readBuffer = Buffer.alloc(0);
+      logger("info", "discord", "connected to Discord IPC", { pipe });
       candidate.on("data", handleData);
-      candidate.on("error", () => {});
+      candidate.on("error", (error) => {
+        logger("warning", "discord", "IPC socket error", { message: error?.message });
+      });
       candidate.on("close", () => {
         if (socket === candidate) {
           socket = null;
           connected = false;
           readBuffer = Buffer.alloc(0);
+          logger("warning", "discord", "Discord IPC closed");
           scheduleReconnect();
         }
       });
@@ -206,6 +288,7 @@ function stopDiscordPresence() {
 }
 
 module.exports = {
+  setDiscordLogger,
   startDiscordPresence,
   setDiscordActivity,
   stopDiscordPresence,
