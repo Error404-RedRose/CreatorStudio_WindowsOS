@@ -7835,7 +7835,7 @@ async function runAi3dPrompt({ projectId, text, model, sessionId, signal, images
         signal,
       });
     } catch (error) {
-      const transient = /fetch failed|network|ECONNRESET|socket|terminated|stream error|interrupted/i.test(
+      const transient = /fetch failed|network|ECONNRESET|socket|terminated|stream error|interrupted|operation was aborted/i.test(
         String(error?.message || ""),
       );
       if (!transient || attempt >= 1 || signal?.aborted) throw error;
