@@ -121,6 +121,7 @@ export const tools = [
         relative: { type: "string", description: "Exact base-colour relative path from library_inspect." },
         faceIds: { type: "array", items: { type: "string" }, description: "Sketch face ids. Defaults to the current face selection." },
         objectIds: { type: "array", items: { type: "string" }, description: "Imported object ids. Defaults to the current object selection." },
+        slot: { type: "number", description: "Material slot index on an imported object, from library_inspect or the Material panel. Omit to apply to every slot." },
         textureScale: { type: "number", description: "World size in metres for one texture tile (default 1). Use 0.5 for small bricks, 2 for large stone." },
         materialize: { type: "boolean", description: "Generate missing normal/AO/roughness/metallic maps (default true)." },
       },
@@ -323,7 +324,8 @@ export const tools = [
     name: "sketch_paint_faces",
     category: "material",
     mutating: true,
-    description: "Paint sketch faces with a hex colour, roughness, metalness or opacity. Applies directly to the face material paint.",
+    description:
+      "Paint sketch faces with a hex colour, roughness, metalness, opacity, shader or texture tile size. Applies directly to the face material paint. When editing texture density, pass textureScale so every PBR map repeats together.",
     inputSchema: {
       type: "object",
       properties: {
@@ -332,6 +334,13 @@ export const tools = [
         roughness: { type: "number" },
         metalness: { type: "number" },
         opacity: { type: "number" },
+        shader: { type: "string", description: "Shader preset stored on the face material, for example creator-pbr or materialize-pbr." },
+        textureScale: {
+          type: "number",
+          description: "World size in metres for one texture tile. Smaller values repeat the texture more often; 0.5 is fine brick, 2 is large stone.",
+        },
+        emissive: color,
+        emissiveIntensity: { type: "number" },
       },
       required: ["faceIds"],
       additionalProperties: false,

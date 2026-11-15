@@ -20,15 +20,85 @@ function clamp(value, min = 0, max = 1) {
   return value < min ? min : value > max ? max : value;
 }
 
-function decodeImage(buffer, ext) {
-  const clean = String(ext || "").toLowerCase().replace(/^\./, "");
-  if (clean === "png") {
-    const decoded = PNG.sync.read(buffer);
-    return { width: decoded.width, height: decoded.height, data: decoded.data };
+function detectImageFormat(buffer, ext) {
+  if (!buffer || buffer.length < 4) return String(ext || "").toLowerCase().replace(/^\./, "");
+  if (buffer[0] === 0xff && buffer[1] === 0xd8) return "jpg";
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) return "png";
+  if (buffer[0] === 0x42 && buffer[1] === 0x4d) return "bmp";
+  return String(ext || "").toLowerCase().replace(/^\./, "");
+}
+
+/**
+ * Minimal BMP reader for uncompressed 8/24/32-bit files. Several texture packs
+ * in the wild use a .bmp extension for JPEG bytes, so callers sniff the magic
+ * first; this path is only used by real BMP data.
+ */
+function decodeBmp(buffer) {
+  if (buffer.length < 54 || buffer[0] !== 0x42 || buffer[1] !== 0x4d) return null;
+  const dataOffset = buffer.readUInt32LE(10);
+  const headerSize = buffer.readUInt32LE(14);
+  const width = buffer.readInt32LE(18);
+  const rawHeight = buffer.readInt32LE(22);
+  const bpp = buffer.readUInt16LE(28);
+  const compression = buffer.readUInt32LE(30);
+  if (width <= 0 || rawHeight === 0) return null;
+  if (![0, 3].includes(compression)) return null;
+  if (![8, 24, 32].includes(bpp)) return null;
+  const height = Math.abs(rawHeight);
+  const topDown = rawHeight < 0;
+  const stride = Math.floor((width * bpp + 31) / 32) * 4;
+  if (dataOffset + stride * height > buffer.length) return null;
+  const data = new Uint8Array(width * height * 4);
+  let palette = null;
+  if (bpp === 8) {
+    const colorsUsed = buffer.readUInt32LE(46) || 256;
+    palette = new Uint8Array(Math.min(256, colorsUsed) * 4);
+    const paletteStart = 14 + headerSize;
+    for (let i = 0; i < Math.min(256, colorsUsed); i += 1) {
+      const at = paletteStart + i * 4;
+      if (at + 3 >= buffer.length) break;
+      palette[i * 4] = buffer[at + 2];
+      palette[i * 4 + 1] = buffer[at + 1];
+      palette[i * 4 + 2] = buffer[at];
+      palette[i * 4 + 3] = 255;
+    }
   }
-  if (clean === "jpg" || clean === "jpeg") {
+  for (let y = 0; y < height; y += 1) {
+    const sourceRow = topDown ? y : height - 1 - y;
+    const rowStart = dataOffset + sourceRow * stride;
+    for (let x = 0; x < width; x += 1) {
+      const target = (y * width + x) * 4;
+      if (bpp === 8) {
+        const entry = buffer[rowStart + x] * 4;
+        data[target] = palette?.[entry] ?? 0;
+        data[target + 1] = palette?.[entry + 1] ?? 0;
+        data[target + 2] = palette?.[entry + 2] ?? 0;
+        data[target + 3] = 255;
+      } else {
+        const at = rowStart + x * (bpp / 8);
+        data[target] = buffer[at + 2];
+        data[target + 1] = buffer[at + 1];
+        data[target + 2] = buffer[at];
+        data[target + 3] = bpp === 32 ? buffer[at + 3] : 255;
+      }
+    }
+  }
+  return { width, height, data };
+}
+
+function decodeImage(buffer, ext) {
+  const format = detectImageFormat(buffer, ext);
+  if (format === "png") {
+    const decoded = PNG.sync.read(buffer);
+    return { width: decoded.width, height: decoded.height, data: decoded.data, format };
+  }
+  if (format === "jpg" || format === "jpeg") {
     const decoded = jpeg.decode(buffer, { useTArray: true, formatAsRGBA: true });
-    return { width: decoded.width, height: decoded.height, data: decoded.data };
+    return { width: decoded.width, height: decoded.height, data: decoded.data, format: "jpg" };
+  }
+  if (format === "bmp") {
+    const decoded = decodeBmp(buffer);
+    return decoded ? { ...decoded, format } : null;
   }
   return null;
 }
@@ -210,7 +280,9 @@ export async function materializeTextureFile(basePath, options = {}) {
   const original = await fs.readFile(basePath);
   const decoded = decodeImage(original, ext);
   if (!decoded) {
-    throw new Error(`Materialize supports PNG and JPG base-colour textures. ${path.basename(basePath)} is ${ext.toUpperCase() || "unknown"}.`);
+    throw new Error(
+      `Materialize could not decode ${path.basename(basePath)}. It reads PNG, JPEG and uncompressed BMP data; the file extension is ${ext.toUpperCase() || "unknown"}.`,
+    );
   }
   const image = resize(decoded);
   const maps = buildMaps(image);

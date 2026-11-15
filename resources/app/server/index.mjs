@@ -7484,7 +7484,8 @@ function ai3dSystemPrompt(materialContext) {
     "- Use twix_library_geometry on at most two representative FBX/GLB models. If it fails, do not retry; continue from the metadata and proportions. Never let a library inspection failure stop the build.",
     "- Use these real library materials whenever a surface needs texture:",
     materialContext,
-    "- Apply materials with twix_library_material to selected faces or objects. It sets base colour, normal, AO, roughness and metallic maps together, and materializes any missing maps.",
+    "- Apply materials with twix_library_material to selected faces or objects. It sets base colour, normal, AO, roughness and metallic maps together, and materializes any missing maps. Pass slot to target one material slot on an imported object.",
+    "- Change texture density with twix_sketch_paint_faces textureScale, or with the textureScale input on twix_library_material. Both scale the base colour, normal, AO, roughness and metallic maps together, so PBR layers never drift apart.",
     "- Choose materials by construction logic, not by whatever name appears first. Exterior walls: brick, siding, plaster or stone. Roofs: roof shingles, clay tile, slate or metal. Foundations: concrete or stone. Interior floors: finished wood or tile. Furniture: finished wood, metal, fabric or leather. Do not use bark, ash, forest-floor, paint-splash or generic PBR textures on built surfaces unless the user asks for that look.",
     "- Set realistic textureScale for every material: bricks about 0.5-0.8 m per tile, siding 0.3-0.6, roof shingles 0.4-0.8, wood planks 1-2, concrete 1-2, fabric 0.5-1. A material that is too large or too small is a failed material application.",
     "- If the user asks to materialize the scene, call twix_materialize_scene. If they ask to materialize the library, call twix_materialize_library in batches and report remaining. Never just say it was done; run the tool and report the counts.",
@@ -11829,6 +11830,9 @@ const STUDIO3D_MAP_WORDS = {
   roughness: ["rough", "roughness", "r"],
   metallic: ["metal", "metallic", "metalness", "m"],
   emissive: ["emissive", "emission", "glow"],
+  // Height/bump/displacement maps are not base colour. Treating them as base
+  // created phantom "Material height" entries that could never be materialized.
+  height: ["height", "disp", "displacement", "bump"],
   base: ["color", "colour", "albedo", "basecolor", "diffuse", "bc", "d"],
 };
 
@@ -11887,7 +11891,7 @@ function studio3dBuildMaterials(textures) {
     if (!base) continue;
     const maps = {};
     for (const texture of group.textures) {
-      if (texture.mapRole === "base") continue;
+      if (texture.mapRole === "base" || texture.mapRole === "height") continue;
       if (!maps[texture.mapRole] || texture.bytes > maps[texture.mapRole].bytes) {
         maps[texture.mapRole] = texture;
       }
@@ -12296,7 +12300,14 @@ app.post("/api/studio3d/materialize", async (req, res) => {
   const force = Boolean(body.force);
   try {
     const index = await scanStudio3dFolder(root);
-    const materializable = (texture) => ["png", "jpg", "jpeg"].includes(String(texture.ext || "").toLowerCase());
+    // The Materialize engine sniffs the file magic, so .bmp files that are
+    // really JPEG data (common in texture packs) work too.
+    const materializable = (texture) => ["png", "jpg", "jpeg", "bmp"].includes(String(texture.ext || "").toLowerCase());
+    const skip = new Set(
+      (Array.isArray(body.skip) ? body.skip.map(String) : [])
+        .filter(Boolean)
+        .map((value) => path.resolve(root, value).toLowerCase()),
+    );
     const requested = Array.isArray(body.paths) ? body.paths.map(String).filter(Boolean) : [];
     let candidates = index.textures.filter((texture) => texture.mapRole === "base" && materializable(texture));
     if (requested.length) {
@@ -12305,13 +12316,14 @@ app.post("/api/studio3d/materialize", async (req, res) => {
     } else if (!force) {
       candidates = candidates.filter((texture) => !texture.material?.complete);
     }
+    candidates = candidates.filter((texture) => !skip.has(path.resolve(root, texture.path).toLowerCase()));
     const batch = candidates.slice(0, limit);
     const processed = [];
     const errors = [];
     for (const texture of batch) {
       const target = path.resolve(root, texture.path);
       if (!isInside(root, target)) {
-        errors.push({ texture: texture.name, error: "Texture is outside the 3D library folder." });
+        errors.push({ texture: texture.name, relative: texture.relative, error: "Texture is outside the 3D library folder." });
         continue;
       }
       try {
@@ -12328,13 +12340,17 @@ app.post("/api/studio3d/materialize", async (req, res) => {
           generated: Object.values(result.maps).some((value) => !value.reused),
         });
       } catch (error) {
-        errors.push({ texture: texture.name, error: error.message });
+        errors.push({ texture: texture.name, relative: texture.relative, error: error.message });
       }
     }
     studio3dScanCache.delete(root);
     const refreshed = batch.length ? await scanStudio3dFolder(root) : index;
     const remaining = refreshed.textures.filter(
-      (texture) => texture.mapRole === "base" && materializable(texture) && !texture.material?.complete,
+      (texture) =>
+        texture.mapRole === "base" &&
+        materializable(texture) &&
+        !texture.material?.complete &&
+        !skip.has(path.resolve(root, texture.path).toLowerCase()),
     ).length;
     log("info", "studio3d", "materialize batch", {
       folder: root,
