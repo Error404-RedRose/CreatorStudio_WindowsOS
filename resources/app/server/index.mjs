@@ -5432,18 +5432,14 @@ function resolveCodingRoot(dir) {
   return root;
 }
 
+// Only dependency/cache folders are hidden. Project folders such as src,
+// Assets, build, bin, obj, dist, release and target are real workspace content
+// and must appear in the coding hierarchy.
 const CODING_IGNORED = new Set([
   "node_modules",
   ".git",
   ".svn",
-  "target",
-  "dist",
-  "build",
-  "release",
-  "release-build",
-  "out",
-  "bin",
-  "obj",
+  ".hg",
   ".next",
   ".turbo",
   ".vs",
@@ -5455,7 +5451,6 @@ const CODING_IGNORED = new Set([
   "__pycache__",
   ".venv",
   "venv",
-  "coverage",
   ".cache",
 ]);
 
