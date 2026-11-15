@@ -143,6 +143,33 @@ export const tools = [
     },
   },
   {
+    name: "materialize_scene",
+    category: "material",
+    mutating: true,
+    description:
+      "Materialize every texture already used by the scene. It matches scene base-colour maps to 3D Library materials, generates missing normal/AO/roughness/metallic maps with the Materialize engine, then re-links the complete PBR set to each object. Use this when the user asks to materialize the scene.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "materialize_library",
+    category: "material",
+    mutating: true,
+    description:
+      "Generate missing normal/AO/roughness/metallic maps for 3D Library base-colour textures in this batch. Call repeatedly while remaining > 0 for the whole library. Use this when the user asks to materialize the library.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Textures per batch (default 8, max 24)." },
+        force: { type: "boolean", description: "Regenerate maps even when they already exist." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "scene_organize",
     category: "scene",
     mutating: true,

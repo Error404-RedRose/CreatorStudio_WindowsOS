@@ -609,14 +609,13 @@ const defaultSettings = () => ({
   defaultProjectDir: PROJECTS_ROOT,
   autosaveSeconds: 8,
   checkpoints: 40,
-  // Appearance defaults: the studio ships with the look currently used in the
-  // Appearance tab (Twilight theme, rain background, 28px blur, 1.5x speed,
-  // full zoom). New installs with no settings.json start out exactly like this.
+  // Performance default: no animated WebGL background. The app ships with a
+  // static themed surface so typing and 3D tools never compete with a shader.
   theme: "twilight",
-  backgroundFx: "rain",
-  backgroundBlur: 28,
-  backgroundIntensity: 92,
-  backgroundSpeed: 1.5,
+  backgroundFx: "none",
+  backgroundBlur: 0,
+  backgroundIntensity: 0,
+  backgroundSpeed: 1,
   backgroundZoomPct: 100,
   textScale: 1,
   uiScale: 1,
@@ -7447,6 +7446,7 @@ function ai3dSystemPrompt(materialContext) {
     "- Use these real library materials whenever a surface needs texture:",
     materialContext,
     "- Apply materials with twix_library_material to selected faces or objects. It sets base colour, normal, AO, roughness and metallic maps together, and materializes any missing maps.",
+    "- If the user asks to materialize the scene, call twix_materialize_scene. If they ask to materialize the library, call twix_materialize_library in batches and report remaining. Never just say it was done; run the tool and report the counts.",
     "- Give every major surface a material. Do not leave the whole scene default grey.",
     "Sketch workflow (prefer this for architecture, furniture, openings and anything the user must keep editing):",
     "1. Use twix_sketch_inspect to see existing faces, groups and selection.",
@@ -11839,6 +11839,7 @@ function studio3dBuildMaterials(textures) {
     group.textures.push(texture);
   }
   const materials = [];
+  const usedNames = new Map();
   for (const group of groups.values()) {
     const bases = group.textures.filter((texture) => texture.mapRole === "base");
     const base = bases.sort((a, b) => b.bytes - a.bytes)[0] || null;
@@ -11851,7 +11852,11 @@ function studio3dBuildMaterials(textures) {
       }
     }
     const missing = ["normal", "ao", "roughness", "metallic"].filter((kind) => !maps[kind]);
-    const name = base.name.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim() || "Material";
+    const pretty = base.name.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim();
+    const derived = String(base.displayName || "").trim() || pretty || "Material";
+    const count = (usedNames.get(derived.toLowerCase()) || 0) + 1;
+    usedNames.set(derived.toLowerCase(), count);
+    const name = count > 1 ? `${derived} ${count}` : derived;
     const material = {
       key: group.key,
       name,
@@ -11961,6 +11966,86 @@ function studio3dClassify(relative, kind, rig) {
 }
 
 const studio3dScanCache = new Map();
+const studio3dTextureNameCache = new Map();
+
+const STUDIO3D_NAME_STOP = new Set([
+  "texture", "textures", "raw", "pbr", "albedo", "material", "seamless", "tile", "tiling",
+  "top", "down", "close", "closeup", "up", "front", "view", "orthographic", "isometric",
+  "feature", "features", "colour", "color", "colors", "colours", "surface", "high", "quality",
+  "resolution", "photo", "photograph", "realistic", "detailed", "detail", "pattern", "background",
+  "wallpaper", "negative", "prompt", "visible", "shadow", "shadows", "strong", "light", "lights",
+  "sharp", "blurry", "blur", "logo", "watermark", "text", "name", "brand", "imprint", "copyright",
+  "right", "image", "picture", "render", "rendering", "cgi", "octane", "unreal", "engine",
+  "substance", "painter", "design", "decorative", "style", "styled", "natural", "clean",
+]);
+
+function studio3dNameFromPrompt(raw) {
+  const head = String(raw || "").split(/negative prompt:/i)[0];
+  const tokens = head
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .split(" ")
+    .map((token) => token.trim())
+    .filter((token) => token.length > 2 && !STUDIO3D_NAME_STOP.has(token) && !/^\d+$/.test(token));
+  const unique = [...new Set(tokens)].slice(0, 2);
+  if (!unique.length) return "";
+  return unique.map((token) => token[0].toUpperCase() + token.slice(1)).join(" ");
+}
+
+async function studio3dReadTextureName(target, stat) {
+  const cached = studio3dTextureNameCache.get(target);
+  if (cached && cached.mtime === stat.mtimeMs) return cached.name;
+  let name = "";
+  try {
+    const handle = await fs.open(target, "r");
+    try {
+      const size = Math.min(stat.size, 512 * 1024);
+      const buffer = Buffer.alloc(size);
+      await handle.read(buffer, 0, size, 0);
+      if (buffer.toString("binary", 1, 4) === "PNG") {
+        let offset = 8;
+        while (offset + 12 <= size) {
+          const length = buffer.readUInt32BE(offset);
+          const type = buffer.toString("ascii", offset + 4, offset + 8);
+          if (offset + 12 + length > size) break;
+          const payload = buffer.subarray(offset + 8, offset + 8 + length);
+          if (type === "tEXt" || type === "iTXt") {
+            const zero = payload.indexOf(0);
+            if (zero > 0) {
+              const keyword = payload.toString("latin1", 0, zero).toLowerCase();
+              if (["parameters", "prompt", "description", "comment"].includes(keyword)) {
+                let text = "";
+                if (type === "tEXt") {
+                  text = payload.toString("utf8", zero + 1);
+                } else {
+                  const compressed = payload[zero + 1] === 1;
+                  if (!compressed) {
+                    const languageEnd = payload.indexOf(0, zero + 3);
+                    const translatedEnd = payload.indexOf(0, languageEnd + 1);
+                    text = payload.toString("utf8", translatedEnd + 1);
+                  }
+                }
+                const derived = studio3dNameFromPrompt(text);
+                if (derived) {
+                  name = derived;
+                  break;
+                }
+              }
+            }
+          }
+          if (type === "IDAT") break;
+          offset += 12 + length;
+        }
+      }
+    } finally {
+      await handle.close().catch(() => {});
+    }
+  } catch {
+    /* Names are cosmetic; never fail a library scan for metadata. */
+  }
+  studio3dTextureNameCache.set(target, { mtime: stat.mtimeMs, name });
+  return name;
+}
 
 function studio3dMime(ext) {
   switch (ext) {
@@ -12111,11 +12196,15 @@ async function scanStudio3dFolder(folder, force = false) {
       if (STUDIO3D_TEXTURE_EXTS.has(ext)) {
         const stem = path.basename(entry.name, path.extname(entry.name));
         const material = studio3dTextureMaterialKey(relative, stem);
+        const numericStem = /^\d{3,}(?:[-_\s.]|$)/.test(stem);
+        const displayName =
+          material.role === "base" && numericStem ? await studio3dReadTextureName(absolute, stat) : "";
         textures.push({
           ...base,
           kind: "texture",
           mapRole: material.role,
           materialKey: material.key,
+          displayName,
           ...studio3dClassify(relative, "texture", null),
         });
         continue;
