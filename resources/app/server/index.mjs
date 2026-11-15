@@ -10657,6 +10657,20 @@ function redactGitError(text, token) {
   return value.replace(/https:\/\/[^@\s]+@github\.com/g, "https://[redacted]@github.com");
 }
 
+/** Keep the actionable Git failure instead of thousands of CRLF warnings. */
+function gitFailureDetail(text, token) {
+  const redacted = redactGitError(text, token);
+  const lines = redacted.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const important = lines.filter(
+    (line) =>
+      /^(fatal|error):/i.test(line) ||
+      /filename too long|unable to index file|adding files failed|permission denied|authentication failed|repository not found/i.test(
+        line,
+      ),
+  );
+  return (important.length ? important : lines).slice(-14).join("\n");
+}
+
 async function githubGitCliPush({ owner, repo, branch, files, cleanMode, deleteMissing, message, token, log }) {
   if (!(await gitAvailable())) return { ok: false, fallback: true, error: "Git is not installed." };
   if (!token) return { ok: false, fallback: true, error: "No GitHub token is configured." };
@@ -10668,10 +10682,14 @@ async function githubGitCliPush({ owner, repo, branch, files, cleanMode, deleteM
     if (cloned.code !== 0) {
       cloned = await runGit(["clone", "--depth", "1", authUrl, repoDir], temp, 1800000);
       if (cloned.code !== 0) {
-        throw new Error("Git clone failed: " + redactGitError(cloned.stderr || cloned.stdout, token));
+        throw new Error("Git clone failed: " + gitFailureDetail(cloned.stderr || cloned.stdout, token));
       }
       await runGit(["checkout", "-b", branch], repoDir, 60000);
     }
+    // Keep the pushed tree byte-for-byte (no CRLF churn warnings) and allow
+    // Windows Git to index deep venv paths when a project really needs it.
+    await runGit(["config", "core.longpaths", "true"], repoDir, 30000);
+    await runGit(["config", "core.autocrlf", "false"], repoDir, 30000);
 
     if (cleanMode || deleteMissing) {
       const entries = await fs.readdir(repoDir, { withFileTypes: true });
@@ -10700,7 +10718,7 @@ async function githubGitCliPush({ owner, repo, branch, files, cleanMode, deleteM
     }
 
     const added = await runGit(["add", "-A"], repoDir, 180000);
-    if (added.code !== 0) throw new Error("git add failed: " + redactGitError(added.stderr, token));
+    if (added.code !== 0) throw new Error("git add failed: " + gitFailureDetail(added.stderr, token));
     const commit = await runGit(
       [
         "-c", "user.name=Creator Studio",
@@ -10711,11 +10729,11 @@ async function githubGitCliPush({ owner, repo, branch, files, cleanMode, deleteM
       300000,
     );
     if (commit.code !== 0 && !/nothing to commit|no changes added/i.test(commit.stdout + commit.stderr)) {
-      throw new Error("git commit failed: " + redactGitError(commit.stderr || commit.stdout, token));
+      throw new Error("git commit failed: " + gitFailureDetail(commit.stderr || commit.stdout, token));
     }
     const pushed = await runGit(["push", "origin", `HEAD:${branch}`], repoDir, 1800000);
     if (pushed.code !== 0) {
-      throw new Error("git push failed: " + redactGitError(pushed.stderr || pushed.stdout, token));
+      throw new Error("git push failed: " + gitFailureDetail(pushed.stderr || pushed.stdout, token));
     }
     const head = await runGit(["rev-parse", "HEAD"], repoDir, 30000);
     const sha = head.stdout.trim();
@@ -10745,7 +10763,7 @@ async function githubGitCliPull({ owner, repo, branch, entries, prefix, root, ov
   try {
     const cloned = await runGit(["clone", "--depth", "1", "--branch", branch, "--single-branch", authUrl, repoDir], temp, 1800000);
     if (cloned.code !== 0) {
-      throw new Error("Git clone failed: " + redactGitError(cloned.stderr || cloned.stdout, token));
+      throw new Error("Git clone failed: " + gitFailureDetail(cloned.stderr || cloned.stdout, token));
     }
     if (await gitLfsAvailable()) {
       await runGit(["lfs", "pull"], repoDir, 1800000);
@@ -11379,9 +11397,11 @@ app.post("/api/github/sync", async (req, res) => {
     const targetBranch = String(branch || "").trim() || (await githubDefaultBranch(owner, repo));
     const ignoreDirs = new Set([
       ".git",
+      ".recovered",
       "node_modules",
       "dist",
       "build",
+      "builds",
       "release",
       "out",
       "coverage",
@@ -11392,19 +11412,60 @@ app.post("/api/github/sync", async (req, res) => {
       "temp",
       "logs",
       "code-recovery",
+      "venv",
+      ".venv",
+      "__pycache__",
+      ".pytest_cache",
+      ".mypy_cache",
+      ".turbo",
+      ".next",
+      ".nuxt",
+      ".svelte-kit",
+      ".parcel-cache",
+      "obj",
+      "bin",
+      "target",
+      "deriveddata",
     ]);
-    const ignoreExt = new Set([".exe", ".dll", ".pdb", ".zip", ".7z", ".rar"]);
+    const ignoreExt = new Set([
+      ".exe",
+      ".dll",
+      ".pdb",
+      ".zip",
+      ".7z",
+      ".rar",
+      ".pyc",
+      ".pyo",
+      ".tmp",
+      ".temp",
+      ".swp",
+      ".swo",
+      ".bak",
+    ]);
     const REPORT_FILE = "github_notpushed.txt";
-    const ignoreFiles = new Set([REPORT_FILE]);
+    const ignoreFiles = new Set([REPORT_FILE, ".ds_store", "thumbs.db", "desktop.ini"]);
     const ignoredRuleNames = new Set();
     // Windows folder names are case-insensitive: "Logs" must match "logs".
-    const isIgnoredDir = (name) => ignoreDirs.has(String(name || "").toLowerCase());
+    // release-build and release-build-linux are staging folders produced by
+    // build.bat; they can contain 300 MB venvs and Windows paths too long for
+    // Git. Ignore every release-build* folder by default.
+    const isIgnoredDir = (name) => {
+      const value = String(name || "").toLowerCase();
+      return ignoreDirs.has(value) || value.startsWith("release-build");
+    };
+    const isIgnoredFile = (name) => {
+      const value = String(name || "").toLowerCase();
+      if (ignoreFiles.has(value)) return true;
+      // Never push real environment secrets. Template files ending in
+      // .example/.sample stay eligible.
+      if (/^\.env(?:\.|$)/i.test(value) && !/\.(example|sample|template)$/i.test(value)) return true;
+      return ignoreExt.has(path.extname(value).toLowerCase());
+    };
     const isIgnoredRemotePath = (remotePath) => {
       const parts = String(remotePath || "").split("/");
       if (parts.some((part) => isIgnoredDir(part))) return true;
       const fileName = String(parts[parts.length - 1] || "").toLowerCase();
-      if (ignoreFiles.has(fileName)) return true;
-      return ignoreExt.has(path.extname(fileName).toLowerCase());
+      return isIgnoredFile(fileName);
     };
 
     // 1. Collect local files.
@@ -11429,13 +11490,13 @@ app.post("/api/github/sync", async (req, res) => {
           skippedIgnored++;
           continue;
         }
-        if (entry.name.toLowerCase() === REPORT_FILE) {
-          // Regenerated below and included in the same commit.
-          continue;
-        }
-        if (ignoreExt.has(path.extname(entry.name).toLowerCase())) {
-          ignoredRuleNames.add(path.extname(entry.name).toLowerCase());
-          skippedIgnored++;
+        if (isIgnoredFile(entry.name)) {
+          // github_notpushed.txt is regenerated below and included in the same
+          // commit, so do not count it as a skipped source file.
+          if (entry.name.toLowerCase() !== REPORT_FILE) {
+            ignoredRuleNames.add(path.extname(entry.name).toLowerCase() || entry.name);
+            skippedIgnored++;
+          }
           continue;
         }
         const stat = await fs.stat(absolute).catch(() => null);
