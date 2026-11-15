@@ -498,6 +498,20 @@ export const tools = [
     },
   },
   {
+    name: "sketch_reverse_faces",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Invert the normal direction of one or more sketch faces. Pass faceIds, or omit them to reverse the current face selection. This is the same multi-face invert used by the right-click menu.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        faceIds: { type: "array", items: { type: "string" } },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "sketch_paint_faces",
     category: "material",
     mutating: true,
