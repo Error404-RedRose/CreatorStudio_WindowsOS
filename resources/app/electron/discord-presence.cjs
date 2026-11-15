@@ -99,11 +99,22 @@ function normaliseActivity(activity) {
   const state = String(activity?.state || "In Creator Studio").slice(0, 128);
   const largeImage = String(activity?.largeImage || APP_ICON).slice(0, 256);
   const largeText = String(activity?.largeText || "Creator Studio").slice(0, 128);
+  // Discord's voice-channel roster uses the activity artwork when a
+  // small_image is present, falling back to the Developer Portal application
+  // icon otherwise. Supply the Creator Studio artwork explicitly so the voice
+  // row does not inherit an unrelated application icon.
+  const smallImage = String(activity?.smallImage || APP_ICON).slice(0, 256);
+  const smallText = String(activity?.smallText || "Creator Studio").slice(0, 128);
   return {
     details,
     state,
     timestamps: { start: Number(activity?.start) || sessionStartedAt },
-    assets: { large_image: largeImage, large_text: largeText },
+    assets: {
+      large_image: largeImage,
+      large_text: largeText,
+      small_image: smallImage,
+      small_text: smallText,
+    },
     instance: false,
   };
 }

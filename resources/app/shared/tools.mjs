@@ -405,7 +405,7 @@ export const tools = [
     category: "inspect",
     mutating: false,
     description:
-      "Inspect the editable SketchUp sketch document: face ids, group ids, area, normal, centre, UV Wrap state and current face selection. Call this before editing sketch geometry. The editor is Z-up: the ground is the XY plane and height runs along Z.",
+      "Inspect the editable SketchUp sketch document: face ids, edge ids with endpoints and hidden state, group ids, area, normal, centre, UV Wrap state and current selection. Call this before editing sketch geometry. The editor is Z-up: the ground is the XY plane and height runs along Z.",
     inputSchema: {
       type: "object",
       properties: {
@@ -535,6 +535,78 @@ export const tools = [
         faceIds: { type: "array", items: { type: "string" } },
         spacing: { type: "number", description: "Triangle edge target in metres (default 0.5)." },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_edit_lines",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Hide, show or erase specific sketch lines by edge id, using the same surface-preserving logic as the Hide Line and Erase tools. Erase also rebuilds the flat surface behind the removed lines. Read edge ids from sketch_inspect.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        edgeIds: { type: "array", items: { type: "string" }, description: "Edge ids from sketch_inspect." },
+        action: { type: "string", enum: ["erase", "hide", "show"], description: "erase removes the line, hide/show toggles visibility." },
+      },
+      required: ["edgeIds"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_make_face",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Create one editable face from selected boundary lines. Pass a closed outer loop, or an outer loop plus inner loops (for example both sides of a wall perimeter) to create one surface with holes. This is the same kernel operation as the Make Face tool.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        edgeIds: { type: "array", items: { type: "string" }, description: "Closed boundary edge ids from sketch_inspect." },
+      },
+      required: ["edgeIds"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_rebuild_surfaces",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Reconnect coplanar faces after hidden or visible lines were erased. Uses shared boundary vertices, not deleted edge records, so a cleaned wall becomes one editable n-gon instead of leftover triangles. Omit faceIds to rebuild every group.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        faceIds: { type: "array", items: { type: "string" }, description: "Optional faces to rebuild around." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_heal_faces",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Heal coplanar triangle regions into safe editable n-gon faces. The same validation as the Heal Flat Faces tool rejects self-intersecting loops and restores any region that would clip. Omit faceIds to heal the current selection, or set all to heal the whole scene.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        faceIds: { type: "array", items: { type: "string" } },
+        all: { type: "boolean", description: "Heal the whole scene even when faces are selected." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_delete_hidden_lines",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Delete every hidden line and rebuild the flat surfaces behind them. Works even when the hidden lines were erased one at a time earlier and no hidden edge records remain.",
+    inputSchema: {
+      type: "object",
+      properties: {},
       additionalProperties: false,
     },
   },

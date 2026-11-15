@@ -1508,8 +1508,12 @@ the appropriate \`twix_*\` tool.
    For editable architecture and cut-outs, use the sketch tools: \`twix_sketch_inspect\`,
    \`twix_sketch_rectangle\`, \`twix_sketch_circle\`, \`twix_sketch_polygon\`,
    \`twix_sketch_offset\`, \`twix_sketch_push_pull\`, \`twix_sketch_select_faces\`,
-   \`twix_sketch_paint_faces\` and \`twix_sketch_uv_wrap\`. Keep caps and openings as single editable
+   \`twix_sketch_paint_faces\`, \`twix_sketch_uv_wrap\`, \`twix_sketch_edit_lines\`,
+   \`twix_sketch_make_face\`, \`twix_sketch_rebuild_surfaces\`, \`twix_sketch_heal_faces\` and
+   \`twix_sketch_delete_hidden_lines\`. Keep caps and openings as single editable
    n-gons; never hand-triangulate them. UV Wrap adds hidden triangles without breaking the face.
+   After erasing or hiding lines, rebuild the flat surface so the user selects one face, not a
+   leftover triangle.
    \`twix_sketch_polygon\` takes explicit world-space points; for horizontal faces order them
    counter-clockwise viewed from above (+Z green normal). Call \`twix_library_inspect\` to use the
    user's 3D Library architecture references, then reproduce their proportions with new sketch faces.
@@ -7810,7 +7814,9 @@ function ai3dSystemPrompt(materialContext, mode = "build") {
     "3. To cut a door or window, draw the opening face on the wall, push/pull it through the full wall thickness, delete the cut slug, then offset and extrude the reveal and add the frame, sill and trim. Never draw an opening on one side only.",
     "4. Use twix_sketch_offset to create frames, reveals and door/window trim, and twix_sketch_push_pull to extrude walls, columns, openings and solids along a face normal.",
     "5. Use twix_sketch_select_faces and twix_sketch_uv_wrap before applying textures.",
-    "Keep sketch faces as one editable n-gon: never triangulate a cap by hand. UV Wrap adds hidden triangles without breaking the face.",
+    "6. Read line ids with twix_sketch_inspect. Clean imported or edited walls with twix_sketch_delete_hidden_lines or twix_sketch_rebuild_surfaces so coplanar triangles become one editable n-gon. Use twix_sketch_heal_faces for selected flat regions, and twix_sketch_make_face with a closed boundary edgeIds list (outer loop plus optional inner loops) to make one surface with holes. twix_sketch_edit_lines can hide, show or erase exact line ids with the same surface-preserving rules as the UI.",
+    "Keep sketch faces as one editable n-gon: never triangulate a cap by hand. UV Wrap adds hidden triangles without breaking the face. After erasing or hiding lines, always rebuild the surface before push/pull, offset, paint or export so the user can select the whole face.",
+    "The Hidden Lines snapshot look uses opaque default-white surfaces; lines behind a face are not visible. Use X-ray hidden only when you deliberately need to inspect internal hidden edges.",
     "",
     "Object workflow:",
     "- Use twix_foliage_create for trees, plants, hedges and organic foliage. Build trees upright and vary height and canopy rather than stamping identical copies.",
