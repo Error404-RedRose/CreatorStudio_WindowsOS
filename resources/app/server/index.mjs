@@ -2391,7 +2391,15 @@ function pushLog(logs, data) {
 
 function extractOpenCodeProviderError(line) {
   const text = String(line || "");
-  if (!/stream error|AI_APICallError|free usage limit|insufficient balance|rate limit/i.test(text)) {
+  // Only abort a live request for failures that cannot recover inside
+  // OpenCode's own retry loop. A generic "stream error" or AI_APICallError is
+  // often transient; aborting on it produced the frequent "provider
+  // connection was interrupted" message even when the build later succeeded.
+  if (
+    !/free usage limit|insufficient balance|rate limit|quota|invalid api key|unauthorized|authentication failed|model[^\n]*(?:not found|unavailable|does not exist)/i.test(
+      text,
+    )
+  ) {
     return null;
   }
   const sessionID = /session\.id=([A-Za-z0-9_-]+)/.exec(text)?.[1] || "";
@@ -7645,13 +7653,13 @@ async function ai3dMaterialContext() {
   try {
     const settings = await getSettings();
     const folder = settings.studio3d?.folder ? path.resolve(settings.studio3d.folder) : "";
-    if (!folder) return "No 3D Library folder is linked. Use procedural colours and tell the user to link a folder for PBR textures.";
+    if (!folder) return "No 3D Library folder is linked, so no texture material brushes are registered. Do not create colours or geometry; tell the user to link a 3D Library with base-colour textures.";
     const index = await scanStudio3dFolder(folder);
     const materials = (index.materials || []).slice();
     materials.sort((a, b) => Number(b.complete) - Number(a.complete) || a.name.localeCompare(b.name));
     const shown = materials.slice(0, 40);
     if (!shown.length) {
-      return `The 3D Library has ${index.textures.length} texture file(s) but no base-colour materials yet. Use colours, or call twix_library_material after the user adds base-colour textures.`;
+      return `The 3D Library has ${index.textures.length} texture file(s) but no registered base-colour material brushes. Do not create colours or geometry; report that no material brush is available and ask the user to add base-colour textures in the 3D Library first.`;
     }
     const lines = shown.map((material) => {
       const maps = ["base", ...Object.keys(material.maps || {})].join(", ");
@@ -7671,7 +7679,27 @@ async function ai3dMaterialContext() {
   }
 }
 
-function ai3dSystemPrompt(materialContext) {
+function ai3dSystemPrompt(materialContext, mode = "build") {
+  if (mode === "materialize") {
+    return [
+      "You are the AI materializer inside Creator Studio's SketchUp-style 3D editor.",
+      "The live scene is connected through the twix_* tools. This pass applies ONLY texture material brushes that are already registered in the Paint / Material tab.",
+      "Hard rules:",
+      "- Do not create colour swatches. Do not call twix_paint_palette.",
+      "- Do not paint flat colours. Do not call twix_sketch_paint_faces.",
+      "- Do not build, move, add, delete, scale or reframe geometry. Do not change the camera, environment, lighting or render look.",
+      "- Use only the material brushes listed below. If none is a credible match for a surface, leave that surface unchanged and report it.",
+      "- If the user selected faces or objects, touch only that scope. With no selection, cover the whole scene.",
+      "Registered texture material brushes:",
+      materialContext,
+      "Workflow:",
+      "1. Call twix_scene_inspect and twix_sketch_inspect to read the surfaces, groups and existing materials.",
+      "2. Choose the closest registered material for each major surface by construction logic (walls, roofs, floors, furniture, metal, fabric).",
+      "3. Apply each set with twix_library_material using the exact material name or relative path and a realistic textureScale.",
+      "4. Never call twix_materialize_library. Never call twix_paint_palette or twix_sketch_paint_faces.",
+      "5. Reply with the material applied to each surface and list any surface left unchanged because no registered brush matched.",
+    ].join("\n");
+  }
   return [
     "You are the AI 3D builder inside Creator Studio's SketchUp-style 3D editor.",
     "The live 3D scene is connected through the twix_* tools. Use those tools to complete the request directly.",
@@ -7689,10 +7717,11 @@ function ai3dSystemPrompt(materialContext) {
     "- The blueprint must be deep and complete: site envelope, every level, every room/zone, every asset with its final width, depth, height and world position, the material and colour plan, the colour swatches, and the ordered build phases. Compute exact numbers, not adjectives.",
     "- For edits to an existing scene, include the existing groups, bounds and materials you are keeping in the blueprint, and list exactly which groups/faces change.",
     "- Follow the blueprint exactly with the 3D tools. If you must change a dimension or position, update the blueprint with twix_scene_blueprint again before building the changed part.",
-    "Colour and material palette rule (mandatory):",
-    "- Every build or restyle starts by planning its colours. Call twix_paint_palette with named hex colours for all surfaces before drawing or painting.",
+    "Colour-only palette rule (mandatory):",
+    "- This builder may only colour geometry. Do not apply library PBR/texture material brushes during a build.",
+    "- Every build or restyle starts by planning its colours. Call twix_paint_palette with named hex colours for all surfaces before drawing or painting. Those names become named paint swatches the user can rename later.",
     "- Use only the exact hex values registered with twix_paint_palette for twix_sketch_paint_faces and any object colour input. Do not invent a different shade for the same surface later.",
-    "- Library PBR materials are the first choice for realistic surfaces; procedural colour is the fallback when no suitable library material exists. The Paint swatches must still contain the build palette.",
+    "- Never call twix_library_material, twix_materialize_scene or twix_materialize_library in build mode. The user applies registered texture material brushes later with the Materialize button.",
     "Attached reference images:",
     "- The user may attach one or more photos of a real object, room, building or style. Study them before planning: silhouette, proportions, storey heights, roof form, openings, colours, materials and layout.",
     "- The blueprint and the built scene must match the attached references unless the user explicitly asks for a variation. Mention which reference drove the design in your final summary.",
@@ -7718,17 +7747,12 @@ function ai3dSystemPrompt(materialContext) {
     "4. Use exact coordinates and verify with twix_object_inspect that each group has sensible bounds and sits on a surface.",
     "5. Keep doors and windows clear. Never place a chair or table in a doorway or through a wall.",
     "",
-    "Library and texture rules:",
+    "Library geometry rules:",
     "- Use twix_library_inspect to read the user's 3D Library categories before designing.",
     "- Use twix_library_geometry on at most two representative FBX/GLB models. If it fails, do not retry; continue from the metadata and proportions. Never let a library inspection failure stop the build.",
-    "- Use these real library materials whenever a surface needs texture:",
-    materialContext,
-    "- Apply materials with twix_library_material to selected faces or objects. It sets base colour, normal, AO, roughness and metallic maps together, and materializes any missing maps. Pass slot to target one material slot on an imported object.",
-    "- Change texture density with twix_sketch_paint_faces textureScale, or with the textureScale input on twix_library_material. Both scale the base colour, normal, AO, roughness and metallic maps together, so PBR layers never drift apart.",
-    "- Choose materials by construction logic, not by whatever name appears first. Exterior walls: brick, siding, plaster or stone. Roofs: roof shingles, clay tile, slate or metal. Foundations: concrete or stone. Interior floors: finished wood or tile. Furniture: finished wood, metal, fabric or leather. Do not use bark, ash, forest-floor, paint-splash or generic PBR textures on built surfaces unless the user asks for that look.",
-    "- Set realistic textureScale for every material: bricks about 0.5-0.8 m per tile, siding 0.3-0.6, roof shingles 0.4-0.8, wood planks 1-2, concrete 1-2, fabric 0.5-1. A material that is too large or too small is a failed material application.",
-    "- If the user asks to materialize the scene, call twix_materialize_scene. If they ask to materialize the library, call twix_materialize_library in batches and report remaining. Never just say it was done; run the tool and report the counts.",
-    "- Give every major surface a material. Do not leave the whole scene default grey.",
+    "- Library models may be imported with twix_library_import for their shape, but do not apply or copy their texture materials in build mode.",
+    "- Give every major surface a colour from the registered swatches. Do not leave the whole scene default grey.",
+    "- If the user asks to materialize a surface or the scene, tell them to use the Materialize button; do not run material tools in build mode.",
     "Sketch workflow (prefer this for architecture, furniture, openings and anything the user must keep editing):",
     "1. Use twix_sketch_inspect to see existing faces, groups and selection.",
     "2. Use twix_sketch_rectangle and twix_sketch_circle to draw exact faces in metres.",
@@ -7745,19 +7769,19 @@ function ai3dSystemPrompt(materialContext) {
     "- Use twix_object_create only for simple blockouts; refine blockouts before finishing.",
     "- Apply materials, UVs and smooth shading where appropriate, validate the scene and take a hidden-camera snapshot at the end. Never reframe the editor camera.",
     "- Do not ask the user to confirm. Do not only describe the steps: call the tools and build it.",
-    "- When finished, reply with a short summary of what was created, the final group count and which materials were used.",
+    "- When finished, reply with a short summary of what was created, the final group count and which named colour swatches were used.",
   ].join("\n");
 }
 
-async function runAi3dPrompt({ projectId, text, model, sessionId, signal, images = [], jobId = "" }) {
+async function runAi3dPrompt({ projectId, text, model, sessionId, signal, images = [], jobId = "", mode = "build" }) {
   let state = ocServers.get(String(projectId));
   if (!state || state.stopped || !state.ready) {
     state = await startOpenCode(String(projectId), "prop", false);
   }
   if (!state) throw new Error("OpenCode could not start for this project.");
   await ai3dTerminateStaleWork(projectId, state).catch(() => null);
-  const materialContext = await ai3dMaterialContext();
-  const system = ai3dSystemPrompt(materialContext);
+  const materialContext = mode === "materialize" ? await ai3dMaterialContext() : "";
+  const system = ai3dSystemPrompt(materialContext, mode);
   let activeSessionId = sessionId ? String(sessionId) : "";
   if (!activeSessionId) activeSessionId = await ocNewSession(state, AI3D_JOB_TITLE);
   if (jobId) {
@@ -7784,18 +7808,57 @@ async function runAi3dPrompt({ projectId, text, model, sessionId, signal, images
       url: dataUrl,
     });
   }
-  const sent = await ocSendMessage(state, {
-    sessionId: activeSessionId,
-    title: AI3D_JOB_TITLE,
-    body: {
-      model,
-      agent: "build",
-      system,
-      tools: { "*": false, "twix_*": true },
-      parts: messageParts,
-    },
-    signal,
-  });
+  const aiTools =
+    mode === "materialize"
+      ? { "*": false, "twix_*": true, "twix_paint_palette": false, "twix_sketch_paint_faces": false }
+      : {
+          "*": false,
+          "twix_*": true,
+          "twix_library_material": false,
+          "twix_materialize_scene": false,
+          "twix_materialize_library": false,
+        };
+  let sent = null;
+  let attempt = 0;
+  while (!sent) {
+    try {
+      sent = await ocSendMessage(state, {
+        sessionId: activeSessionId,
+        title: AI3D_JOB_TITLE,
+        body: {
+          model,
+          agent: "build",
+          system,
+          tools: aiTools,
+          parts: messageParts,
+        },
+        signal,
+      });
+    } catch (error) {
+      const transient = /fetch failed|network|ECONNRESET|socket|terminated|stream error|interrupted/i.test(
+        String(error?.message || ""),
+      );
+      if (!transient || attempt >= 1 || signal?.aborted) throw error;
+      attempt += 1;
+      log("warning", "ai3d", "provider interrupted; retrying once", {
+        projectId,
+        sessionId: activeSessionId,
+        message: String(error?.message || "").slice(0, 300),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      // Keep the same OpenCode session and ask the model to inspect what
+      // already landed instead of replaying the whole build. Completed tool
+      // calls stay in the scene, so a continuation is safer than a duplicate.
+      messageParts.splice(0, messageParts.length, {
+        type: "text",
+        text:
+          "The previous request was interrupted before it finished. Continue from the current live scene. " +
+          "Inspect existing groups, faces and paint swatches and finish only the unfinished parts; do not repeat " +
+          "objects, groups or swatches that already exist. Original request:\n" +
+          text,
+      });
+    }
+  }
   if (jobId && sent.sessionId && sent.sessionId !== activeSessionId) {
     await ai3dTrackActive({
       jobId,
@@ -7907,7 +7970,8 @@ app.post("/api/ai3d/job/:id/terminate", async (req, res) => {
 });
 
 app.post("/api/ai3d/prompt", async (req, res) => {
-  const { prompt, projectId, model, sessionId, async: asyncJob, images = [] } = req.body || {};
+  const { prompt, projectId, model, sessionId, async: asyncJob, images = [], mode: rawMode } = req.body || {};
+  const mode = rawMode === "materialize" ? "materialize" : "build";
   const text = String(prompt || "").trim();
   if (!text) return res.status(400).json({ ok: false, error: "Describe what you want the AI to build." });
   if (!projectId) return res.status(400).json({ ok: false, error: "Open a project before asking the 3D AI." });
@@ -7926,6 +7990,7 @@ app.post("/api/ai3d/prompt", async (req, res) => {
       status: "running",
       text: "",
       error: "",
+      mode,
       sessionId: sessionId || "",
       tools: [],
       startedAt: Date.now(),
@@ -7944,6 +8009,7 @@ app.post("/api/ai3d/prompt", async (req, res) => {
           signal,
           images,
           jobId: job.id,
+          mode: job.mode,
         });
         job.status = "done";
         job.text = result.text;
@@ -8003,6 +8069,7 @@ app.post("/api/ai3d/prompt", async (req, res) => {
       signal,
       images,
       jobId: syncJobId,
+      mode,
     });
     res.json({ ok: true, text: result.text, sessionId: result.sessionId, tools: result.tools });
   } catch (error) {
@@ -12551,7 +12618,14 @@ async function scanStudio3dFolder(folder, force = false) {
       if (STUDIO3D_MODEL_EXTS.has(ext)) {
         const rig = await inspectStudio3dModel(absolute, ext, stat.size);
         if (relative.startsWith("Clips/") && rig.clips === 0) rig.clips = 1;
-        models.push({ ...base, kind: "model", rig, ...studio3dClassify(relative, "model", rig) });
+        // A saved scene stores its sketch, viewport and AI sessions in a
+        // sibling .twix sidecar. Surface that in the library so the row can
+        // offer "Open saved scene" instead of a plain FBX import.
+        const hasScene = await fs
+          .access(absolute + ".twix")
+          .then(() => true)
+          .catch(() => false);
+        models.push({ ...base, kind: "model", rig, hasScene, ...studio3dClassify(relative, "model", rig) });
         if ((rig.clips > 0 || relative.startsWith("Clips/")) && STUDIO3D_ANIMATION_EXTS.has(ext)) {
           animations.push({ ...base, kind: "animation", rig, ...studio3dClassify(relative, "animation", rig) });
         }
@@ -12820,6 +12894,9 @@ app.post("/api/studio3d/sidecar", async (req, res) => {
     }
     const sidecar = target + ".twix";
     await fs.writeFile(sidecar, JSON.stringify(req.body), "utf8");
+    // The library scan that ran when the FBX was written could not see this
+    // sidecar yet. Drop the cache so the next library load reports hasScene.
+    studio3dScanCache.delete(folder);
     log("info", "studio3d", "sidecar saved", { path: path.relative(folder, sidecar).replace(/\\/g, "/") });
     res.json({ ok: true, path: path.relative(folder, sidecar).replace(/\\/g, "/") });
   } catch (error) {
@@ -13093,11 +13170,12 @@ app.post("/api/bridge/tool", async (req, res) => {
   // session can still be running hours-old work and would otherwise keep
   // editing the scene in the background. Only a live 3D AI job may drive the
   // scene through the scene MCP; the coding applet uses origin "coding".
+  let sceneJob = null;
   if (origin === "scene") {
-    const running = [...ai3dJobs.values()].some(
+    sceneJob = [...ai3dJobs.values()].find(
       (job) => job.projectId === String(projectId || "") && job.status === "running",
-    );
-    if (!running) {
+    ) || null;
+    if (!sceneJob) {
       return res.status(409).json({
         ok: false,
         stale: true,
@@ -13105,6 +13183,38 @@ app.post("/api/bridge/tool", async (req, res) => {
           "No 3D AI build is running for this scene. This tool call came from a finished or stale AI session and was blocked so it cannot edit the scene in the background.",
       });
     }
+  }
+  const toolName = String(name || "").replace(/^twix_/, "");
+  const buildBlockedTools = new Set(["library_material", "materialize_scene", "materialize_library"]);
+  if (sceneJob?.mode === "build" && buildBlockedTools.has(toolName)) {
+    return res.status(409).json({
+      ok: false,
+      error:
+        `${name} is disabled in the 3D builder. Build mode is colour-only: register named swatches with ` +
+        "twix_paint_palette and paint with those exact colours. Texture materials are applied only by the Materialize button.",
+    });
+  }
+  const materializeAllowed = new Set([
+    "scene_inspect",
+    "sketch_inspect",
+    "sketch_select_faces",
+    "selection_set",
+    "object_inspect",
+    "library_inspect",
+    "library_geometry",
+    "library_material",
+    "materialize_scene",
+    "sketch_uv_wrap",
+    "scene_snapshot",
+    "scene_validate",
+  ]);
+  if (sceneJob?.mode === "materialize" && !materializeAllowed.has(toolName)) {
+    return res.status(409).json({
+      ok: false,
+      error:
+        `${name} is disabled while materializing. Materialize may only inspect the scene and apply the ` +
+        "texture material brushes already registered in the Paint / Material tab. It cannot create colours or change geometry.",
+    });
   }
   const set = clients.get(projectId);
   const sockets = set ? [...set].filter((c) => c.readyState === 1) : [];
