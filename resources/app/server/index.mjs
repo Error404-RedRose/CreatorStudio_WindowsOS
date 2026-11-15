@@ -7360,6 +7360,124 @@ app.post("/api/ai3d/generate", async (req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------ */
+/* User notes and calendar                                             */
+/* ------------------------------------------------------------------ */
+
+const USER_NOTES_DIR = path.join(DATA_DIR, "notes");
+const USER_CALENDAR_FILE = path.join(DATA_DIR, "calendar.json");
+
+function userNotePath(name) {
+  const clean = path.basename(String(name || "").replace(/\\/g, "/")).trim();
+  if (!clean || clean === "." || clean === "..") return "";
+  if (!/\.(txt|rtf|md)$/i.test(clean)) return "";
+  return path.join(USER_NOTES_DIR, clean);
+}
+
+async function ensureDefaultUserNote() {
+  await ensureDir(USER_NOTES_DIR);
+  const existing = (await fs.readdir(USER_NOTES_DIR).catch(() => [])).filter((name) => /\.(txt|rtf|md)$/i.test(name));
+  if (existing.length) return;
+  await fs.writeFile(
+    path.join(USER_NOTES_DIR, "Note (1).txt"),
+    "Creator Studio notes\n\nKeep links, chat snippets and build ideas here. Type or paste a URL and click it in the link list below the editor.\n",
+    "utf8",
+  );
+}
+
+app.get("/api/user-notes", async (_req, res) => {
+  try {
+    await ensureDefaultUserNote();
+    const names = (await fs.readdir(USER_NOTES_DIR)).filter((name) => /\.(txt|rtf|md)$/i.test(name));
+    const files = [];
+    for (const name of names) {
+      const file = path.join(USER_NOTES_DIR, name);
+      const stat = await fs.stat(file).catch(() => null);
+      if (!stat?.isFile()) continue;
+      files.push({ name, bytes: stat.size, modified: stat.mtime.toISOString() });
+    }
+    files.sort((a, b) => a.name.localeCompare(b.name));
+    res.json({ ok: true, files, dir: USER_NOTES_DIR });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/user-notes/file", async (req, res) => {
+  try {
+    const target = userNotePath(req.query.name);
+    if (!target) return res.status(400).json({ error: "A .txt, .rtf or .md note name is required." });
+    const content = await fs.readFile(target, "utf8");
+    res.json({ ok: true, name: path.basename(target), content, dir: USER_NOTES_DIR });
+  } catch (error) {
+    res.status(error?.code === "ENOENT" ? 404 : 500).json({ error: error.message });
+  }
+});
+
+app.post("/api/user-notes/file", async (req, res) => {
+  try {
+    const { name, content = "" } = req.body || {};
+    const target = userNotePath(name);
+    if (!target) return res.status(400).json({ error: "A .txt, .rtf or .md note name is required." });
+    const text = String(content ?? "");
+    if (text.length > 4 * 1024 * 1024) return res.status(413).json({ error: "That note is larger than 4 MB." });
+    await ensureDir(USER_NOTES_DIR);
+    await writeFileAtomic(target, Buffer.from(text, "utf8"));
+    res.json({ ok: true, name: path.basename(target), bytes: Buffer.byteLength(text, "utf8"), dir: USER_NOTES_DIR });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/user-notes/file", async (req, res) => {
+  try {
+    const target = userNotePath(req.query.name);
+    if (!target) return res.status(400).json({ error: "A .txt, .rtf or .md note name is required." });
+    await fs.unlink(target).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+function normalizeCalendarEvents(value) {
+  if (!Array.isArray(value)) return [];
+  const events = [];
+  for (const item of value.slice(0, 5000)) {
+    if (!item || typeof item !== "object") continue;
+    const date = String(item.date || "").slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+    const title = String(item.title || "").trim().slice(0, 200);
+    if (!title) continue;
+    events.push({
+      id: String(item.id || randomUUID()),
+      date,
+      time: /^\d{2}:\d{2}$/.test(String(item.time || "")) ? String(item.time) : "",
+      title,
+      notes: String(item.notes || "").slice(0, 20000),
+      createdAt: String(item.createdAt || new Date().toISOString()),
+    });
+  }
+  return events;
+}
+
+app.get("/api/user-calendar", async (_req, res) => {
+  const events = normalizeCalendarEvents(await readJson(USER_CALENDAR_FILE, []));
+  res.json({ ok: true, events });
+});
+
+app.post("/api/user-calendar", async (req, res) => {
+  try {
+    const events = normalizeCalendarEvents(req.body?.events);
+    await writeJsonAtomic(USER_CALENDAR_FILE, events);
+    res.json({ ok: true, events });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 const ai3dJobs = new Map();
 const ai3dBridgeActivity = new Map();
 const AI3D_JOB_TITLE = "3D AI builder";
