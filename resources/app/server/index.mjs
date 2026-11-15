@@ -11,6 +11,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createLicenseService } from "./license.mjs";
 import { createModService } from "./mods.mjs";
 import { createSpeechService } from "./speech.mjs";
+import { MATERIALIZE_MAPS, materializeTextureFile } from "./materialize.mjs";
 import { discoverLocalAiEndpoints, ensureHermesApiServer, readHermesDirectProviders } from "./ai-endpoints.mjs";
 import { assessCommand } from "../shared/command-safety.mjs";
 import { createGithubIndex } from "./github-index.mjs";
@@ -7329,11 +7330,210 @@ app.post("/api/ai3d/generate", async (req, res) => {
   }
 });
 
+const ai3dJobs = new Map();
+const ai3dBridgeActivity = new Map();
+
+function ai3dActivityList(projectId) {
+  return (ai3dBridgeActivity.get(String(projectId || "")) || []).slice(-24).reverse();
+}
+
+function ai3dActivityStart(projectId, name) {
+  if (!projectId || !String(name).startsWith("twix_")) return null;
+  const running = [...ai3dJobs.values()].some(
+    (job) => job.projectId === projectId && job.status === "running",
+  );
+  if (!running) return null;
+  const item = {
+    id: randomUUID(),
+    name: String(name),
+    status: "running",
+    startedAt: Date.now(),
+  };
+  const list = ai3dBridgeActivity.get(projectId) || [];
+  list.push(item);
+  if (list.length > 60) list.splice(0, list.length - 60);
+  ai3dBridgeActivity.set(projectId, list);
+  return item;
+}
+
+function ai3dActivityFinish(projectId, item, result, started) {
+  if (!item) return;
+  item.status = result?.ok === false ? "error" : "done";
+  item.ms = Date.now() - started;
+  item.error = result?.ok === false ? String(result.error || "Tool failed").slice(0, 240) : "";
+}
+
+function ai3dFriendlyError(error, projectId) {
+  const raw = String(error?.message || "The 3D AI request failed.");
+  const activity = ai3dActivityList(projectId);
+  const completed = activity.filter((item) => item.status === "done").length;
+  const failed = activity.filter((item) => item.status === "error").length;
+  const suffix = activity.length
+    ? ` ${completed} tool call${completed === 1 ? "" : "s"} completed${failed ? `, ${failed} failed` : ""}; completed scene changes are kept.`
+    : "";
+  if (/fetch failed|network|ECONNRESET|socket|terminated|aborted by the provider/i.test(raw)) {
+    return (
+      "The AI provider connection was interrupted before the request finished." +
+      suffix +
+      " Retry, or choose a more reliable tool-capable model. The AI panel keeps this conversation and its progress."
+    );
+  }
+  if (/timed? out|timeout/i.test(raw)) {
+    return "The 3D AI request timed out." + suffix + " The scene is not cleared; retry or ask for a smaller change.";
+  }
+  return raw + suffix;
+}
+
+async function ai3dMaterialContext() {
+  try {
+    const settings = await getSettings();
+    const folder = settings.studio3d?.folder ? path.resolve(settings.studio3d.folder) : "";
+    if (!folder) return "No 3D Library folder is linked. Use procedural colours and tell the user to link a folder for PBR textures.";
+    const index = await scanStudio3dFolder(folder);
+    const materials = (index.materials || []).slice();
+    materials.sort((a, b) => Number(b.complete) - Number(a.complete) || a.name.localeCompare(b.name));
+    const shown = materials.slice(0, 40);
+    if (!shown.length) {
+      return `The 3D Library has ${index.textures.length} texture file(s) but no base-colour materials yet. Use colours, or call twix_library_material after the user adds base-colour textures.`;
+    }
+    const lines = shown.map((material) => {
+      const maps = ["base", ...Object.keys(material.maps || {})].join(", ");
+      const missing = material.missing?.length ? `; missing ${material.missing.join(", ")} (auto-materialized on apply)` : "; complete PBR set";
+      return `- ${material.name} (base file: ${material.baseName}; maps: ${maps}${missing})`;
+    });
+    return [
+      `The linked 3D Library contains ${index.materials.length} base-colour material(s) and ${index.textures.length} texture file(s).`,
+      ...lines,
+      materials.length > shown.length ? `- ${materials.length - shown.length} more materials are available by name.` : "",
+      "When a surface needs a texture, call twix_library_material with one of these names. It applies the base colour plus normal, AO, roughness and metallic maps, and materializes missing maps automatically.",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  } catch (error) {
+    return `The 3D Library could not be read (${error.message}). Use procedural colours and continue.`;
+  }
+}
+
+function ai3dSystemPrompt(materialContext) {
+  return [
+    "You are the AI 3D builder inside Creator Studio's SketchUp-style 3D editor.",
+    "The live 3D scene is connected through the twix_* tools. Use those tools to complete the request directly.",
+    "",
+    "Coordinate system: the editor is Z-up. The ground is the XY plane, height goes along +Z, and the Rectangle/Circle tools draw on XY unless you pass a different normal. All procedural buildings, trees, props and humanoids are automatically stood upright on the grid.",
+    "Spatial reasoning rules:",
+    "- Units are metres. The world origin is (0,0,0), the floor is z=0, and every vertex you create must use absolute world coordinates.",
+    "- Before drawing, write a short internal coordinate plan: site bounds, footprint corners, floor height, wall height, openings, roof ridge, furniture positions and walkway widths. Reuse exact numbers between tools instead of guessing.",
+    "- Use twix_sketch_polygon when rectangle/circle cannot express the shape. Pass every vertex explicitly and close the loop. Horizontal faces must be ordered counter-clockwise viewed from above so their green normal points +Z.",
+    "- Example 6x4 m room floor: [{x:0,y:0,z:0},{x:6,y:0,z:0},{x:6,y:4,z:0},{x:0,y:4,z:0}]. Push/Pull that face by 0.15 for a slab, or draw walls as vertical polygons and Push/Pull them by their thickness.",
+    "- Do not change the scene background, atmosphere, environment, lighting, camera projection or renderer look unless the user explicitly asks for that. Building geometry must not repaint the scene.",
+    "Grouping and placement rules (always apply):",
+    "- Every created object must be a named group. A house is a group; each chair, table, plate, shelf, individual book and tree is its own group. Use twix_sketch_group for each finished sketch object and twix_object_group for loose imported objects. Never leave a finished asset as loose ungrouped parts.",
+    "- Finish each group at its final world position. Do not group objects and then move the group into place unless you verify the resulting bounds.",
+    "- Keep furniture upright, resting on the floor or on the supporting surface. Chairs face the table, plates sit on the table, books sit on their shelf, and every tree trunk starts at z=0.",
+    "- Keep at least 0.9 m walkways between furniture groups and walls. Do not overlap groups, beds, tables or trees. No furniture inside walls, no assets floating above the floor.",
+    "- Build one coherent scene only. Do not add filler props the user did not request. Stop adding objects once the requested layout exists.",
+    "- Rebuild malformed geometry instead of stacking corrections. Validate with twix_scene_inspect/twix_scene_validate and report every group name in the final summary.",
+    "- At the end call twix_scene_organize to group any remaining loose parts by name and report the final group count.",
+    "Staging workflow for rooms, houses and interiors:",
+    "1. Choose a site plan and state the overall bounds internally (for example 12 x 9 m). Keep every object inside it.",
+    "2. Build the shell first: floor slab, walls, openings, roof, then architectural trim.",
+    "3. Place large furniture next (beds, tables, sofas, shelves), then small props on top. Each gets its own group.",
+    "4. Use exact coordinates and verify with twix_object_inspect that each group has sensible bounds and sits on a surface.",
+    "5. Keep doors and windows clear. Never place a chair or table in a doorway or through a wall.",
+    "",
+    "Library and texture rules:",
+    "- Use twix_library_inspect to read the user's 3D Library categories before designing.",
+    "- Use twix_library_geometry on at most two representative FBX/GLB models. If it fails, do not retry; continue from the metadata and proportions. Never let a library inspection failure stop the build.",
+    "- Use these real library materials whenever a surface needs texture:",
+    materialContext,
+    "- Apply materials with twix_library_material to selected faces or objects. It sets base colour, normal, AO, roughness and metallic maps together, and materializes any missing maps.",
+    "- Give every major surface a material. Do not leave the whole scene default grey.",
+    "Sketch workflow (prefer this for architecture, furniture, openings and anything the user must keep editing):",
+    "1. Use twix_sketch_inspect to see existing faces, groups and selection.",
+    "2. Use twix_sketch_rectangle and twix_sketch_circle to draw exact faces in metres.",
+    "3. Use twix_sketch_offset to create frames, reveals and door/window trim.",
+    "4. Use twix_sketch_push_pull to extrude walls, columns, openings and solids along a face normal.",
+    "5. Use twix_sketch_select_faces and twix_sketch_uv_wrap before applying textures.",
+    "Keep sketch faces as one editable n-gon: never triangulate a cap by hand. UV Wrap adds hidden triangles without breaking the face.",
+    "",
+    "Object workflow:",
+    "- Use twix_foliage_create for trees, plants, hedges and organic foliage. Build trees upright and vary height and canopy rather than stamping identical copies.",
+    "- Use twix_humanoid_create for people. Never assemble a person from cubes or capsules.",
+    "- Use twix_mesh_create and twix_prop_create for curved or organic props, weapons, furniture and detailed objects.",
+    "- Use twix_building_create for floors, walls, roofs and architectural elements that do not need custom sketch openings.",
+    "- Use twix_object_create only for simple blockouts; refine blockouts before finishing.",
+    "- Apply materials, UVs and smooth shading where appropriate, validate the scene and frame the viewport at the end.",
+    "- Do not ask the user to confirm. Do not only describe the steps: call the tools and build it.",
+    "- When finished, reply with a short summary of what was created, the final group count and which materials were used.",
+  ].join("\n");
+}
+
+async function runAi3dPrompt({ projectId, text, model, sessionId, signal }) {
+  let state = ocServers.get(String(projectId));
+  if (!state || state.stopped || !state.ready) {
+    state = await startOpenCode(String(projectId), "prop", false);
+  }
+  if (!state) throw new Error("OpenCode could not start for this project.");
+  const materialContext = await ai3dMaterialContext();
+  const system = ai3dSystemPrompt(materialContext);
+  const sent = await ocSendMessage(state, {
+    sessionId: sessionId || null,
+    title: "3D AI builder",
+    body: {
+      model,
+      agent: "build",
+      system,
+      tools: { "*": false, "twix_*": true },
+      parts: [{ type: "text", text }],
+    },
+    signal,
+  });
+  const response = sent.value;
+  const parts = Array.isArray(response?.parts) ? response.parts : [];
+  const responseText = cleanAssistantText(
+    parts.filter((part) => part?.type === "text" && part.text).map((part) => String(part.text)).join("\n\n"),
+  );
+  const tools = parts
+    .filter((part) => part?.type === "tool")
+    .map((part) => ({
+      name: String(part.tool || "tool"),
+      status: part.state?.status ? String(part.state.status) : "",
+      error: part.state?.error ? String(part.state.error).slice(0, 300) : "",
+    }));
+  const responseError =
+    response?.info?.error?.data?.message ||
+    response?.info?.error?.message ||
+    response?.error?.data?.message ||
+    response?.error?.message ||
+    "";
+  if (responseError) throw new Error(String(responseError));
+  if (!responseText && !tools.length) {
+    throw new Error("The AI model returned no result. Choose a tool-capable model and try again.");
+  }
+  const summary =
+    responseText ||
+    (tools.length
+      ? `The AI finished working in the 3D scene (${tools.length} tool call${tools.length === 1 ? "" : "s"}).`
+      : "The AI finished working in the 3D scene.");
+  return { text: summary, sessionId: sent.sessionId || sessionId || "", tools };
+}
+
 app.post("/api/ai3d/abort", async (req, res) => {
   try {
     const { projectId, sessionId } = req.body || {};
-    const state = ocServers.get(String(projectId || ""));
-    if (!state?.ready) return res.json({ ok: true, aborted: false });
+    const projectKey = String(projectId || "");
+    let abortedJob = false;
+    for (const job of ai3dJobs.values()) {
+      if (job.projectId !== projectKey || job.status !== "running") continue;
+      job.status = "cancelled";
+      job.error = "The AI request was cancelled. Completed scene changes are kept.";
+      job.updatedAt = Date.now();
+      job.abort?.abort();
+      job.abort = null;
+      abortedJob = true;
+    }
+    const state = ocServers.get(projectKey);
+    if (!state?.ready) return res.json({ ok: true, aborted: abortedJob });
     if (sessionId) {
       await ocFetch(state, `/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }).catch(() => null);
     } else {
@@ -7355,7 +7555,7 @@ app.post("/api/ai3d/abort", async (req, res) => {
 });
 
 app.post("/api/ai3d/prompt", async (req, res) => {
-  const { prompt, projectId, model, sessionId } = req.body || {};
+  const { prompt, projectId, model, sessionId, async: asyncJob } = req.body || {};
   const text = String(prompt || "").trim();
   if (!text) return res.status(400).json({ ok: false, error: "Describe what you want the AI to build." });
   if (!projectId) return res.status(400).json({ ok: false, error: "Open a project before asking the 3D AI." });
@@ -7364,6 +7564,69 @@ app.post("/api/ai3d/prompt", async (req, res) => {
   }
 
   const abort = new AbortController();
+  const timeout = AbortSignal.timeout(10 * 60 * 1000);
+  const signal = AbortSignal.any ? AbortSignal.any([abort.signal, timeout]) : abort.signal;
+
+  if (asyncJob) {
+    const job = {
+      id: randomUUID(),
+      projectId: String(projectId),
+      status: "running",
+      text: "",
+      error: "",
+      sessionId: sessionId || "",
+      tools: [],
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      abort,
+    };
+    ai3dJobs.set(job.id, job);
+    res.json({ ok: true, jobId: job.id, sessionId: job.sessionId });
+    void (async () => {
+      try {
+        const result = await runAi3dPrompt({
+          projectId: job.projectId,
+          text,
+          model,
+          sessionId: job.sessionId || null,
+          signal,
+        });
+        job.status = "done";
+        job.text = result.text;
+        job.sessionId = result.sessionId;
+        job.tools = result.tools;
+        log("info", "ai3d", "job complete", {
+          projectId: job.projectId,
+          model: `${model.providerID}/${model.modelID}`,
+          tools: result.tools.length,
+          textLength: result.text.length,
+        });
+      } catch (error) {
+        if (abort.signal.aborted) {
+          job.status = "cancelled";
+          job.error = "The AI request was cancelled. Completed scene changes are kept.";
+        } else {
+          job.status = "error";
+          job.error = ai3dFriendlyError(error, job.projectId);
+          log("warning", "ai3d", "job failed", { projectId: job.projectId, message: error?.message });
+        }
+      } finally {
+        job.updatedAt = Date.now();
+        job.abort = null;
+        const cutoff = Date.now() - 30 * 60 * 1000;
+        for (const [id, entry] of ai3dJobs) {
+          if (entry.status !== "running" && entry.updatedAt < cutoff) ai3dJobs.delete(id);
+        }
+        while (ai3dJobs.size > 24) {
+          const oldest = [...ai3dJobs.values()].sort((a, b) => a.updatedAt - b.updatedAt)[0];
+          if (!oldest || oldest.status === "running") break;
+          ai3dJobs.delete(oldest.id);
+        }
+      }
+    })();
+    return;
+  }
+
   let abortState = null;
   let abortSessionId = sessionId || "";
   res.on("close", () => {
@@ -7374,109 +7637,45 @@ app.post("/api/ai3d/prompt", async (req, res) => {
       }
     }
   });
-  const signal = AbortSignal.any
-    ? AbortSignal.any([abort.signal, AbortSignal.timeout(10 * 60 * 1000)])
-    : abort.signal;
 
   try {
-    let state = ocServers.get(String(projectId));
-    if (!state || state.stopped || !state.ready) {
-      state = await startOpenCode(String(projectId), "prop", false);
-    }
-    if (!state) throw new Error("OpenCode could not start for this project.");
-    abortState = state;
-    if (sessionId) abortSessionId = sessionId;
-
-    const system = [
-      "You are the AI 3D builder inside Creator Studio's SketchUp-style 3D editor.",
-      "The live 3D scene is connected through the twix_* tools. Use those tools to complete the request directly.",
-      "",
-      "Coordinate system: the editor is Z-up. The ground is the XY plane, height goes along +Z, and the Rectangle/Circle tools draw on XY unless you pass a different normal. All procedural buildings, trees, props and humanoids are automatically stood upright on the grid.",
-      "Spatial reasoning rules:",
-      "- Units are metres. The world origin is (0,0,0), the floor is z=0, and every vertex you create must use absolute world coordinates.",
-      "- Before drawing, write a short internal coordinate plan: footprint corners, floor height, wall height, openings and roof ridge. Reuse exact numbers between tools instead of guessing.",
-      "- Use twix_sketch_polygon when rectangle/circle cannot express the shape. Pass every vertex explicitly and close the loop. Horizontal faces must be ordered counter-clockwise viewed from above so their green normal points +Z.",
-      "- Example 6x4 m room floor: [{x:0,y:0,z:0},{x:6,y:0,z:0},{x:6,y:4,z:0},{x:0,y:4,z:0}]. Push/Pull that face by 0.15 for a slab, or draw walls as vertical polygons and Push/Pull them by their thickness.",
-      "- Do not change the scene background, atmosphere, environment, lighting, camera projection or renderer look unless the user explicitly asks for that. Building geometry must not repaint the scene.",
-      "Grouping and placement rules (always apply):",
-      "- Every created object must be a named group. A house is a group; each chair, table, plate, shelf, individual book and tree is its own group. Use twix_object_group after creating loose objects. Never leave a finished asset as loose ungrouped parts.",
-      "- Keep furniture upright and on the ground (z=0). Chairs must face the table, not away from it. Plates sit on the table, books sit on their shelf/stack, trees stand upright with the trunk base at z=0.",
-      "- Rebuild malformed geometry instead of stacking corrections. Validate with twix_scene_inspect/twix_scene_validate and report every group name in the final summary.",
-      "- Use twix_library_inspect to read the user's 3D Library categories and architectural references before designing. Then use twix_library_geometry on a matching FBX/GLB to sample its real vertex cloud, bounds and polygon mix. Use those proportions and styles, but build new editable sketch geometry rather than copying a library file.",
-      "- After building, call twix_sketch_inspect or twix_scene_inspect to verify face count, bounds and normals, then frame the viewport.",
-      "Sketch workflow (prefer this for architecture, furniture, openings and anything the user must keep editing):",
-      "1. Use twix_sketch_inspect to see existing faces, groups and selection.",
-      "2. Use twix_sketch_rectangle and twix_sketch_circle to draw exact faces in metres.",
-      "3. Use twix_sketch_offset to create frames, reveals and door/window trim.",
-      "4. Use twix_sketch_push_pull to extrude walls, columns, openings and solids along a face normal.",
-      "5. Use twix_sketch_select_faces, twix_sketch_paint_faces and twix_sketch_uv_wrap for presentation and texture-ready detail.",
-      "Keep sketch faces as one editable n-gon: never triangulate a cap by hand. UV Wrap adds hidden triangles without breaking the face.",
-      "",
-      "Object workflow:",
-      "- Use twix_foliage_create for trees, plants, hedges and organic foliage.",
-      "- Use twix_humanoid_create for people and humanoids. Never assemble a person from cubes or capsules.",
-      "- Use twix_mesh_create and twix_prop_create for curved or organic props, weapons, furniture and detailed objects.",
-      "- Use twix_building_create for floors, walls, roofs and architectural elements that do not need custom sketch openings.",
-      "- Use twix_object_create only for simple blockouts; refine blockouts into continuous vertex-built surfaces before finishing.",
-      "- Apply materials, UVs and smooth shading where appropriate, validate the scene and frame the viewport at the end.",
-      "- Do not ask the user to confirm. Do not only describe the steps: call the tools and build it.",
-      "- When finished, reply with a short summary of what was created and which tools were used.",
-    ].join("\n");
-
-    const sent = await ocSendMessage(state, {
+    const result = await runAi3dPrompt({
+      projectId: String(projectId),
+      text,
+      model,
       sessionId: sessionId || null,
-      title: "3D AI builder",
-      body: {
-        model,
-        agent: "build",
-        system,
-        tools: { "*": false, "twix_*": true },
-        parts: [{ type: "text", text }],
-      },
       signal,
     });
-
-    const response = sent.value;
-    const parts = Array.isArray(response?.parts) ? response.parts : [];
-    const responseText = cleanAssistantText(
-      parts.filter((part) => part?.type === "text" && part.text).map((part) => String(part.text)).join("\n\n"),
-    );
-    const tools = parts
-      .filter((part) => part?.type === "tool")
-      .map((part) => ({
-        name: String(part.tool || "tool"),
-        status: part.state?.status ? String(part.state.status) : "",
-        error: part.state?.error ? String(part.state.error).slice(0, 300) : "",
-      }));
-    const responseError =
-      response?.info?.error?.data?.message ||
-      response?.info?.error?.message ||
-      response?.error?.data?.message ||
-      response?.error?.message ||
-      "";
-    if (responseError) throw new Error(String(responseError));
-    if (!responseText && !tools.length) {
-      throw new Error("The AI model returned no result. Choose a tool-capable model and try again.");
-    }
-
-    const summary =
-      responseText ||
-      (tools.length
-        ? `The AI finished working in the 3D scene (${tools.length} tool call${tools.length === 1 ? "" : "s"}).`
-        : "The AI finished working in the 3D scene.");
-    log("info", "ai3d", "prompt complete", {
-      projectId,
-      model: `${model.providerID}/${model.modelID}`,
-      tools: tools.length,
-      textLength: summary.length,
-    });
-    res.json({ ok: true, text: summary, sessionId: sent.sessionId || sessionId || "", tools });
+    res.json({ ok: true, text: result.text, sessionId: result.sessionId, tools: result.tools });
   } catch (error) {
     log("warning", "ai3d", "prompt failed", { projectId, message: error?.message });
     if (!res.headersSent) {
-      res.status(502).json({ ok: false, error: error?.message || "The 3D AI request failed." });
+      res.status(502).json({ ok: false, error: ai3dFriendlyError(error, String(projectId)) });
     }
   }
+});
+
+app.get("/api/ai3d/job/:id", (req, res) => {
+  const job = ai3dJobs.get(String(req.params.id || ""));
+  if (!job) return res.status(404).json({ ok: false, error: "That AI job is no longer available." });
+  res.json({
+    ok: true,
+    job: {
+      id: job.id,
+      status: job.status,
+      text: job.text,
+      error: job.error,
+      sessionId: job.sessionId,
+      tools: job.tools,
+      activity: ai3dActivityList(job.projectId),
+      startedAt: job.startedAt,
+      updatedAt: job.updatedAt,
+    },
+  });
+});
+
+app.get("/api/ai3d/activity", (req, res) => {
+  res.json({ ok: true, activity: ai3dActivityList(String(req.query.projectId || "")) });
 });
 
 app.get("/api/search", async (req, res) => {
@@ -11583,6 +11782,105 @@ function studio3dTextureSub(text) {
   return "PBR";
 }
 
+const STUDIO3D_MAP_WORDS = {
+  normal: ["normal", "normalmap", "nrm", "normals", "n"],
+  ao: ["ao", "occlusion", "ambientocclusion"],
+  roughness: ["rough", "roughness", "r"],
+  metallic: ["metal", "metallic", "metalness", "m"],
+  emissive: ["emissive", "emission", "glow"],
+  base: ["color", "colour", "albedo", "basecolor", "diffuse", "bc", "d"],
+};
+
+function studio3dMapRole(stem) {
+  const tokens = String(stem || "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  if (!tokens.length) return { role: "base", baseStem: String(stem || "") };
+  const tail = tokens[tokens.length - 1];
+  const baseWords = STUDIO3D_MAP_WORDS.base;
+  let role = "base";
+  let baseTokens = tokens.slice();
+  for (const [kind, words] of Object.entries(STUDIO3D_MAP_WORDS)) {
+    if (kind === "base") continue;
+    if (words.includes(tail)) {
+      role = kind;
+      baseTokens = tokens.slice(0, -1);
+      break;
+    }
+  }
+  while (baseTokens.length > 1 && baseWords.includes(baseTokens[baseTokens.length - 1])) {
+    baseTokens = baseTokens.slice(0, -1);
+  }
+  return { role, baseStem: baseTokens.join("_") || "material" };
+}
+
+function studio3dTextureMaterialKey(relative, stem) {
+  void relative;
+  const info = studio3dMapRole(stem);
+  // Texture subfolders are only classification hints (Albedo, Normal, AO...).
+  // A material is identified by the shared base stem so a map stored in a
+  // different category folder still joins its base colour texture.
+  return {
+    key: info.baseStem.toLowerCase(),
+    role: info.role,
+  };
+}
+
+function studio3dBuildMaterials(textures) {
+  const groups = new Map();
+  for (const texture of textures) {
+    if (!texture.materialKey) continue;
+    let group = groups.get(texture.materialKey);
+    if (!group) {
+      group = { key: texture.materialKey, textures: [] };
+      groups.set(texture.materialKey, group);
+    }
+    group.textures.push(texture);
+  }
+  const materials = [];
+  for (const group of groups.values()) {
+    const bases = group.textures.filter((texture) => texture.mapRole === "base");
+    const base = bases.sort((a, b) => b.bytes - a.bytes)[0] || null;
+    if (!base) continue;
+    const maps = {};
+    for (const texture of group.textures) {
+      if (texture.mapRole === "base") continue;
+      if (!maps[texture.mapRole] || texture.bytes > maps[texture.mapRole].bytes) {
+        maps[texture.mapRole] = texture;
+      }
+    }
+    const missing = ["normal", "ao", "roughness", "metallic"].filter((kind) => !maps[kind]);
+    const name = base.name.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim() || "Material";
+    const material = {
+      key: group.key,
+      name,
+      base: base.path,
+      baseRelative: base.relative,
+      baseName: base.name,
+      bytes: base.bytes,
+      maps: Object.fromEntries(Object.entries(maps).map(([kind, texture]) => [kind, texture.path])),
+      mapNames: Object.fromEntries(Object.entries(maps).map(([kind, texture]) => [kind, texture.name])),
+      missing,
+      complete: missing.length === 0,
+      shader: "creator-pbr",
+    };
+    for (const texture of group.textures) {
+      texture.material = {
+        key: material.key,
+        name: material.name,
+        role: texture.mapRole,
+        base: material.base,
+        complete: material.complete,
+        missing: material.missing,
+      };
+    }
+    materials.push(material);
+  }
+  materials.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  return materials;
+}
+
 function studio3dClipSub(text) {
   if (studio3dWords(text, ["walk", "run", "jog", "sprint", "locomotion", "strafe", "crawl", "climb"])) return "Locomotion";
   if (studio3dWords(text, ["attack", "combat", "shoot", "hit", "block", "punch", "swing", "cast"])) return "Combat";
@@ -11758,7 +12056,7 @@ async function inspectStudio3dModel(target, ext, bytes) {
 async function scanStudio3dFolder(folder, force = false) {
   const root = folder ? path.resolve(folder) : "";
   if (!root) {
-    return { folder: "", scannedAt: new Date().toISOString(), models: [], textures: [], animations: [], errors: [] };
+    return { folder: "", scannedAt: new Date().toISOString(), models: [], textures: [], materials: [], animations: [], errors: [] };
   }
   await ensureStudio3dFolders(root);
   const cached = studio3dScanCache.get(root);
@@ -11803,14 +12101,23 @@ async function scanStudio3dFolder(folder, force = false) {
       };
       if (STUDIO3D_MODEL_EXTS.has(ext)) {
         const rig = await inspectStudio3dModel(absolute, ext, stat.size);
+        if (relative.startsWith("Clips/") && rig.clips === 0) rig.clips = 1;
         models.push({ ...base, kind: "model", rig, ...studio3dClassify(relative, "model", rig) });
-        if (rig.clips > 0 && STUDIO3D_ANIMATION_EXTS.has(ext)) {
+        if ((rig.clips > 0 || relative.startsWith("Clips/")) && STUDIO3D_ANIMATION_EXTS.has(ext)) {
           animations.push({ ...base, kind: "animation", rig, ...studio3dClassify(relative, "animation", rig) });
         }
         continue;
       }
       if (STUDIO3D_TEXTURE_EXTS.has(ext)) {
-        textures.push({ ...base, kind: "texture", ...studio3dClassify(relative, "texture", null) });
+        const stem = path.basename(entry.name, path.extname(entry.name));
+        const material = studio3dTextureMaterialKey(relative, stem);
+        textures.push({
+          ...base,
+          kind: "texture",
+          mapRole: material.role,
+          materialKey: material.key,
+          ...studio3dClassify(relative, "texture", null),
+        });
         continue;
       }
       if (ext === "anim" || ext === "bvh") {
@@ -11824,7 +12131,16 @@ async function scanStudio3dFolder(folder, force = false) {
   models.sort(byName);
   textures.sort(byName);
   animations.sort(byName);
-  const index = { folder: root.replace(/\\/g, "/"), scannedAt: new Date().toISOString(), models, textures, animations, errors: errors.slice(0, 12) };
+  const materials = studio3dBuildMaterials(textures);
+  const index = {
+    folder: root.replace(/\\/g, "/"),
+    scannedAt: new Date().toISOString(),
+    models,
+    textures,
+    materials,
+    animations,
+    errors: errors.slice(0, 12),
+  };
   studio3dScanCache.set(root, { at: Date.now(), index });
   return index;
 }
@@ -11838,6 +12154,76 @@ app.get("/api/studio3d/library", async (req, res) => {
     res.json(index);
   } catch (error) {
     res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/studio3d/materialize", async (req, res) => {
+  const settings = await getSettings();
+  const root = settings.studio3d?.folder ? path.resolve(settings.studio3d.folder) : "";
+  if (!root) return res.status(400).json({ error: "Choose a 3D library folder first." });
+  const body = req.body || {};
+  const limit = Math.max(1, Math.min(12, Number(body.limit) || 4));
+  const force = Boolean(body.force);
+  try {
+    const index = await scanStudio3dFolder(root);
+    const materializable = (texture) => ["png", "jpg", "jpeg"].includes(String(texture.ext || "").toLowerCase());
+    const requested = Array.isArray(body.paths) ? body.paths.map(String).filter(Boolean) : [];
+    let candidates = index.textures.filter((texture) => texture.mapRole === "base" && materializable(texture));
+    if (requested.length) {
+      const wanted = new Set(requested.map((value) => path.resolve(root, value).toLowerCase()));
+      candidates = index.textures.filter((texture) => wanted.has(path.resolve(texture.path).toLowerCase()));
+    } else if (!force) {
+      candidates = candidates.filter((texture) => !texture.material?.complete);
+    }
+    const batch = candidates.slice(0, limit);
+    const processed = [];
+    const errors = [];
+    for (const texture of batch) {
+      const target = path.resolve(root, texture.path);
+      if (!isInside(root, target)) {
+        errors.push({ texture: texture.name, error: "Texture is outside the 3D library folder." });
+        continue;
+      }
+      try {
+        const result = await materializeTextureFile(target, { force });
+        processed.push({
+          name: texture.name,
+          relative: texture.relative,
+          width: result.width,
+          height: result.height,
+          maps: Object.fromEntries(
+            Object.entries(result.maps).map(([kind, value]) => [kind, path.basename(value.path)]),
+          ),
+          bytes: Object.values(result.maps).reduce((sum, value) => sum + value.bytes, 0),
+          generated: Object.values(result.maps).some((value) => !value.reused),
+        });
+      } catch (error) {
+        errors.push({ texture: texture.name, error: error.message });
+      }
+    }
+    studio3dScanCache.delete(root);
+    const refreshed = batch.length ? await scanStudio3dFolder(root) : index;
+    const remaining = refreshed.textures.filter(
+      (texture) => texture.mapRole === "base" && materializable(texture) && !texture.material?.complete,
+    ).length;
+    log("info", "studio3d", "materialize batch", {
+      folder: root,
+      processed: processed.length,
+      errors: errors.length,
+      remaining,
+    });
+    res.json({
+      ok: true,
+      processed,
+      errors,
+      remaining,
+      total: refreshed.textures.filter((texture) => texture.mapRole === "base" && materializable(texture)).length,
+      materials: refreshed.materials.length,
+      completeMaterials: refreshed.materials.filter((material) => material.complete).length,
+    });
+  } catch (error) {
+    log("error", "studio3d", "materialize failed", { message: error.message });
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -12256,6 +12642,8 @@ app.post("/api/bridge/tool", async (req, res) => {
       pendingTools.set(id, { resolve, timer, projectId, ws });
       ws.send(JSON.stringify({ type: "tool.call", id, name, args: args || {}, projectId }));
     });
+  const activity = ai3dActivityStart(projectId, name);
+  const activityStarted = Date.now();
   let result = null;
   for (const ws of sockets) {
     result = await runOn(ws);
@@ -12263,6 +12651,7 @@ app.post("/api/bridge/tool", async (req, res) => {
       result?.ok === false && /workspace is not ready|viewport is not ready/i.test(String(result.error || result.summary || ""));
     if (!notReady) break;
   }
+  ai3dActivityFinish(projectId, activity, result, activityStarted);
   log(result?.ok === false ? "warning" : "info", "bridge", "tool.result " + name, { projectId, ms: Date.now() - started, result });
   res.json(result);
 });
