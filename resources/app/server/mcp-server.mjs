@@ -75,10 +75,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } catch {
       result = { ok: false, error: `Bridge returned invalid JSON (HTTP ${res.status})`, raw: text.slice(0, 500) };
     }
-    const payload = JSON.stringify(result);
+    const image = typeof result?.image === "string" ? result.image : "";
+    const textResult = image ? { ...result, image: "[image attached]" } : result;
+    const payload = JSON.stringify(textResult);
     return {
-      content: [{ type: "text", text: payload }],
-      structuredContent: result,
+      content: [
+        { type: "text", text: payload },
+        ...(image ? [{ type: "image", data: image, mimeType: "image/png" }] : []),
+      ],
+      structuredContent: textResult,
       isError: result?.ok === false,
     };
   } catch (error) {

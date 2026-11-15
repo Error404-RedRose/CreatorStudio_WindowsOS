@@ -12782,7 +12782,8 @@ app.post("/api/bridge/tool", async (req, res) => {
     if (!notReady) break;
   }
   ai3dActivityFinish(projectId, activity, result, activityStarted);
-  log(result?.ok === false ? "warning" : "info", "bridge", "tool.result " + name, { projectId, ms: Date.now() - started, result });
+  const loggableResult = result?.image ? { ...result, image: "[image attached]" } : result;
+  log(result?.ok === false ? "warning" : "info", "bridge", "tool.result " + name, { projectId, ms: Date.now() - started, result: loggableResult });
   res.json(result);
 });
 
