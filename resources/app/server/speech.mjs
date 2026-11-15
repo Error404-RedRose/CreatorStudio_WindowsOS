@@ -8,6 +8,11 @@ import { fileURLToPath } from "node:url";
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SPEECH_TOOLS = path.join(APP_ROOT, "tools", "speech");
+const PACKAGED_SPEECH_PYTHON = path.join(
+  SPEECH_TOOLS,
+  "runtime",
+  process.platform === "win32" ? "python.exe" : path.join("bin", "python"),
+);
 const REQUIREMENTS_FILE = path.join(SPEECH_TOOLS, "requirements.txt");
 const REQUIREMENTS_LINUX_FILE = path.join(SPEECH_TOOLS, "requirements-linux.txt");
 const INSTALL_RETRY_MS = 10 * 60 * 1000;
@@ -169,6 +174,7 @@ export function createSpeechService({ dataDir, getConfig, onTranscript }) {
   function runtimeAvailable() {
     if (venvReady()) return true;
     const packaged = [
+      PACKAGED_SPEECH_PYTHON,
       process.platform === "win32"
         ? path.join(APP_ROOT, "tools", "speech", "venv", "Scripts", "python.exe")
         : path.join(APP_ROOT, "tools", "speech", "venv", "bin", "python"),
@@ -217,8 +223,11 @@ export function createSpeechService({ dataDir, getConfig, onTranscript }) {
         ? [
             ...(venvReady() ? [venvPython] : []),
             process.env.TWIX_PYTHON || "",
-            // Prefer the packaged, known-good environment over a partially
-            // provisioned data venv that has not written its ready marker.
+            // The portable runtime is relocatable and includes its own
+            // CPython DLLs and stdlib. A build-machine virtual environment is
+            // only a development fallback because its pyvenv.cfg points at the
+            // developer's Python installation.
+            PACKAGED_SPEECH_PYTHON,
             path.join(APP_ROOT, "tools", "speech", "venv", "Scripts", "python.exe"),
             path.join(APP_ROOT, "tools", "speech", ".venv", "Scripts", "python.exe"),
             venvPython,

@@ -1,6 +1,6 @@
 # Creator Studio
 
-**By Twilight Studio** · Version **0.14.0-beta.72** · Windows x64
+**By Twilight Studio** · Version **0.14.0-beta.73** · Windows x64
 
 A native Windows creative workspace where AI agents and manual tools share the same project.
 Model in 3D, simulate cloth, format writing, code with an AI agent, drive a live Unity Editor,
@@ -20,37 +20,33 @@ edit layered images, and run AI research — all from one desktop application.
 
 ## Downloading and installing from GitHub
 
-The main executable is stored with **Git LFS** because it is larger than GitHub's
-100 MB file limit. A plain ZIP download contains a small **pointer file** instead of
-the real program (about 134 bytes), so use one of these methods.
+### Recommended: the Windows installer
 
-### Recommended: run `install.bat`
+1. Open **[Creator Studio Releases](https://github.com/Error404-RedRose/CreatorStudio_WindowsOS/releases/latest)**.
+2. Download **`CreatorStudio-Setup.exe`**.
+3. Run it and choose the install folder. Setup creates Start-menu and desktop shortcuts.
 
-1. Download the repository as a ZIP and extract it completely.
-2. Open the extracted folder and run **`install.bat`**.
-3. The installer downloads the complete build, verifies the 238 MB executable, and
-   starts Creator Studio.
+The installer contains the complete application, including the **portable speech
+engine**. Git, Git LFS, Python and repository ZIP repair are not required.
 
-`install.bat` uses `git clone` plus `git lfs pull` when Git is installed. If Git is
-missing, it offers a direct download of the executable from GitHub's LFS media
-endpoint, so no developer tools are required. Run it again any time you need to
-restore the executable.
+### If you already downloaded the repository ZIP
 
-### Manual: clone with Git LFS
+Run **`install.bat`** in the extracted folder. It downloads and launches the latest
+installer from GitHub Releases. It does not require Git or Git LFS.
 
-```text
-git lfs install
-git clone https://github.com/Error404-RedRose/CreatorStudio_WindowsOS.git
-cd CreatorStudio_WindowsOS
-git lfs pull
-```
+### Portable folder
 
-Then run `Creator Studio.exe`.
+A complete `win-unpacked` folder is still published for in-app updates. Run
+`Creator Studio.exe` from that folder only when the folder contains `resources`,
+`locales`, the DLLs and `resources\app\dist\index.html`. If the EXE is a tiny
+pointer file, use the installer instead.
 
-### Manual: single executable
+### Why a repository ZIP alone can look broken
 
-Open `Creator Studio.exe` on GitHub and use **Download** on the file page. The file
-is about 238 MB; keep it in the same folder as the rest of the release files.
+GitHub stores every `.exe` in the repository with **Git LFS**. A plain ZIP download
+contains small pointer files, including the speech runtime. The installer avoids
+that problem by shipping the verified files directly. Do not run a pointer EXE and
+do not repair only `Creator Studio.exe` by hand.
 
 ---
 
@@ -58,8 +54,9 @@ is about 238 MB; keep it in the same folder as the rest of the release files.
 
 | Item | Description |
 | --- | --- |
-| `Creator Studio.exe` | The application. Run it from this folder. |
-| `install.bat` | Restores the full executable when the repository was downloaded as a ZIP. |
+| `CreatorStudio-Setup.exe` | Recommended Windows installer. Creates shortcuts and installs the complete build. |
+| `Creator Studio.exe` | Portable application. Run it from a complete folder. |
+| `install.bat` | Downloads and launches the latest installer when a complete portable folder is not present. |
 | `resources/`, `locales/`, `*.dll`, `*.pak`, `*.bin` | Required runtime files. Do not move or delete them. |
 | `README.md` | This document. |
 | `LICENSE.txt` | License terms for Creator Studio. |

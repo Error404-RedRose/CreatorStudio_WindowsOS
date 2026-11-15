@@ -539,6 +539,42 @@ export const tools = [
     },
   },
   {
+    name: "sketch_arc",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Draw an editable arc from a start point, end point and bulge point. The arc cuts the face under it into new faces, matching the manual Arc tool. Higher sides values give a smoother curve.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        start: vec3,
+        end: vec3,
+        bulge: vec3,
+        sides: { type: "number", description: "Arc segments, 8-128 (default 24)." },
+      },
+      required: ["start", "end", "bulge"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "sketch_bevel_edges",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Bevel selected sketch edges with a real quarter-circle profile. 1 segment is a chamfer; 3-8 segments give a round bevel. Use edge ids from sketch_inspect.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        edgeIds: { type: "array", items: { type: "string" } },
+        segments: { type: "number", description: "1-16 profile segments (default 4)." },
+        amount: { type: "number", description: "Bevel width in metres." },
+        outward: { type: "boolean", description: "Bevel outward instead of inward." },
+      },
+      required: ["edgeIds", "amount"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "sketch_edit_lines",
     category: "modeling",
     mutating: true,

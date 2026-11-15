@@ -398,6 +398,7 @@ function showMainWindow() {
       mainWindow.center();
       mainWindow.show();
       mainWindow.focus();
+      mainWindow.webContents.focus();
       logWindowShown();
       return;
     }
@@ -408,6 +409,10 @@ function showMainWindow() {
     mainWindow.setBounds({ x: area.x, y: area.y, width: area.width + 1, height: area.height + 1 }, false);
     mainWindow.show();
     mainWindow.focus();
+    // Focus the renderer explicitly after the maximum-size bounds are applied.
+    // Some packed Windows shells otherwise keep keyboard focus on the desktop
+    // until the user clicks once, which reads as broken shortcuts.
+    mainWindow.webContents.focus();
     logWindowShown();
   } catch (error) {
     mainLog("warning", "electron", "show window failed", { message: error?.message });
