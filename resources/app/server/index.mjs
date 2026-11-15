@@ -7362,6 +7362,115 @@ app.post("/api/ai3d/generate", async (req, res) => {
 
 const ai3dJobs = new Map();
 const ai3dBridgeActivity = new Map();
+const AI3D_JOB_TITLE = "3D AI builder";
+const AI3D_ACTIVE_FILE = path.join(DATA_DIR, "ai3d-active.json");
+
+async function ai3dReadActiveRecords() {
+  const data = await readJson(AI3D_ACTIVE_FILE, []);
+  return Array.isArray(data) ? data.filter((item) => item && item.projectId) : [];
+}
+
+async function ai3dWriteActiveRecords(records) {
+  try {
+    await writeJsonAtomic(AI3D_ACTIVE_FILE, records.slice(-40));
+  } catch (error) {
+    log("warning", "ai3d", "could not persist active jobs", { message: error?.message });
+  }
+}
+
+async function ai3dTrackActive(record) {
+  if (!record?.jobId) return;
+  const records = await ai3dReadActiveRecords();
+  const index = records.findIndex((item) => item.jobId === record.jobId);
+  if (index >= 0) records[index] = { ...records[index], ...record };
+  else records.push(record);
+  await ai3dWriteActiveRecords(records);
+}
+
+async function ai3dUntrackActive(jobId) {
+  if (!jobId) return;
+  const records = await ai3dReadActiveRecords();
+  await ai3dWriteActiveRecords(records.filter((item) => item.jobId !== jobId));
+}
+
+async function ai3dAbortOpenCodeSession(state, sessionId) {
+  if (!state?.ready || !sessionId) return false;
+  try {
+    await ocFetch(state, `/session/${encodeURIComponent(String(sessionId))}/abort`, { method: "POST" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stop 3D AI work left over from a previous backend or app run. The active-job
+ * file is written when a job starts and removed when it ends, so anything still
+ * in it after a backend restart is stale. Aborting by the recorded session id
+ * and by the 3D AI session title covers both completed and half-created jobs.
+ * Jobs that are genuinely running in this process are never touched.
+ */
+async function ai3dTerminateStaleWork(projectId, state) {
+  const key = String(projectId || "");
+  if (!state?.ready || !key) return { aborted: [] };
+  const runningJobs = [...ai3dJobs.values()].filter(
+    (job) => job.projectId === key && job.status === "running",
+  );
+  const runningJobIds = new Set(runningJobs.map((job) => job.id));
+  const runningSessions = new Set(
+    runningJobs.map((job) => String(job.sessionId || "")).filter(Boolean),
+  );
+  const records = await ai3dReadActiveRecords();
+  const ids = new Set();
+  const remaining = [];
+  let dropped = 0;
+  for (const record of records) {
+    if (String(record.projectId) !== key) {
+      remaining.push(record);
+      continue;
+    }
+    if (runningJobIds.has(String(record.jobId || ""))) {
+      remaining.push(record);
+      continue;
+    }
+    dropped += 1;
+    const sessionId = String(record.sessionId || "");
+    if (sessionId && !runningSessions.has(sessionId)) ids.add(sessionId);
+  }
+  const sessions = await ocFetch(state, "/session").catch(() => null);
+  if (Array.isArray(sessions)) {
+    for (const session of sessions) {
+      if (String(session?.title || "") !== AI3D_JOB_TITLE) continue;
+      const id = String(session?.id || "");
+      if (id && !runningSessions.has(id)) ids.add(id);
+    }
+  }
+  const aborted = [];
+  for (const sessionId of ids) {
+    if (await ai3dAbortOpenCodeSession(state, sessionId)) aborted.push(sessionId);
+  }
+  if (dropped || remaining.length !== records.length) await ai3dWriteActiveRecords(remaining);
+  if (aborted.length) {
+    log("warning", "ai3d", "terminated stale AI work", { projectId: key, sessions: aborted.length });
+  }
+  return { aborted };
+}
+
+async function ai3dCancelJob(job, reason) {
+  if (!job) return false;
+  if (job.status === "running") {
+    job.status = "cancelled";
+    job.error = reason || "The AI request was cancelled. Completed scene changes are kept.";
+    job.updatedAt = Date.now();
+    job.abort?.abort();
+    job.abort = null;
+  }
+  const state = ocServers.get(job.projectId);
+  if (job.sessionId) await ai3dAbortOpenCodeSession(state, job.sessionId);
+  await ai3dUntrackActive(job.id);
+  return true;
+}
+
 
 function ai3dActivityList(projectId) {
   return (ai3dBridgeActivity.get(String(projectId || "")) || []).slice(-24).reverse();
@@ -7457,6 +7566,18 @@ function ai3dSystemPrompt(materialContext) {
     "- Example 6x4 m room floor: [{x:0,y:0,z:0},{x:6,y:0,z:0},{x:6,y:4,z:0},{x:0,y:4,z:0}]. Push/Pull that face by 0.15 for a slab, or draw walls as vertical polygons and Push/Pull them by their thickness.",
     "- Do not change the scene background, atmosphere, environment, lighting, camera projection or renderer look unless the user explicitly asks for that. Building geometry must not repaint the scene.",
     "- Never move or reframe the user's editor camera. Do not call viewport_set or any camera tool to look at your work. The user's view stays exactly where they left it. Use twix_scene_snapshot with your own hidden camera when you need to inspect placement.",
+    "Blueprint-first rule (mandatory for every build or scene edit):",
+    "- Before the first geometry, material or scene call, inspect first with twix_scene_inspect (and twix_sketch_inspect when a sketch exists), then call twix_scene_blueprint exactly once.",
+    "- The blueprint must be deep and complete: site envelope, every level, every room/zone, every asset with its final width, depth, height and world position, the material and colour plan, the colour swatches, and the ordered build phases. Compute exact numbers, not adjectives.",
+    "- For edits to an existing scene, include the existing groups, bounds and materials you are keeping in the blueprint, and list exactly which groups/faces change.",
+    "- Follow the blueprint exactly with the 3D tools. If you must change a dimension or position, update the blueprint with twix_scene_blueprint again before building the changed part.",
+    "Colour and material palette rule (mandatory):",
+    "- Every build or restyle starts by planning its colours. Call twix_paint_palette with named hex colours for all surfaces before drawing or painting.",
+    "- Use only the exact hex values registered with twix_paint_palette for twix_sketch_paint_faces and any object colour input. Do not invent a different shade for the same surface later.",
+    "- Library PBR materials are the first choice for realistic surfaces; procedural colour is the fallback when no suitable library material exists. The Paint swatches must still contain the build palette.",
+    "Attached reference images:",
+    "- The user may attach one or more photos of a real object, room, building or style. Study them before planning: silhouette, proportions, storey heights, roof form, openings, colours, materials and layout.",
+    "- The blueprint and the built scene must match the attached references unless the user explicitly asks for a variation. Mention which reference drove the design in your final summary.",
     "Visual inspection rules:",
     "- Call twix_scene_snapshot before starting and after major stages. It renders from a hidden camera and saves a PNG to the project references without touching the editor camera.",
     "- You may request perspective or orthographic projection, any FOV, and shaded, textured, hidden, xrayhidden, normal or UV looks. Use orthographic top views for room layout and perspective views for proportions.",
@@ -7510,26 +7631,62 @@ function ai3dSystemPrompt(materialContext) {
   ].join("\n");
 }
 
-async function runAi3dPrompt({ projectId, text, model, sessionId, signal }) {
+async function runAi3dPrompt({ projectId, text, model, sessionId, signal, images = [], jobId = "" }) {
   let state = ocServers.get(String(projectId));
   if (!state || state.stopped || !state.ready) {
     state = await startOpenCode(String(projectId), "prop", false);
   }
   if (!state) throw new Error("OpenCode could not start for this project.");
+  await ai3dTerminateStaleWork(projectId, state).catch(() => null);
   const materialContext = await ai3dMaterialContext();
   const system = ai3dSystemPrompt(materialContext);
+  let activeSessionId = sessionId ? String(sessionId) : "";
+  if (!activeSessionId) activeSessionId = await ocNewSession(state, AI3D_JOB_TITLE);
+  if (jobId) {
+    await ai3dTrackActive({
+      jobId,
+      projectId: String(projectId),
+      sessionId: activeSessionId,
+      title: AI3D_JOB_TITLE,
+      startedAt: Date.now(),
+    });
+  }
+  // A restored session can still have an old run attached to it. Stop that run
+  // before sending the new prompt so two builds never edit the same scene.
+  await ai3dAbortOpenCodeSession(state, activeSessionId);
+  const messageParts = [{ type: "text", text }];
+  for (const [index, image] of (Array.isArray(images) ? images : []).slice(0, 8).entries()) {
+    const dataUrl = String(image?.dataUrl || "");
+    if (!dataUrl.startsWith("data:image/")) continue;
+    const mime = String(image?.mime || dataUrl.slice(5, dataUrl.indexOf(";")) || "image/png");
+    messageParts.push({
+      type: "file",
+      mime,
+      filename: String(image?.name || `reference-${index + 1}.png`),
+      url: dataUrl,
+    });
+  }
   const sent = await ocSendMessage(state, {
-    sessionId: sessionId || null,
-    title: "3D AI builder",
+    sessionId: activeSessionId,
+    title: AI3D_JOB_TITLE,
     body: {
       model,
       agent: "build",
       system,
       tools: { "*": false, "twix_*": true },
-      parts: [{ type: "text", text }],
+      parts: messageParts,
     },
     signal,
   });
+  if (jobId && sent.sessionId && sent.sessionId !== activeSessionId) {
+    await ai3dTrackActive({
+      jobId,
+      projectId: String(projectId),
+      sessionId: sent.sessionId,
+      title: AI3D_JOB_TITLE,
+      startedAt: Date.now(),
+    });
+  }
   const response = sent.value;
   const parts = Array.isArray(response?.parts) ? response.parts : [];
   const responseText = cleanAssistantText(
@@ -7562,42 +7719,77 @@ async function runAi3dPrompt({ projectId, text, model, sessionId, signal }) {
 
 app.post("/api/ai3d/abort", async (req, res) => {
   try {
-    const { projectId, sessionId } = req.body || {};
+    const { projectId, sessionId, jobId } = req.body || {};
     const projectKey = String(projectId || "");
     let abortedJob = false;
+    const jobSessionIds = new Set();
     for (const job of ai3dJobs.values()) {
-      if (job.projectId !== projectKey || job.status !== "running") continue;
-      job.status = "cancelled";
-      job.error = "The AI request was cancelled. Completed scene changes are kept.";
-      job.updatedAt = Date.now();
-      job.abort?.abort();
-      job.abort = null;
-      abortedJob = true;
+      if (job.projectId !== projectKey) continue;
+      if (jobId && job.id !== String(jobId)) continue;
+      if (job.status === "running") abortedJob = true;
+      if (job.sessionId) jobSessionIds.add(String(job.sessionId));
+      await ai3dCancelJob(job, "The AI request was cancelled. Completed scene changes are kept.");
     }
     const state = ocServers.get(projectKey);
     if (!state?.ready) return res.json({ ok: true, aborted: abortedJob });
-    if (sessionId) {
-      await ocFetch(state, `/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }).catch(() => null);
-    } else {
+    const ids = new Set(jobSessionIds);
+    if (sessionId) ids.add(String(sessionId));
+    if (!ids.size) {
       const sessions = await ocFetch(state, "/session").catch(() => []);
-      const ids = (Array.isArray(sessions) ? sessions : [])
-        .slice()
-        .sort((a, b) => new Date(b.time?.updated || b.updated || 0).getTime() - new Date(a.time?.updated || a.updated || 0).getTime())
-        .slice(0, 4)
-        .map((session) => session.id)
-        .filter(Boolean);
-      for (const id of ids) {
-        await ocFetch(state, `/session/${encodeURIComponent(id)}/abort`, { method: "POST" }).catch(() => null);
+      for (const session of Array.isArray(sessions) ? sessions : []) {
+        if (String(session?.title || "") === AI3D_JOB_TITLE) ids.add(String(session.id));
       }
     }
-    res.json({ ok: true, aborted: true });
+    for (const id of ids) await ai3dAbortOpenCodeSession(state, id);
+    await ai3dTerminateStaleWork(projectKey, state).catch(() => null);
+    res.json({ ok: true, aborted: true, sessions: [...ids] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Explicit session/job termination. The panel calls this when a session is
+ * deleted or the user stops a restored session, and the scene bridge calls it
+ * before switching away from a library file. Unlike /abort it never falls back
+ * to "the most recent sessions"; it only stops the project's 3D AI work and the
+ * requested OpenCode session.
+ */
+app.post("/api/ai3d/terminate", async (req, res) => {
+  try {
+    const { projectId, sessionId } = req.body || {};
+    const projectKey = String(projectId || "");
+    let cancelled = 0;
+    for (const job of ai3dJobs.values()) {
+      if (job.projectId !== projectKey) continue;
+      if (sessionId && job.sessionId && String(job.sessionId) !== String(sessionId)) continue;
+      if (job.status === "running") cancelled += 1;
+      await ai3dCancelJob(job, "The AI session was terminated. Completed scene changes are kept.");
+    }
+    const state = ocServers.get(projectKey);
+    if (state?.ready) {
+      if (sessionId) await ai3dAbortOpenCodeSession(state, sessionId);
+      await ai3dTerminateStaleWork(projectKey, state).catch(() => null);
+    }
+    res.json({ ok: true, cancelled, sessionId: sessionId || null });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai3d/job/:id/terminate", async (req, res) => {
+  try {
+    const job = ai3dJobs.get(String(req.params.id || ""));
+    if (!job) return res.status(404).json({ ok: false, error: "That AI job is no longer available." });
+    await ai3dCancelJob(job, "The AI job was terminated. Completed scene changes are kept.");
+    res.json({ ok: true, jobId: job.id, status: job.status });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
 app.post("/api/ai3d/prompt", async (req, res) => {
-  const { prompt, projectId, model, sessionId, async: asyncJob } = req.body || {};
+  const { prompt, projectId, model, sessionId, async: asyncJob, images = [] } = req.body || {};
   const text = String(prompt || "").trim();
   if (!text) return res.status(400).json({ ok: false, error: "Describe what you want the AI to build." });
   if (!projectId) return res.status(400).json({ ok: false, error: "Open a project before asking the 3D AI." });
@@ -7632,6 +7824,8 @@ app.post("/api/ai3d/prompt", async (req, res) => {
           model,
           sessionId: job.sessionId || null,
           signal,
+          images,
+          jobId: job.id,
         });
         job.status = "done";
         job.text = result.text;
@@ -7655,6 +7849,7 @@ app.post("/api/ai3d/prompt", async (req, res) => {
       } finally {
         job.updatedAt = Date.now();
         job.abort = null;
+        await ai3dUntrackActive(job.id).catch(() => null);
         const cutoff = Date.now() - 30 * 60 * 1000;
         for (const [id, entry] of ai3dJobs) {
           if (entry.status !== "running" && entry.updatedAt < cutoff) ai3dJobs.delete(id);
@@ -7671,6 +7866,7 @@ app.post("/api/ai3d/prompt", async (req, res) => {
 
   let abortState = null;
   let abortSessionId = sessionId || "";
+  const syncJobId = `sync-${randomUUID()}`;
   res.on("close", () => {
     if (!res.writableEnded) {
       abort.abort();
@@ -7687,6 +7883,8 @@ app.post("/api/ai3d/prompt", async (req, res) => {
       model,
       sessionId: sessionId || null,
       signal,
+      images,
+      jobId: syncJobId,
     });
     res.json({ ok: true, text: result.text, sessionId: result.sessionId, tools: result.tools });
   } catch (error) {
@@ -7694,6 +7892,8 @@ app.post("/api/ai3d/prompt", async (req, res) => {
     if (!res.headersSent) {
       res.status(502).json({ ok: false, error: ai3dFriendlyError(error, String(projectId)) });
     }
+  } finally {
+    await ai3dUntrackActive(syncJobId).catch(() => null);
   }
 });
 
@@ -11456,6 +11656,7 @@ app.post("/api/opencode/connect", async (req, res) => {
   try {
     await loadProjectById(projectId);
     const state = await startOpenCode(projectId, workspace || "prop", Boolean(force));
+    await ai3dTerminateStaleWork(projectId, state).catch(() => null);
     const payload = await ocFetch(state, "/config/providers").catch(() => null);
     const providers = payload ? await normalizeProviders(payload) : [];
     const settings = await getSettings();
@@ -12767,9 +12968,26 @@ app.get("/api/bridge/library", async (req, res) => {
 
 app.post("/api/bridge/tool", async (req, res) => {
   const started = Date.now();
-  const { token, projectId, name, args } = req.body || {};
-  log("info", "bridge", "tool.call " + name, { projectId, args });
+  const { token, projectId, name, args, origin } = req.body || {};
+  log("info", "bridge", "tool.call " + name, { projectId, origin, args });
   if (token !== BRIDGE_TOKEN) return res.status(403).json({ error: "Bad bridge token" });
+  // Scene MCP calls belong to the 3D AI builder. After a restart, an OpenCode
+  // session can still be running hours-old work and would otherwise keep
+  // editing the scene in the background. Only a live 3D AI job may drive the
+  // scene through the scene MCP; the coding applet uses origin "coding".
+  if (origin === "scene") {
+    const running = [...ai3dJobs.values()].some(
+      (job) => job.projectId === String(projectId || "") && job.status === "running",
+    );
+    if (!running) {
+      return res.status(409).json({
+        ok: false,
+        stale: true,
+        error:
+          "No 3D AI build is running for this scene. This tool call came from a finished or stale AI session and was blocked so it cannot edit the scene in the background.",
+      });
+    }
+  }
   const set = clients.get(projectId);
   const sockets = set ? [...set].filter((c) => c.readyState === 1) : [];
   if (!sockets.length) {

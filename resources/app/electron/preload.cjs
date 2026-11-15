@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld("twixDesktop", {
   readClipboardText: () => ipcRenderer.invoke("clipboard:readText"),
   pasteClipboard: () => ipcRenderer.invoke("edit:paste"),
   pickDirectory: () => ipcRenderer.invoke("dialog:openDirectory"),
+  pickImages: () => ipcRenderer.invoke("dialog:openImages"),
   saveTextFile: (defaultName, content, filters) => ipcRenderer.invoke("file:saveText", { defaultName, content, filters }),
   openTextFile: (filters) => ipcRenderer.invoke("file:openText", { filters }),
   checkForUpdates: (force) => ipcRenderer.invoke("updates:check", Boolean(force)),

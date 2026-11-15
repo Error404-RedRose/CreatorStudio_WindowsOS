@@ -612,6 +612,39 @@ ipcMain.handle("file:openText", async (_event, payload = {}) => {
   if (stat.size > 100 * 1024 * 1024) throw new Error("File is larger than 100 MB.");
   return { path: filePath, name: path.basename(filePath), content: fs.readFileSync(filePath, "utf8") };
 });
+ipcMain.handle("dialog:openImages", async () => {
+  if (!mainWindow) return [];
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "Attach reference photos",
+    properties: ["openFile", "multiSelections"],
+    filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif", "bmp"] }],
+  });
+  if (result.canceled) return [];
+  const mimeByExt = {
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    webp: "image/webp",
+    gif: "image/gif",
+    bmp: "image/bmp",
+  };
+  const images = [];
+  for (const filePath of result.filePaths.slice(0, 8)) {
+    try {
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile() || stat.size > 20 * 1024 * 1024) continue;
+      const ext = path.extname(filePath).toLowerCase().replace(/^\./, "");
+      const mime = mimeByExt[ext];
+      if (!mime) continue;
+      images.push({
+        name: path.basename(filePath),
+        mime,
+        dataUrl: `data:${mime};base64,${fs.readFileSync(filePath).toString("base64")}`,
+      });
+    } catch {}
+  }
+  return images;
+});
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {

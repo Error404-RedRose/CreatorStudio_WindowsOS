@@ -63,6 +63,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       body: JSON.stringify({
         token: BRIDGE_TOKEN,
         projectId: PROJECT_ID,
+        origin: "scene",
         name,
         args: args || {},
       }),

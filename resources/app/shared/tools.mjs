@@ -64,6 +64,143 @@ export const tools = [
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
+    name: "scene_blueprint",
+    category: "inspect",
+    mutating: false,
+    description:
+      "Record the complete build blueprint before touching geometry. Call this once at the start of every build or scene edit with the site bounds, levels, zones, asset list (name, group, size, position, material and colour), material plan, colour swatches and build phases. The panel shows this blueprint as the job plan, and every later tool call must follow it exactly. For edits, inspect the existing scene first and include the unchanged context in the blueprint.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short name for the build, e.g. 'Two-storey brick cottage'." },
+        summary: { type: "string", description: "What the finished scene will contain and how it will be laid out." },
+        site: {
+          type: "object",
+          description: "Overall site and building envelope in metres.",
+          properties: {
+            width: { type: "number" },
+            depth: { type: "number" },
+            height: { type: "number" },
+            notes: { type: "string" },
+          },
+          additionalProperties: true,
+        },
+        levels: {
+          type: "array",
+          description: "Floors/levels with elevations and heights in metres.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              elevation: { type: "number" },
+              height: { type: "number" },
+              notes: { type: "string" },
+            },
+            additionalProperties: true,
+          },
+        },
+        zones: {
+          type: "array",
+          description: "Rooms, terraces, gardens or functional areas with world-space rectangles.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              purpose: { type: "string" },
+              x: { type: "number" },
+              y: { type: "number" },
+              width: { type: "number" },
+              depth: { type: "number" },
+            },
+            additionalProperties: true,
+          },
+        },
+        assets: {
+          type: "array",
+          description: "Every group/object to build with its final size and world position.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              group: { type: "string" },
+              width: { type: "number" },
+              depth: { type: "number" },
+              height: { type: "number" },
+              x: { type: "number" },
+              y: { type: "number" },
+              z: { type: "number" },
+              material: { type: "string" },
+              color: color,
+            },
+            additionalProperties: true,
+          },
+        },
+        materials: {
+          type: "array",
+          description: "Material brush plan per target surface or group.",
+          items: {
+            type: "object",
+            properties: {
+              target: { type: "string" },
+              material: { type: "string" },
+              color: color,
+              textureScale: { type: "number" },
+            },
+            additionalProperties: true,
+          },
+        },
+        colorSwatches: {
+          type: "array",
+          description: "Named colours the build will use. Pass the same values to paint_palette.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              color: color,
+            },
+            required: ["color"],
+            additionalProperties: true,
+          },
+        },
+        phases: {
+          type: "array",
+          description: "Ordered build phases, e.g. site, shell, roof, openings, furniture, materials.",
+          items: { type: "string" },
+        },
+        notes: { type: "string" },
+      },
+      required: ["title"],
+      additionalProperties: true,
+    },
+  },
+  {
+    name: "paint_palette",
+    category: "material",
+    mutating: false,
+    description:
+      "Register the build's colour swatches in the Paint panel before painting anything. Pass every named hex colour the blueprint uses. The colours appear in the user's swatches and are returned as the approved palette; use only those exact hex values with sketch_paint_faces, object_style and other colour inputs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        colors: {
+          type: "array",
+          description: "Named colours to add to the Paint swatches.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              color: color,
+            },
+            required: ["color"],
+            additionalProperties: true,
+          },
+        },
+      },
+      required: ["colors"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "selection_set",
     category: "scene",
     mutating: false,
