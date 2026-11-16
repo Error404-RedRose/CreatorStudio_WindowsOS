@@ -667,6 +667,21 @@ ipcMain.handle("file:saveText", async (_event, payload = {}) => {
   fs.writeFileSync(result.filePath, String(content ?? ""), "utf8");
   return result.filePath;
 });
+ipcMain.handle("file:saveBinary", async (_event, payload = {}) => {
+  if (!mainWindow) return null;
+  const { defaultName = "export.bin", data, filters } = payload || {};
+  const exportDir = path.join(app.getPath("documents"), "3D Creator Studio");
+  fs.mkdirSync(exportDir, { recursive: true });
+  const defaultPath = path.isAbsolute(defaultName) ? defaultName : path.join(exportDir, defaultName);
+  const result = await dialog.showSaveDialog(mainWindow, {
+    defaultPath,
+    filters: Array.isArray(filters) && filters.length ? filters : [{ name: "Binary", extensions: ["bin"] }],
+  });
+  if (result.canceled || !result.filePath) return null;
+  const buffer = Buffer.from(data instanceof ArrayBuffer ? new Uint8Array(data) : data || []);
+  fs.writeFileSync(result.filePath, buffer);
+  return result.filePath;
+});
 ipcMain.handle("file:openText", async (_event, payload = {}) => {
   if (!mainWindow) return null;
   const { filters } = payload || {};

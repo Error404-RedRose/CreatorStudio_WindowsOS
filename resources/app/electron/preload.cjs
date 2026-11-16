@@ -56,6 +56,7 @@ contextBridge.exposeInMainWorld("twixDesktop", {
   pickDirectory: () => ipcRenderer.invoke("dialog:openDirectory"),
   pickImages: () => ipcRenderer.invoke("dialog:openImages"),
   saveTextFile: (defaultName, content, filters) => ipcRenderer.invoke("file:saveText", { defaultName, content, filters }),
+  saveBinaryFile: (defaultName, data, filters) => ipcRenderer.invoke("file:saveBinary", { defaultName, data, filters }),
   openTextFile: (filters) => ipcRenderer.invoke("file:openText", { filters }),
   checkForUpdates: (force) => ipcRenderer.invoke("updates:check", Boolean(force)),
   applyUpdate: (force) => ipcRenderer.invoke("updates:apply", Boolean(force)),
