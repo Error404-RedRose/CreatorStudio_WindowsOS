@@ -499,30 +499,213 @@ class Transcriber:
 
 
 class HoldState:
-    """Physical right-control state read directly from Windows."""
+    """Global Right Control state for the push-to-talk key.
+
+    Windows reads the physical key through Win32 and also installs a keyboard
+    hook when the keyboard module is available. Linux uses the X11 keyboard
+    map (the packaged Linux build has no Win32 API) and also tries the optional
+    keyboard hook. The control file remains the fallback for headless or
+    compositor-restricted desktops.
+    """
 
     VK_RCONTROL = 0xA3
     VK_LCONTROL = 0xA2
+    XK_CONTROL_R = 0xFFE4
+    XK_CONTROL_L = 0xFFE3
 
     def __init__(self, hotkey: str):
         self.ok = False
         self.error = ""
         self.vk = self.VK_LCONTROL if "left" in hotkey.lower() else self.VK_RCONTROL
+        self._pressed = False
+        self._hook = False
+        self._hook_ready = threading.Event()
+        self._hook_thread = None
+        self._hook_proc = None
+        self._hook_handle = None
+        self._win32 = None
+        self._x11 = None
+        self._display = None
+        self._keycode = 0
+        name = "left ctrl" if "left" in hotkey.lower() else "right ctrl"
+        self._name = name
+        self._right = "left" not in hotkey.lower()
+        # Linux evdev scan codes: KEY_LEFTCTRL=29, KEY_RIGHTCTRL=97. The
+        # keyboard package reports the scan code even when both keys share a
+        # generic "ctrl" name, so the filter never confuses the two.
+        self._scan = 97 if self._right else 29
+
+        if sys.platform == "win32":
+            # A raw low-level hook reads vkCode directly. The keyboard package
+            # maps key_to_scan_codes("right ctrl") to (57629, 29, 57373), and
+            # scan code 29 is Left Ctrl, so its convenience hooks fired for the
+            # wrong physical key. vkCode 0xA3 is Right Ctrl and 0xA2 is Left Ctrl.
+            self._start_windows_hook()
+            try:
+                self._win32 = ctypes.windll.user32  # type: ignore[attr-defined]
+                log(f"[Hotkey] {hotkey} is global (virtual key 0x{self.vk:02X})")
+            except Exception as error:
+                self.error = str(error)
+                log(f"[WARN] Win32 hotkey unavailable ({error})")
+        elif sys.platform.startswith("linux"):
+            # X11 keymap is the most reliable path in the packaged Linux app.
+            try:
+                x11 = ctypes.CDLL("libX11.so.6")
+                x11.XOpenDisplay.restype = ctypes.c_void_p
+                x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+                x11.XKeysymToKeycode.restype = ctypes.c_uint
+                x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+                x11.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+                display = x11.XOpenDisplay(None)
+                if display:
+                    keysym = self.XK_CONTROL_L if not self._right else self.XK_CONTROL_R
+                    keycode = int(x11.XKeysymToKeycode(display, keysym))
+                    if keycode:
+                        self._x11 = x11
+                        self._display = display
+                        self._keycode = keycode
+                        log(f"[Hotkey] {hotkey} is global (X11 keycode {keycode})")
+                    else:
+                        self.error = "X11 did not return a Right Control keycode."
+                else:
+                    self.error = "No X11 display is available (Wayland/HDR session?)."
+            except Exception as error:
+                self.error = str(error)
+                log(f"[WARN] X11 hotkey unavailable ({error})")
+            # Optional evdev fallback for desktops where XQueryKeymap cannot
+            # see the physical key. Filtering by scan code keeps Left Ctrl out.
+            try:
+                import keyboard  # type: ignore
+
+                keyboard.hook(self._filter_hook, suppress=False)
+                self._hook = True
+                log(f"[Hotkey] {hotkey} global evdev keyboard hook active")
+            except Exception as error:
+                log(f"[WARN] Global evdev keyboard hook unavailable ({error})")
+
+        self.ok = bool(self._win32 or self._x11 or self._hook_enabled())
+        if not self.ok:
+            log("[WARN] Global hotkey unavailable; using the control file.")
+
+    def _start_windows_hook(self) -> None:
+        """Install a WH_KEYBOARD_LL hook that watches only vkCode 0xA3."""
         try:
-            self.user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-            self.ok = True
-            log(f"[Hotkey] {hotkey} is global (virtual key 0x{self.vk:02X})")
+            from ctypes import wintypes
         except Exception as error:
-            self.error = str(error)
-            log(f"[WARN] Global hotkey unavailable ({error}); using the control file.")
+            log(f"[WARN] Windows hook types unavailable ({error})")
+            return
+
+        WH_KEYBOARD_LL = 13
+        WM_KEYDOWN = 0x0100
+        WM_KEYUP = 0x0101
+        WM_SYSKEYDOWN = 0x0104
+        WM_SYSKEYUP = 0x0105
+        LRESULT = ctypes.c_ssize_t
+
+        class KbdHookStruct(ctypes.Structure):
+            _fields_ = [
+                ("vkCode", wintypes.DWORD),
+                ("scanCode", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_void_p),
+            ]
+
+        def run() -> None:
+            try:
+                user32 = ctypes.WinDLL("user32", use_last_error=True)
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                user32.SetWindowsHookExW.restype = ctypes.c_void_p
+                user32.SetWindowsHookExW.argtypes = [
+                    ctypes.c_int,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    wintypes.DWORD,
+                ]
+                user32.CallNextHookEx.restype = LRESULT
+                user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+                user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), ctypes.c_void_p, wintypes.UINT, wintypes.UINT]
+                user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+                user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+                kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+
+                def low_level_proc(n_code, w_param, l_param):
+                    try:
+                        if n_code == 0:
+                            info = ctypes.cast(l_param, ctypes.POINTER(KbdHookStruct)).contents
+                            if int(info.vkCode) == self.vk:
+                                if w_param in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                                    self._pressed = True
+                                elif w_param in (WM_KEYUP, WM_SYSKEYUP):
+                                    self._pressed = False
+                    except Exception:
+                        pass
+                    return user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+                self._hook_proc = ctypes.WINFUNCTYPE(
+                    LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+                )(low_level_proc)
+                handle = user32.SetWindowsHookExW(
+                    WH_KEYBOARD_LL,
+                    ctypes.cast(self._hook_proc, ctypes.c_void_p),
+                    kernel32.GetModuleHandleW(None),
+                    0,
+                )
+                if not handle:
+                    self.error = f"SetWindowsHookEx failed ({ctypes.get_last_error()})."
+                    log(f"[WARN] Windows keyboard hook unavailable ({self.error})")
+                    self._hook_ready.set()
+                    return
+                self._hook_handle = handle
+                self._hook = True
+                self._hook_ready.set()
+                log("[Hotkey] right ctrl Windows low-level hook active")
+                msg = wintypes.MSG()
+                while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+            except Exception as error:
+                self.error = str(error)
+                log(f"[WARN] Windows keyboard hook unavailable ({error})")
+                self._hook_ready.set()
+
+        self._hook_thread = threading.Thread(target=run, name="right-ctrl-hook", daemon=True)
+        self._hook_thread.start()
+        self._hook_ready.wait(1.5)
+
+    def _hook_enabled(self) -> bool:
+        return self._hook
+
+    def _filter_hook(self, event=None) -> None:
+        name = getattr(event, "name", "")
+        scan = getattr(event, "scan_code", None)
+        if self._right:
+            matched = name == "right ctrl" or (sys.platform.startswith("linux") and scan == self._scan)
+        else:
+            matched = name == "left ctrl" or (sys.platform.startswith("linux") and scan == self._scan)
+        if not matched:
+            return
+        self._pressed = getattr(event, "event_type", "") == "down"
 
     def held(self) -> bool:
-        if not self.ok:
-            return False
-        try:
-            return bool(self.user32.GetAsyncKeyState(self.vk) & 0x8000)
-        except Exception:
-            return False
+        if self._pressed:
+            return True
+        if self._win32 is not None:
+            try:
+                if self._win32.GetAsyncKeyState(self.vk) & 0x8000:
+                    return True
+            except Exception:
+                pass
+        if self._x11 is not None and self._display:
+            try:
+                keys = ctypes.create_string_buffer(32)
+                self._x11.XQueryKeymap(self._display, keys)
+                index = self._keycode // 8
+                bit = 1 << (self._keycode % 8)
+                return bool(keys.raw[index] & bit)
+            except Exception:
+                return False
+        return False
 
 
 class Microphone:
