@@ -207,6 +207,7 @@ const MODDING_DIR = modService.modsDir;
 const IS_PACKAGED = process.env.TWIX_PACKAGED === "1";
 
 const LOG_DIR = path.join(DATA_DIR, "logs");
+const WATCHDOG_DIR = path.join(DATA_DIR, "watchdog");
 const LOG_MAX_BYTES = 8 * 1024 * 1024;
 
 // Pre-prompt snapshots let the assistant recover the app source if an edit
@@ -13279,6 +13280,107 @@ app.post("/api/studio3d/sidecar", async (req, res) => {
     res.json({ ok: true, path: path.relative(folder, sidecar).replace(/\\/g, "/") });
   } catch (error) {
     res.status(400).json({ error: error.message });
+  }
+});
+
+function watchdogSessionName(value) {
+  return String(value || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
+}
+
+function watchdogSessionFile(session) {
+  const safe = watchdogSessionName(session);
+  if (!safe) throw new Error("A valid watchdog session id is required.");
+  return path.join(WATCHDOG_DIR, `${safe}.jsonl`);
+}
+
+app.post("/api/modeler/watchdog/start", async (req, res) => {
+  try {
+    const session = watchdogSessionName(req.body?.session);
+    if (!session) return res.status(400).json({ error: "A watchdog session id is required." });
+    await ensureDir(WATCHDOG_DIR);
+    const file = watchdogSessionFile(session);
+    const start = {
+      type: "session-start",
+      at: new Date().toISOString(),
+      session,
+      ...(req.body?.meta && typeof req.body.meta === "object" ? { meta: req.body.meta } : {}),
+    };
+    await fs.writeFile(file, JSON.stringify(start) + "\n", "utf8");
+    log("info", "modeler-watchdog", "session started", { session, path: file });
+    res.json({ ok: true, session, path: file });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/modeler/watchdog/append", async (req, res) => {
+  try {
+    const file = watchdogSessionFile(req.body?.session);
+    const entries = Array.isArray(req.body?.entries) ? req.body.entries.slice(0, 1000) : [];
+    if (!entries.length) return res.json({ ok: true, count: 0 });
+    await ensureDir(WATCHDOG_DIR);
+    const lines = entries
+      .filter((entry) => entry && typeof entry === "object")
+      .map((entry) => JSON.stringify(entry))
+      .join("\n");
+    if (lines) await fs.appendFile(file, lines + "\n", "utf8");
+    res.json({ ok: true, count: entries.length });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/modeler/watchdog/stop", async (req, res) => {
+  try {
+    const file = watchdogSessionFile(req.body?.session);
+    const summary = {
+      type: "session-stop",
+      at: new Date().toISOString(),
+      reason: String(req.body?.reason || "user"),
+      events: Number(req.body?.events || 0),
+      errors: Number(req.body?.errors || 0),
+      ...(req.body?.meta && typeof req.body.meta === "object" ? { meta: req.body.meta } : {}),
+    };
+    await fs.appendFile(file, JSON.stringify(summary) + "\n", "utf8");
+    log("info", "modeler-watchdog", "session stopped", { session: req.body?.session, events: summary.events, errors: summary.errors });
+    res.json({ ok: true, path: file, summary });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/modeler/watchdog/sessions", async (req, res) => {
+  try {
+    await ensureDir(WATCHDOG_DIR);
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit || 12)));
+    const names = await fs.readdir(WATCHDOG_DIR).catch(() => []);
+    const sessions = [];
+    for (const name of names) {
+      if (!name.endsWith(".jsonl")) continue;
+      const file = path.join(WATCHDOG_DIR, name);
+      const stat = await fs.stat(file).catch(() => null);
+      if (!stat) continue;
+      sessions.push({
+        session: name.slice(0, -6),
+        path: file,
+        bytes: stat.size,
+        modifiedAt: stat.mtime.toISOString(),
+      });
+    }
+    sessions.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
+    res.json({ ok: true, sessions: sessions.slice(0, limit) });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/modeler/watchdog/log", async (req, res) => {
+  try {
+    const file = watchdogSessionFile(req.query?.session);
+    const text = await fs.readFile(file, "utf8");
+    res.json({ ok: true, path: file, text });
+  } catch (error) {
+    res.status(404).json({ error: error.message });
   }
 });
 
