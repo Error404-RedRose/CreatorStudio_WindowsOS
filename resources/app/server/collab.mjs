@@ -113,6 +113,7 @@ export function createCollabService({ dataDir, appRoot, log = () => null }) {
     } catch {
       cache = { rooms: [] };
     }
+    for (const room of cache.rooms) startRoomWatcher(room);
     return cache;
   };
 
@@ -160,6 +161,62 @@ export function createCollabService({ dataDir, appRoot, log = () => null }) {
   const addEvent = (room, text, severity = "info") => {
     room.events = [...(room.events || []), { at: new Date().toISOString(), text, severity }].slice(-80);
   };
+
+  /* Realtime file sync: watch the host project and refresh the room manifest as
+   * soon as Unity saves an asset, script or scene. Members poll the room state
+   * every few seconds and pull the new version automatically. */
+  const roomWatchers = new Map();
+  const roomWatchTimers = new Map();
+  const roomRefreshing = new Set();
+
+  function stopRoomWatcher(roomId) {
+    const watcher = roomWatchers.get(roomId);
+    if (watcher) {
+      try {
+        watcher.close();
+      } catch {}
+    }
+    roomWatchers.delete(roomId);
+    const timer = roomWatchTimers.get(roomId);
+    if (timer) clearTimeout(timer);
+    roomWatchTimers.delete(roomId);
+  }
+
+  function startRoomWatcher(room) {
+    if (!room?.id || roomWatchers.has(room.id)) return;
+    if (!fssync.existsSync(room.root)) return;
+    const schedule = (filename) => {
+      if (filename && ignored(String(filename).replace(/\\/g, "/"))) return;
+      const previous = roomWatchTimers.get(room.id);
+      if (previous) clearTimeout(previous);
+      roomWatchTimers.set(
+        room.id,
+        setTimeout(async () => {
+          roomWatchTimers.delete(room.id);
+          if (roomRefreshing.has(room.id)) return;
+          roomRefreshing.add(room.id);
+          try {
+            await refreshRoom(room.id, room.token);
+          } catch (error) {
+            log("warning", "collab", "live refresh failed", { id: room.id, message: error.message });
+          } finally {
+            roomRefreshing.delete(room.id);
+          }
+        }, 1200),
+      );
+    };
+    try {
+      const watcher = fssync.watch(room.root, { recursive: true }, (_event, filename) => {
+        schedule(filename);
+      });
+      watcher.on("error", () => stopRoomWatcher(room.id));
+      roomWatchers.set(room.id, watcher);
+    } catch {
+      // Some filesystems cannot watch recursively. Fall back to a light poll.
+      const timer = setInterval(() => schedule(""), 12000);
+      roomWatchers.set(room.id, { close: () => clearInterval(timer) });
+    }
+  }
 
   async function attachBridge(root, room) {
     const source = path.join(appRoot, "unity", "com.twilightstudio.creatorstudio");
@@ -225,6 +282,7 @@ export function createCollabService({ dataDir, appRoot, log = () => null }) {
     const store = await load();
     store.rooms.unshift(room);
     await save();
+    startRoomWatcher(room);
     log("info", "collab", "room created", { id: room.id, root: room.root, files: room.manifest.count });
     return room;
   }
@@ -361,6 +419,7 @@ export function createCollabService({ dataDir, appRoot, log = () => null }) {
     const room = await requireRoom(id, token);
     const store = await load();
     store.rooms = store.rooms.filter((item) => item.id !== id);
+    stopRoomWatcher(id);
     await fs.rm(path.join(snapshotsDir, id), { recursive: true, force: true }).catch(() => null);
     await save();
     log("info", "collab", "room deleted", { id });

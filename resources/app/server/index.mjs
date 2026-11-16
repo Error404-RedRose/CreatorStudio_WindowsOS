@@ -326,7 +326,131 @@ app.use((req, res, next) => {
 app.use("/api/collab", collabService.router);
 
 const server = createHttpServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
+// A single HTTP server serves both the AI bridge and the local coding shell.
+// Two path-scoped WebSocketServer instances fight over the upgrade event (the
+// first one rejects the other path with HTTP 400), so route upgrades manually.
+const wss = new WebSocketServer({ noServer: true });
+
+/* Local coding console shell. Each tab owns its cwd; commands stream back over
+ * the authenticated local bridge. Commands are manual, not AI tool calls, so
+ * the user sees the exact command and output. */
+const codingShellWss = new WebSocketServer({ noServer: true });
+server.on("upgrade", (req, socket, head) => {
+  let pathname = "";
+  try {
+    pathname = new URL(req.url || "/", "http://127.0.0.1").pathname;
+  } catch {
+    socket.destroy();
+    return;
+  }
+  if (pathname === "/ws/coding-shell") {
+    codingShellWss.handleUpgrade(req, socket, head, (ws) => codingShellWss.emit("connection", ws, req));
+    return;
+  }
+  if (pathname === "/ws") {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+    return;
+  }
+  socket.destroy();
+});
+codingShellWss.on("connection", (ws) => {
+  let cwd = process.cwd();
+  let running = null;
+  let buffer = "";
+  const send = (payload) => {
+    if (ws.readyState === 1) ws.send(JSON.stringify(payload));
+  };
+  const stopRunning = () => {
+    if (!running) return;
+    try {
+      killProcessTree(running);
+    } catch {}
+    running = null;
+  };
+  ws.on("message", async (raw) => {
+    let message = null;
+    try {
+      message = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    if (!message || typeof message !== "object") return;
+    if (message.type === "init") {
+      try {
+        cwd = resolveCodingRoot(String(message.root || ""));
+        send({ type: "ready", cwd, shell: process.platform === "win32" ? "cmd" : process.env.SHELL || "bash" });
+      } catch (error) {
+        send({ type: "error", message: error.message });
+      }
+      return;
+    }
+    if (message.type === "cancel") {
+      stopRunning();
+      send({ type: "cancelled", cwd });
+      return;
+    }
+    if (message.type !== "run") return;
+    const command = String(message.command || "").trim();
+    if (!command) return;
+    if (running) {
+      send({ type: "error", message: "Wait for the current command to finish, or press Stop." });
+      return;
+    }
+    // Keep cd in the server session so the next command really runs in the
+    // directory the prompt shows. Drive switches (cd /d D:\...) are accepted.
+    const cdMatch = command.match(/^(?:cd|chdir)(?:\s+|\s*$)(.*)$/i);
+    if (cdMatch) {
+      let target = cdMatch[1].trim().replace(/^\/d\s+/i, "").replace(/^["']|["']$/g, "");
+      if (!target) target = os.homedir();
+      const absolute = path.resolve(cwd, expandUserPath(target) || target);
+      try {
+        const stat = await fs.stat(absolute);
+        if (!stat.isDirectory()) throw new Error("Not a folder: " + absolute);
+        cwd = absolute;
+        send({ type: "cwd", cwd });
+        send({ type: "exit", code: 0, cwd });
+      } catch (error) {
+        send({ type: "stderr", data: error.message + "\n" });
+        send({ type: "exit", code: 1, cwd });
+      }
+      return;
+    }
+    send({ type: "start", command, cwd });
+    const child = spawn(command, {
+      cwd,
+      shell: true,
+      windowsHide: true,
+      env: { ...process.env, FORCE_COLOR: "0", TERM: "dumb", PYTHONUNBUFFERED: "1" },
+    });
+    running = child;
+    const timer = setTimeout(() => {
+      send({ type: "stderr", data: "\nCommand stopped after 10 minutes.\n" });
+      stopRunning();
+    }, 10 * 60 * 1000);
+    const forward = (stream, type) => {
+      stream.on("data", (chunk) => {
+        buffer += chunk.toString();
+        if (buffer.length > 120000) buffer = buffer.slice(-120000);
+        send({ type, data: chunk.toString() });
+      });
+    };
+    forward(child.stdout, "stdout");
+    forward(child.stderr, "stderr");
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      send({ type: "stderr", data: error.message + "\n" });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      running = null;
+      send({ type: "exit", code: typeof code === "number" ? code : -1, cwd });
+    });
+  });
+  ws.on("close", () => {
+    stopRunning();
+  });
+});
+
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
