@@ -266,8 +266,18 @@ try {
   }
   Write-Log ("Starting " + $newExePath)
   Start-Process -FilePath $newExePath -WorkingDirectory $InstallDir
-  Write-Log ("Update complete. Previous build saved to " + $backup)
-  Start-Sleep -Seconds 2
+  Write-Log ("Update complete. Removing the temporary rollback backup " + $backup)
+  # Do not leave a full copy of the previous install beside the new one on
+  # every update. The previous version can always be downloaded again.
+  for ($attempt = 0; $attempt -lt 10; $attempt++) {
+    if (-not (Test-Path -LiteralPath $backup)) { break }
+    try {
+      Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction Stop
+    } catch {
+      Start-Sleep -Milliseconds 500
+    }
+  }
+  Start-Sleep -Seconds 1
   Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
   exit 0
 } catch {

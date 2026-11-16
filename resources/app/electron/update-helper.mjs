@@ -343,7 +343,19 @@ async function main() {
       log(`Starting ${newExecutable}`);
       await startApp(newExecutable, installDir);
     }
-    log("Update complete. Previous build kept at " + backup);
+    log("Update complete. The temporary rollback backup will now be removed.");
+    // Keeping a full copy of the previous install next to the new one left
+    // users with a growing pile of "Creator Studio backup <timestamp>"
+    // folders. The previous version is always downloadable again, so remove
+    // the rollback copy once the new build is running.
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      try {
+        await fs.rm(backup, { recursive: true, force: true });
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
     await fs.rm(work, { recursive: true, force: true }).catch(() => {});
     process.exit(0);
   } catch (error) {

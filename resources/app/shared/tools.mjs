@@ -512,6 +512,22 @@ export const tools = [
     },
   },
   {
+    name: "sketch_set_visibility",
+    category: "selection",
+    mutating: true,
+    description:
+      "Hide or show sketch faces, sketch groups, the sketch model, or imported objects by id. This is the Outliner eyeball action and accepts several ids for one undo step.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ids: { type: "array", items: { type: "string" } },
+        visible: { type: "boolean", description: "true shows, false hides." },
+      },
+      required: ["ids", "visible"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "sketch_paint_faces",
     category: "material",
     mutating: true,
