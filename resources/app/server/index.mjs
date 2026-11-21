@@ -8779,6 +8779,26 @@ async function loadReferenceIndex() {
     index = rawReferenceIndexCache.index;
   } else {
     index = await readJson(REFERENCE_INDEX_FILE(), { updatedAt: null, entries: [] });
+    // Older indexes stored whole page bodies and up to 200 keywords per entry.
+    // Normalise once on load: search then scans a fraction of the text, and the
+    // next write shrinks the file instead of carrying the old bulk forward.
+    if (Array.isArray(index.entries)) {
+      const seenIds = new Set();
+      const entries = [];
+      for (const entry of index.entries) {
+        if (!entry || !entry.id || seenIds.has(entry.id)) continue;
+        seenIds.add(entry.id);
+        entries.push({
+          ...entry,
+          summary: String(entry.summary || "").slice(0, REFERENCE_STORED_SUMMARY),
+          text: String(entry.text || "").slice(0, REFERENCE_STORED_TEXT),
+          keywords: Array.isArray(entry.keywords)
+            ? entry.keywords.slice(0, REFERENCE_STORED_KEYWORDS)
+            : [],
+        });
+      }
+      index = { ...index, entries };
+    }
     rawReferenceIndexCache = { key: cacheKey, index };
   }
   try {
@@ -8808,10 +8828,10 @@ async function loadReferenceIndex() {
 const REFERENCE_INDEX_TTL = 24 * 60 * 60 * 1000;
 // A stuck "running" flag from a crashed pass must not lock the index forever.
 const REFERENCE_INDEX_LOCK_TTL = 30 * 60 * 1000;
-const REFERENCE_INDEX_MAX_ENTRIES = 9000;
+const REFERENCE_INDEX_MAX_ENTRIES = 14000;
 // Separate budgets: a large folder library must never push saved URLs out.
-const REFERENCE_INDEX_LOCAL_BUDGET = 6400;
-const REFERENCE_INDEX_URL_BUDGET = 2600;
+const REFERENCE_INDEX_LOCAL_BUDGET = 8000;
+const REFERENCE_INDEX_URL_BUDGET = 5000;
 // Full page bodies were the reason a re-index could allocate gigabytes and
 // black-screen the renderer. Keep enough text to read and search, not the
 // whole page.
@@ -9417,7 +9437,10 @@ function searchReferenceEntries(index, query, limit = 10, options = {}) {
     keywords: (entry.keywords || []).join(" ").toLowerCase(),
     location: String(entry.path || entry.url || "").toLowerCase(),
     summary: String(entry.summary || "").toLowerCase(),
-    text: String(entry.text || "").toLowerCase(),
+    // Only a short prefix is ever needed to prove a keyword hit. Copying and
+    // lowercasing every full 12 KB page body made a large index take seconds
+    // per search and blocked the whole server.
+    text: String(entry.text || "").toLowerCase().slice(0, 1200),
     media: REFERENCE_MEDIA_EXT.test(String(entry.path || entry.url || "")),
   }));
   const expanded = terms.map((term) => expandSearchTerm(term));
