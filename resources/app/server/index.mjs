@@ -8719,11 +8719,24 @@ const REFERENCE_INDEX_FILE = () => path.join(DATA_DIR, "reference-index.json");
 const REFERENCE_NOTES_FILE = () => path.join(DATA_DIR, "reference-index.md");
 
 function tokenizeReference(text) {
-  return String(text || "")
+  // Keywords are the search dictionary pre-flight research runs on. Keep one
+  // copy of every meaningful word, skip filler ("the", "and") that would eat
+  // the budget, and allow enough variety for a real file or page: the old
+  // first-120-raw-tokens rule let stop words and duplicates from a file's
+  // opening lines push every later keyword out of the index.
+  const seen = new Set();
+  const out = [];
+  for (const word of String(text || "")
     .toLowerCase()
-    .split(/[^a-z0-9_+#.-]+/i)
-    .filter((word) => word.length > 2)
-    .slice(0, 120);
+    .split(/[^a-z0-9_+#.-]+/i)) {
+    if (word.length <= 2) continue;
+    if (seen.has(word)) continue;
+    if (RESEARCH_STOPWORDS.has(word)) continue;
+    seen.add(word);
+    out.push(word);
+    if (out.length >= 200) break;
+  }
+  return out;
 }
 
 function stripHtml(html) {
@@ -8741,8 +8754,23 @@ function stripHtml(html) {
     .trim();
 }
 
+let rawReferenceIndexCache = { key: "", index: null };
+
 async function loadReferenceIndex() {
-  const index = await readJson(REFERENCE_INDEX_FILE(), { updatedAt: null, entries: [] });
+  let stat = null;
+  try {
+    stat = await fs.stat(REFERENCE_INDEX_FILE());
+  } catch {
+    stat = null;
+  }
+  const cacheKey = stat ? stat.size + ":" + stat.mtimeMs : "missing";
+  let index;
+  if (rawReferenceIndexCache.index && rawReferenceIndexCache.key === cacheKey) {
+    index = rawReferenceIndexCache.index;
+  } else {
+    index = await readJson(REFERENCE_INDEX_FILE(), { updatedAt: null, entries: [] });
+    rawReferenceIndexCache = { key: cacheKey, index };
+  }
   try {
     const github = await loadGithubIndex();
     const githubEntries = githubReferenceEntries(github);
@@ -8762,7 +8790,7 @@ async function loadReferenceIndex() {
 const REFERENCE_INDEX_TTL = 10 * 60 * 1000;
 // Folder trees can be huge. Keep a generous overall cap but reserve room for
 // URL entries so a large asset library can never push documentation out.
-const REFERENCE_INDEX_MAX_ENTRIES = 8000;
+const REFERENCE_INDEX_MAX_ENTRIES = 10000;
 
 function referenceSourceSignature(settings) {
   const folders = (settings.references?.folders || [])
@@ -8968,7 +8996,13 @@ async function scanReferenceLink(link, entries, maxDepth = 1) {
         headers: { "User-Agent": "3D-Creator-Studio/0.2 reference indexer" },
         signal: AbortSignal.timeout(7000),
       });
-      if (!response.ok) return;
+      if (!response.ok) {
+        // A blocked or missing page (403 bot walls, 404s, 5xx) must still
+        // leave its saved link in the index, or that source disappears from
+        // pre-flight research completely.
+        pushLinkFallback(url, link, label, depth, entries);
+        return;
+      }
       const type = response.headers.get("content-type") || "";
       if (type && !type.includes("text/html") && !type.includes("text/plain") && !type.includes("xhtml")) {
         pushLinkFallback(url, link, label, depth, entries);
@@ -9033,7 +9067,7 @@ async function writeReferenceIndex(index) {
     "",
     "Generated " + index.updatedAt,
     "",
-    ...index.entries.slice(0, 8000).map((entry) => {
+    ...index.entries.slice(0, REFERENCE_INDEX_MAX_ENTRIES).map((entry) => {
       const location = entry.url || entry.path || "";
       return "- [" + entry.type + "] **" + entry.title + "** - " + location + "\n  " + (entry.summary || "");
     }),
@@ -9052,9 +9086,13 @@ async function scanReferenceSources(settingsOverride) {
   for (const folder of folders) await scanReferenceFolder(folder, folderEntries, perFolder);
   const linkEntries = [];
   await scanLinksConcurrently(links, linkEntries);
-  // URL entries go first: they are the smallest and most frequently lost when
-  // the overall cap is applied to a folder-heavy index.
-  const entries = [...linkEntries, ...folderEntries];
+  // Cap priority: the primary page of every saved link first, then folder
+  // files, then link sub-pages. Every source keeps at least its root entry
+  // even when the index is full, so no folder or link silently drops out of
+  // pre-flight research.
+  const primaryLinks = linkEntries.filter((entry) => (entry.depth || 0) >= 1);
+  const subLinks = linkEntries.filter((entry) => (entry.depth || 0) < 1);
+  const entries = [...primaryLinks, ...folderEntries, ...subLinks];
   const index = {
     updatedAt: new Date().toISOString(),
     signature: referenceSourceSignature(settings),
@@ -9388,6 +9426,8 @@ async function referencePreflight(text, limit = 10) {
     // background for the next prompt.
     if (stale) scheduleReferenceIndex(400);
     const entries = index.entries || [];
+    const settings = await getSettings().catch(() => null);
+    const coverage = settings ? referenceIndexCoverage(index, settings) : null;
     const counts = {
       total: entries.length,
       local: entries.filter((entry) => REFERENCE_SCOPE_TYPES.local.includes(entry.type)).length,
@@ -9407,7 +9447,18 @@ async function referencePreflight(text, limit = 10) {
     const urls = search(REFERENCE_SCOPE_TYPES.url, 4);
     const github = search(REFERENCE_SCOPE_TYPES.github, 4);
     const matches = [...local, ...urls, ...github].slice(0, Math.max(1, limit));
-    return { updatedAt, total: counts.total, counts, matches, local, urls, github, stale };
+    return {
+      updatedAt,
+      total: counts.total,
+      counts,
+      matches,
+      local,
+      urls,
+      github,
+      stale,
+      coverage,
+      terms: researchTerms(text, 8),
+    };
   } catch {
     return {
       updatedAt: null,
@@ -9535,19 +9586,37 @@ function buildPreflightBriefing(text, local, remote, elapsedMs) {
   const counts = {
     references: local.matches.length,
     referenceIndexEntries: local.total,
+    localEntries: local.counts?.local ?? 0,
+    urlEntries: local.counts?.url ?? 0,
+    githubEntries: local.counts?.github ?? 0,
     localMatches: local.local?.length || 0,
     urlMatches: local.urls?.length || 0,
     githubKnowledgeMatches: local.github?.length || 0,
     repositories: remote.repositories.length,
     code: remote.code.length,
+    sourcesIndexed: local.coverage?.sourcesIndexed ?? 0,
+    sourcesTotal: local.coverage?.sourcesTotal ?? 0,
+    terms: (local.terms || []).join(", "),
   };
   lines.push(
     "",
     "## Index coverage",
-    "- Local folder/file entries: " + (local.counts?.local ?? 0) + " (" + (local.local?.length || 0) + " matched)",
-    "- URL/documentation entries: " + (local.counts?.url ?? 0) + " (" + (local.urls?.length || 0) + " matched)",
-    "- Indexed GitHub knowledge entries: " + (local.counts?.github ?? 0) + " (" + (local.github?.length || 0) + " matched)",
+    "- Local folder/file entries: " + (local.counts?.local ?? 0) + " (" + (local.local?.length || 0) + " matched this prompt)",
+    "- URL/documentation entries: " + (local.counts?.url ?? 0) + " (" + (local.urls?.length || 0) + " matched this prompt)",
+    "- Indexed GitHub knowledge entries: " + (local.counts?.github ?? 0) + " (" + (local.github?.length || 0) + " matched this prompt)",
   );
+  if (local.coverage) {
+    lines.push(
+      "- Saved sources represented: " +
+        local.coverage.sourcesIndexed +
+        " of " +
+        local.coverage.sourcesTotal +
+        " folders/links (the rest are queued for indexing)",
+    );
+  }
+  if (local.terms?.length) {
+    lines.push("- Search terms: " + local.terms.join(", "));
+  }
   const section = (title, entries, hint) => {
     if (!entries?.length) {
       lines.push("", "## " + title, "No indexed entry matched this prompt's keywords.");
@@ -9854,6 +9923,28 @@ app.post("/api/references/scan-links", async (req, res) => {
   }
 });
 
+/** How many saved folders/links actually have at least one entry in the index. */
+function referenceIndexCoverage(index, settings) {
+  const folderIds = new Set((settings.references?.folders || []).map((folder) => folder.id));
+  const linkIds = new Set((settings.references?.links || []).map((link) => link.id));
+  const seen = new Set();
+  for (const entry of index.entries || []) {
+    if (entry.sourceId) seen.add(entry.sourceId);
+  }
+  let foldersIndexed = 0;
+  let linksIndexed = 0;
+  for (const id of seen) {
+    if (folderIds.has(id)) foldersIndexed += 1;
+    else if (linkIds.has(id)) linksIndexed += 1;
+  }
+  return {
+    sourcesIndexed: foldersIndexed + linksIndexed,
+    sourcesTotal: folderIds.size + linkIds.size,
+    foldersIndexed,
+    linksIndexed,
+  };
+}
+
 app.get("/api/references/status", async (req, res) => {
   try {
     const settings = await getSettings();
@@ -9879,6 +9970,7 @@ app.get("/api/references/status", async (req, res) => {
         folders: settings.references?.folders?.length || 0,
         links: settings.references?.links?.length || 0,
       },
+      coverage: referenceIndexCoverage(index, settings),
       ttlMs: REFERENCE_INDEX_TTL,
     });
   } catch (error) {
