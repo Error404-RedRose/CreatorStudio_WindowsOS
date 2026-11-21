@@ -8726,7 +8726,8 @@ function tokenizeReference(text) {
   const seen = new Set();
   const out = [];
   const add = (word) => {
-    if (!word || word.length <= 2) return;
+    if (!word) return;
+    if (word.length <= 2 && !SIGNIFICANT_SHORT_TERMS.has(word)) return;
     if (seen.has(word)) return;
     if (RESEARCH_STOPWORDS.has(word)) return;
     seen.add(word);
@@ -9526,40 +9527,67 @@ async function globalLearningContextFor(query, workspace = "") {
 // Pre-flight research. Every coding prompt runs these searches BEFORE the
 // model is called, so related GitHub projects and indexed local references are
 // already in its system context before the first command or file edit.
+// Short tokens that carry real signal in a 3D / coding reference library and
+// must survive the usual length filter ("3d", "2d"). Kept deliberately tiny so
+// substring matches stay precise; other short terms would match too many words.
+const SIGNIFICANT_SHORT_TERMS = new Set(["3d", "2d"]);
+
 const RESEARCH_STOPWORDS = new Set([
-  "the", "and", "for", "with", "that", "this", "from", "have", "has", "are", "was", "were", "you", "your",
-  "can", "could", "should", "would", "will", "just", "like", "need", "needs", "want", "wants", "make",
-  "makes", "made", "use", "using", "used", "into", "about", "when", "where", "what", "which", "how",
-  "why", "all", "any", "but", "not", "out", "get", "got", "its", "also", "then", "than", "them", "they",
-  "there", "here", "some", "more", "most", "very", "much", "many", "one", "two", "new", "old", "app",
-  "application", "project", "code", "coding", "stuff", "thing", "things", "something", "please", "help",
-  "build", "building", "create", "creating", "file", "files", "add", "adding", "fix", "fixing", "update",
-  "updating", "change", "changing", "start", "starting", "first", "next", "after", "before", "over",
-  "existing", "current", "same", "already", "work", "works", "working", "able", "want", "wanted", "look",
-  "looks", "good", "better", "best", "set", "sets", "setting", "settings", "run", "running", "write",
-  "writing", "line", "lines", "way", "ways", "time", "times", "every", "each", "other", "only", "own",
-  "through", "between", "under", "while", "until", "because", "since", "does", "put", "puts", "take",
-  "takes", "give", "gives", "show", "shows", "keep", "keeps", "adds", "remove", "removes", "edit",
-  "edits", "updates", "changes", "thing", "maybe", "sure", "really", "actually", "currently",
-  "github", "search", "find", "random", "lookup", "research",
+  // Articles, pronouns, conjunctions and prepositions.
+  "the", "and", "for", "with", "that", "this", "from", "have", "has", "are", "was", "were", "you",
+  "your", "can", "could", "should", "would", "will", "just", "like", "need", "needs", "want", "wants",
+  "make", "makes", "made", "use", "using", "used", "into", "about", "when", "where", "what", "which",
+  "how", "why", "all", "any", "but", "not", "out", "get", "got", "its", "also", "then", "than", "them",
+  "they", "there", "here", "some", "more", "most", "very", "much", "many", "one", "two", "new", "old",
+  "stuff", "thing", "things", "something", "please", "help", "create", "creating", "add", "adding",
+  "adds", "fix", "fixing", "start", "starting", "first", "next", "after", "before", "over", "existing",
+  "current", "same", "already", "work", "works", "working", "able", "wanted", "look", "looks", "good",
+  "better", "best", "way", "ways", "time", "times", "every", "each", "other", "only", "own", "through",
+  "between", "under", "while", "until", "because", "since", "does", "put", "puts", "take", "takes",
+  "give", "gives", "show", "shows", "keep", "keeps", "remove", "removes", "maybe", "sure", "really",
+  "actually", "currently", "random", "application", "someone", "anyone", "nobody",
 ]);
 
 function researchTerms(input, limit = 12) {
-  const seen = new Set();
-  const out = [];
-  const words = String(input || "")
-    .replace(/```[\s\S]*?```/g, " ")
-    .toLowerCase()
-    .split(/[^a-z0-9_+#.:-]+/i)
-    .map((word) => word.replace(/^[.:-]+|[.:-]+$/g, ""))
-    .filter((word) => word.length >= 3 && !RESEARCH_STOPWORDS.has(word));
-  for (const word of words) {
-    if (seen.has(word)) continue;
-    seen.add(word);
-    out.push(word);
-    if (out.length >= limit) break;
+  const raw = String(input || "").replace(/```[\s\S]*?```/g, " ");
+  const counts = new Map();
+  const first = new Map();
+  const order = [];
+  const add = (token, position) => {
+    const term = String(token || "").toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
+    if (!term) return;
+    if (term.length <= 2 && !SIGNIFICANT_SHORT_TERMS.has(term)) return;
+    if (RESEARCH_STOPWORDS.has(term)) return;
+    if (!counts.has(term)) {
+      counts.set(term, 0);
+      first.set(term, position);
+      order.push(term);
+    }
+    counts.set(term, counts.get(term) + 1);
+  };
+  let position = 0;
+  for (const token of raw.split(/[^a-z0-9_+#.:-]+/i)) {
+    position += 1;
+    if (!token) continue;
+    // Keep the full token (internal "-" / "_" preserved) so hyphenated
+    // concepts like "pre-flight" survive, then add each part too so a prompt
+    // word like "faces" still matches an identifier like "rebuildFaces".
+    add(token, position);
+    const expanded = token.replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+    for (const part of expanded.split(/[^a-zA-Z0-9]+/)) add(part, position);
   }
-  return out;
+  const scored = order.map((term) => {
+    const freq = counts.get(term) || 1;
+    const pos = first.get(term) || 0;
+    // Repeats and longer words are the strongest signals of the real topic;
+    // position is only a gentle tiebreaker so a distinctive late word still
+    // outranks a generic early one.
+    const lengthBoost = 1 + Math.min(term.length, 12) * 0.07;
+    const score = (freq + 0.4) * lengthBoost * (1 + 0.4 / (4 + pos * 0.15));
+    return { term, score };
+  });
+  scored.sort((a, b) => b.score - a.score || a.term.localeCompare(b.term));
+  return scored.slice(0, Math.max(1, limit)).map((item) => item.term);
 }
 
 const REFERENCE_SCOPE_TYPES = {
@@ -10265,6 +10293,56 @@ app.get("/api/references/index", async (req, res) => {
   try {
     const index = await loadReferenceIndex();
     res.json({ ok: true, updatedAt: index.updatedAt, count: index.entries?.length || 0, entries: (index.entries || []).slice(0, 300) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/references/keywords", async (req, res) => {
+  try {
+    const index = await loadReferenceIndex();
+    const entries = index.entries || [];
+    const query = String(req.query.q || "").toLowerCase().trim();
+    const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 300)));
+    const offset = Math.max(0, Number(req.query.offset || 0));
+    // Aggregate every indexed keyword into a dictionary of term -> entry count
+    // with a per-scope breakdown (local folders/files, URLs, GitHub). A term
+    // that maps to many entries is a busy topic; a rare term is a precise
+    // discriminator the AI and the user can lean on for manual lookup.
+    const map = new Map();
+    for (const entry of entries) {
+      const keywords = entry.keywords || [];
+      const seen = new Set();
+      const scope = REFERENCE_SCOPE_TYPES.local.includes(entry.type)
+        ? "local"
+        : REFERENCE_SCOPE_TYPES.url.includes(entry.type)
+          ? "url"
+          : "github";
+      for (const keyword of keywords) {
+        const term = String(keyword).toLowerCase();
+        if (!term || seen.has(term)) continue;
+        seen.add(term);
+        let record = map.get(term);
+        if (!record) {
+          record = { term, count: 0, local: 0, url: 0, github: 0 };
+          map.set(term, record);
+        }
+        record.count += 1;
+        record[scope] += 1;
+      }
+    }
+    let list = [...map.values()];
+    if (query) list = list.filter((record) => record.term.includes(query));
+    list.sort((a, b) => b.count - a.count || a.term.localeCompare(b.term));
+    const totalKeywords = list.length;
+    const totalConnections = list.reduce((sum, record) => sum + record.count, 0);
+    res.json({
+      ok: true,
+      updatedAt: index.updatedAt,
+      totalKeywords,
+      totalConnections,
+      keywords: list.slice(offset, offset + limit),
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
