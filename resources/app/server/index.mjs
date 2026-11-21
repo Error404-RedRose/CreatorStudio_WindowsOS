@@ -8721,19 +8721,27 @@ const REFERENCE_NOTES_FILE = () => path.join(DATA_DIR, "reference-index.md");
 function tokenizeReference(text) {
   // Keywords are the search dictionary pre-flight research runs on. Keep one
   // copy of every meaningful word, skip filler ("the", "and") that would eat
-  // the budget, and allow enough variety for a real file or page: the old
-  // first-120-raw-tokens rule let stop words and duplicates from a file's
-  // opening lines push every later keyword out of the index.
+  // the budget, and split code identifiers (camelCase, snake_case, kebab)
+  // so a prompt word like "faces" can still find "rebuildFaces".
   const seen = new Set();
   const out = [];
+  const add = (word) => {
+    if (!word || word.length <= 2) return;
+    if (seen.has(word)) return;
+    if (RESEARCH_STOPWORDS.has(word)) return;
+    seen.add(word);
+    out.push(word);
+  };
   for (const word of String(text || "")
     .toLowerCase()
     .split(/[^a-z0-9_+#.-]+/i)) {
-    if (word.length <= 2) continue;
-    if (seen.has(word)) continue;
-    if (RESEARCH_STOPWORDS.has(word)) continue;
-    seen.add(word);
-    out.push(word);
+    add(word);
+    if (/[a-z0-9]+[_.-][a-z0-9]+/.test(word)) {
+      for (const part of word.split(/[_.-]+/)) add(part);
+    }
+    if (/[a-z][a-z0-9]*[A-Z]/.test(word)) {
+      for (const part of word.replace(/([a-z0-9])([A-Z])/g, "$1 $2").split(/\s+/)) add(part);
+    }
     if (out.length >= 200) break;
   }
   return out;
@@ -8805,6 +8813,9 @@ function referenceSourceSignature(settings) {
 function referenceIndexIsFresh(index, signature) {
   if (!index?.updatedAt || !Array.isArray(index.entries)) return false;
   if (index.signature && index.signature !== signature) return false;
+  // A pass interrupted by an app restart must resume, never count as fresh,
+  // or a 600-source library that never finished stays "done" forever.
+  if (index.progress?.running === true) return false;
   const age = Date.now() - new Date(index.updatedAt).getTime();
   return Number.isFinite(age) && age >= 0 && age < REFERENCE_INDEX_TTL;
 }
@@ -8813,6 +8824,27 @@ let referenceIndexChain = Promise.resolve();
 let referenceIndexJob = null;
 let referenceIndexTimer = null;
 const referenceSourceTimers = new Map();
+
+/** Live state of the current full index pass, shown in the UI and status API. */
+const referenceIndexProgress = {
+  running: false,
+  done: 0,
+  total: 0,
+  current: "",
+  startedAt: null,
+  lastError: "",
+};
+
+function referenceProgressSnapshot() {
+  return {
+    running: referenceIndexProgress.running,
+    done: referenceIndexProgress.done,
+    total: referenceIndexProgress.total,
+    current: referenceIndexProgress.current,
+    startedAt: referenceIndexProgress.startedAt,
+    lastError: referenceIndexProgress.lastError || "",
+  };
+}
 
 function runReferenceIndexJob(job) {
   const run = referenceIndexChain.then(job, job);
@@ -8830,8 +8862,15 @@ async function autoIndexReferences(options = {}) {
     if (!force && referenceIndexIsFresh(index, signature)) {
       return { ok: true, skipped: true, updatedAt: index.updatedAt, count: index.entries.length, signature };
     }
-    const next = await scanReferenceSources(settings);
-    return { ok: true, skipped: false, updatedAt: next.updatedAt, count: next.entries.length, signature: next.signature };
+    const next = await scanReferenceSources(settings, { resume: !force });
+    return {
+      ok: true,
+      skipped: false,
+      updatedAt: next.updatedAt,
+      count: next.entries.length,
+      signature: next.signature,
+      progress: referenceProgressSnapshot(),
+    };
   });
   referenceIndexJob = job;
   try {
@@ -8911,6 +8950,29 @@ function scheduleReferenceIndexCleanup(sourceId) {
   }).catch(() => {});
 }
 
+/**
+ * High-signal words from a source file: exported names, classes, functions
+ * and markdown headings across the whole file, not just its first screen.
+ */
+function collectCodeIdentifiers(text) {
+  const raw = String(text || "");
+  if (!raw) return "";
+  const found = [];
+  const push = (name) => {
+    const clean = String(name || "").trim();
+    if (clean && found.length < 120) found.push(clean);
+  };
+  const patterns = [
+    /(?:^|\n)\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:async\s+)?(?:abstract\s+)?(?:function|class|const|let|var|interface|type|enum|struct|impl|trait|module|namespace)\s+([A-Za-z0-9_$]+)/g,
+    /(?:^|\n)\s*(?:def|class|fn|func|function|sub|proc)\s+([A-Za-z0-9_]+)/g,
+    /(?:^|\n)#{1,4}\s+(.{3,80})$/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of raw.matchAll(pattern)) push(match[1]);
+  }
+  return found.join(" ");
+}
+
 async function scanReferenceFolder(folder, entries, maxEntries = 2000) {
   const root = path.resolve(folder.path);
   if (!fssync.existsSync(root) || !fssync.statSync(root).isDirectory()) return;
@@ -8955,7 +9017,17 @@ async function scanReferenceFolder(folder, entries, maxEntries = 2000) {
         folderId: folder.id,
         folderLabel: folder.label,
         bytes: stat.size,
-        keywords: tokenizeReference(folder.label + " " + relative + " " + text.slice(0, 4000)),
+        keywords: tokenizeReference(
+          folder.label +
+            " " +
+            relative +
+            " " +
+            collectCodeIdentifiers(text) +
+            " " +
+            text.slice(0, 4000) +
+            " " +
+            text.slice(Math.max(0, text.length - 2000)),
+        ),
         summary: textExt ? stripHtml(text).slice(0, 500) : "Reference file: " + name,
         text: text.slice(0, 8000),
         updatedAt: new Date().toISOString(),
@@ -8993,7 +9065,14 @@ async function scanReferenceLink(link, entries, maxDepth = 1) {
     visited.add(url);
     try {
       const response = await fetch(url, {
-        headers: { "User-Agent": "3D-Creator-Studio/0.2 reference indexer" },
+        // Documentation sites commonly 403 unknown bot agents. A
+        // browser-grade UA keeps the indexer honest (it still identifies
+        // itself) while letting the crawl actually read the page.
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 CreatorStudioReferenceIndexer/0.14",
+          Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
+        },
         signal: AbortSignal.timeout(7000),
       });
       if (!response.ok) {
@@ -9015,6 +9094,12 @@ async function scanReferenceLink(link, entries, maxDepth = 1) {
       }
       const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
       const descriptionMatch = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i);
+      const keywordsMatch = html.match(/<meta[^>]+name=["']keywords["'][^>]+content=["']([^"']+)["']/i);
+      // Headings name the real topic of a page far better than body prose.
+      const headings = [...html.matchAll(/<h[12][^>]*>([\s\S]*?)<\/h[12]>/gi)]
+        .map((match) => stripHtml(match[1]))
+        .join(" ")
+        .slice(0, 600);
       const text = stripHtml(html).slice(0, 12000);
       const title = stripHtml(titleMatch?.[1] || label || url).slice(0, 180);
       entries.push({
@@ -9025,7 +9110,9 @@ async function scanReferenceLink(link, entries, maxDepth = 1) {
         url,
         linkId: link.id,
         linkLabel: link.label,
-        keywords: tokenizeReference(link.label + " " + title + " " + text.slice(0, 5000)),
+        keywords: tokenizeReference(
+          link.label + " " + title + " " + (keywordsMatch?.[1] || "") + " " + headings + " " + text.slice(0, 5000),
+        ),
         summary: stripHtml(descriptionMatch?.[1] || text.slice(0, 500)).slice(0, 700),
         text: text.slice(0, 12000),
         depth,
@@ -9075,30 +9162,94 @@ async function writeReferenceIndex(index) {
   await fs.writeFile(REFERENCE_NOTES_FILE(), notes, "utf8");
 }
 
-async function scanReferenceSources(settingsOverride) {
+async function scanReferenceSources(settingsOverride, options = {}) {
   const settings = settingsOverride || (await getSettings());
   const folders = settings.references?.folders || [];
   const links = settings.references?.links || [];
-  const folderEntries = [];
-  // Share the folder budget across every saved folder, so one enormous Unity
-  // library cannot hide the smaller folders.
+  const signature = referenceSourceSignature(settings);
+  const existing = await loadReferenceIndex();
+
+  // An interrupted pass over the same sources resumes instead of restarting:
+  // sources finished before the restart keep their freshly written entries.
+  const resumable =
+    options.resume === true &&
+    existing?.signature === signature &&
+    existing.progress?.running === true &&
+    Array.isArray(existing.progress?.doneIds);
+  const doneIds = resumable ? new Set(existing.progress.doneIds) : new Set();
+
+  referenceIndexProgress.running = true;
+  referenceIndexProgress.total = folders.length + links.length;
+  referenceIndexProgress.done = doneIds.size;
+  referenceIndexProgress.current = "";
+  referenceIndexProgress.startedAt = resumable ? existing.progress.startedAt : new Date().toISOString();
+  referenceIndexProgress.lastError = "";
+
+  // Pending sources keep their previous entries visible until each one is
+  // re-scanned, so coverage never goes down during a pass.
+  const entries = (existing.entries || []).filter((entry) => !entry.sourceId || !doneIds.has(entry.sourceId));
+  let lastFlush = 0;
+  const flush = async (force) => {
+    const now = Date.now();
+    if (!force && now - lastFlush < 2500) return;
+    lastFlush = now;
+    await writeJsonAtomic(REFERENCE_INDEX_FILE(), {
+      updatedAt: new Date().toISOString(),
+      signature,
+      entries: entries.slice(0, REFERENCE_INDEX_MAX_ENTRIES),
+      progress: {
+        running: true,
+        done: referenceIndexProgress.done,
+        total: referenceIndexProgress.total,
+        current: referenceIndexProgress.current,
+        startedAt: referenceIndexProgress.startedAt,
+        doneIds: [...doneIds],
+      },
+    });
+  };
+
   const perFolder = Math.max(200, Math.min(2000, Math.floor(6000 / Math.max(1, folders.length))));
-  for (const folder of folders) await scanReferenceFolder(folder, folderEntries, perFolder);
-  const linkEntries = [];
-  await scanLinksConcurrently(links, linkEntries);
-  // Cap priority: the primary page of every saved link first, then folder
-  // files, then link sub-pages. Every source keeps at least its root entry
-  // even when the index is full, so no folder or link silently drops out of
-  // pre-flight research.
-  const primaryLinks = linkEntries.filter((entry) => (entry.depth || 0) >= 1);
-  const subLinks = linkEntries.filter((entry) => (entry.depth || 0) < 1);
-  const entries = [...primaryLinks, ...folderEntries, ...subLinks];
+  const scanSource = async (kind, source) => {
+    if (doneIds.has(source.id)) return;
+    referenceIndexProgress.current =
+      (kind === "folder" ? "Folder: " : "Link: ") +
+      String(source.label || source.url || source.path || "").slice(0, 90);
+    for (let i = entries.length - 1; i >= 0; i -= 1) {
+      if (entries[i].sourceId === source.id) entries.splice(i, 1);
+    }
+    try {
+      if (kind === "folder") await scanReferenceFolder(source, entries, perFolder);
+      else await scanReferenceLink(source, entries, 1);
+    } catch (error) {
+      referenceIndexProgress.lastError = String(error?.message || error).slice(0, 200);
+    }
+    doneIds.add(source.id);
+    referenceIndexProgress.done += 1;
+    await flush(false);
+  };
+
+  // Folders are disk-bound and stay sequential; links are network-bound and
+  // crawl in a worker pool so a 600-link library finishes in minutes while
+  // writing progress the whole way instead of one all-or-nothing crawl.
+  for (const folder of folders) await scanSource("folder", folder);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < links.length) {
+      const link = links[cursor++];
+      await scanSource("link", link);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(8, links.length)) }, () => worker()));
+  await flush(true);
+
   const index = {
     updatedAt: new Date().toISOString(),
-    signature: referenceSourceSignature(settings),
+    signature,
     entries: entries.slice(0, REFERENCE_INDEX_MAX_ENTRIES),
   };
   await writeReferenceIndex(index);
+  referenceIndexProgress.running = false;
+  referenceIndexProgress.current = "";
   return index;
 }
 
@@ -9171,6 +9322,7 @@ function searchReferenceEntries(index, query, limit = 10, options = {}) {
     let score = 0;
     let strong = false;
     let rareHit = false;
+    const matchedTerms = [];
     for (const term of terms) {
       const weight = 1 / (1 + Math.log(1 + (documentFrequency.get(term) || 0)));
       let termScore = 0;
@@ -9190,18 +9342,19 @@ function searchReferenceEntries(index, query, limit = 10, options = {}) {
       }
       if (item.summary.includes(term)) termScore += 1;
       if (item.text.includes(term)) termScore += 1;
+      if (termScore > 0) matchedTerms.push(term);
       score += termScore * weight;
     }
     if (!strong || score <= 0) continue;
     if (strict && requireRare && !rareHit) continue;
-    scored.push({ entry: item.entry, score });
+    scored.push({ entry: item.entry, score, matchedTerms });
   }
   scored.sort((a, b) => b.score - a.score);
   const best = scored[0]?.score || 0;
   return scored
     .filter((item) => item.score >= (strict ? Math.max(2, best * 0.35) : Math.max(1.2, best * 0.2)))
     .slice(0, Math.max(1, Math.min(30, limit)))
-    .map((item) => item.entry);
+    .map((item) => ({ ...item.entry, matchedTerms: item.matchedTerms }));
 }
 
 const globalLearningFilesCache = { at: 0, files: [] };
@@ -9457,6 +9610,7 @@ async function referencePreflight(text, limit = 10) {
       github,
       stale,
       coverage,
+      progress: referenceProgressSnapshot(),
       terms: researchTerms(text, 8),
     };
   } catch {
@@ -9597,26 +9751,58 @@ function buildPreflightBriefing(text, local, remote, elapsedMs) {
     sourcesIndexed: local.coverage?.sourcesIndexed ?? 0,
     sourcesTotal: local.coverage?.sourcesTotal ?? 0,
     terms: (local.terms || []).join(", "),
+    topMatches: (local.matches || []).slice(0, 3).map((entry) => String(entry.title || "").slice(0, 60)),
+    indexing: local.progress?.running
+      ? local.progress.done + " of " + local.progress.total + " sources" +
+        (local.progress.current ? " (" + local.progress.current + ")" : "")
+      : "",
   };
+
+  // Index snapshot: what was actually searchable when this prompt ran.
   lines.push(
     "",
-    "## Index coverage",
-    "- Local folder/file entries: " + (local.counts?.local ?? 0) + " (" + (local.local?.length || 0) + " matched this prompt)",
-    "- URL/documentation entries: " + (local.counts?.url ?? 0) + " (" + (local.urls?.length || 0) + " matched this prompt)",
-    "- Indexed GitHub knowledge entries: " + (local.counts?.github ?? 0) + " (" + (local.github?.length || 0) + " matched this prompt)",
+    "## Index snapshot",
+    "- Local folders & files: " + (local.counts?.local ?? 0) + " entries searched, " + (local.local?.length || 0) + " matched",
+    "- Documentation URLs: " + (local.counts?.url ?? 0) + " entries searched, " + (local.urls?.length || 0) + " matched",
+    "- GitHub knowledge: " + (local.counts?.github ?? 0) + " entries searched, " + (local.github?.length || 0) + " matched",
   );
   if (local.coverage) {
+    const complete = local.coverage.sourcesIndexed >= local.coverage.sourcesTotal;
     lines.push(
-      "- Saved sources represented: " +
+      "- Coverage: " +
         local.coverage.sourcesIndexed +
         " of " +
         local.coverage.sourcesTotal +
-        " folders/links (the rest are queued for indexing)",
+        " saved sources have indexed entries" +
+        (complete ? " (complete)" : " (the rest are queued for indexing)"),
+    );
+  }
+  if (local.progress?.running) {
+    lines.push(
+      "- Indexing in progress: " +
+        local.progress.done +
+        " of " +
+        local.progress.total +
+        " sources done" +
+        (local.progress.current ? ", currently: " + local.progress.current : "") +
+        ". Matches keep improving as sources land; this prompt searched what is indexed so far.",
+    );
+  }
+  if (local.updatedAt) {
+    const ageMinutes = Math.max(0, Math.round((Date.now() - new Date(local.updatedAt).getTime()) / 60000));
+    lines.push("- Index last updated " + (ageMinutes === 0 ? "just now" : ageMinutes + " minutes ago"));
+  }
+  if (local.stale) {
+    lines.push(
+      "- The reference index is cold or older than " +
+        Math.round(REFERENCE_INDEX_TTL / 60000) +
+        " minutes; a background refresh was queued for the next prompt.",
     );
   }
   if (local.terms?.length) {
     lines.push("- Search terms: " + local.terms.join(", "));
   }
+
   const section = (title, entries, hint) => {
     if (!entries?.length) {
       lines.push("", "## " + title, "No indexed entry matched this prompt's keywords.");
@@ -9625,7 +9811,11 @@ function buildPreflightBriefing(text, local, remote, elapsedMs) {
     lines.push("", "## " + title + " (" + entries.length + " matches)");
     for (const entry of entries.slice(0, 6)) {
       const location = entry.url || entry.path || "";
-      lines.push("- [" + entry.type + "] " + entry.title + " - " + location + " (id: " + entry.id + ")");
+      const why =
+        Array.isArray(entry.matchedTerms) && entry.matchedTerms.length
+          ? " - matched: " + entry.matchedTerms.slice(0, 4).join(", ")
+          : "";
+      lines.push("- [" + entry.type + "] " + entry.title + " - " + location + " (id: " + entry.id + ")" + why);
       if (entry.summary) lines.push("  " + String(entry.summary).replace(/\s+/g, " ").slice(0, 240));
     }
     if (hint) lines.push(hint);
@@ -9645,14 +9835,6 @@ function buildPreflightBriefing(text, local, remote, elapsedMs) {
     local.github,
     "These repositories or files were indexed earlier from Global Learning. Open one with coding_reference_read before downloading it again.",
   );
-  if (local.stale) {
-    lines.push(
-      "",
-      "The reference index is cold or older than " +
-        Math.round(REFERENCE_INDEX_TTL / 60000) +
-        " minutes; a background refresh was queued for the next prompt.",
-    );
-  }
   if (remote.repositories.length) {
     lines.push("", "## GitHub repositories (" + remote.repositories.length + " matches)");
     for (const repo of remote.repositories) {
@@ -9965,6 +10147,7 @@ app.get("/api/references/status", async (req, res) => {
       },
       stale: !referenceIndexIsFresh(index, signature),
       busy: Boolean(referenceIndexJob),
+      progress: referenceProgressSnapshot(),
       signature,
       sources: {
         folders: settings.references?.folders?.length || 0,
