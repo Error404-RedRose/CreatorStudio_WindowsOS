@@ -8743,7 +8743,7 @@ function tokenizeReference(text) {
     if (/[a-z][a-z0-9]*[A-Z]/.test(word)) {
       for (const part of word.replace(/([a-z0-9])([A-Z])/g, "$1 $2").split(/\s+/)) add(part);
     }
-    if (out.length >= 200) break;
+    if (out.length >= REFERENCE_STORED_KEYWORDS) break;
   }
   return out;
 }
@@ -8764,6 +8764,7 @@ function stripHtml(html) {
 }
 
 let rawReferenceIndexCache = { key: "", index: null };
+let githubMergeCache = { key: "", at: 0, index: null };
 
 async function loadReferenceIndex() {
   let stat = null;
@@ -8781,13 +8782,18 @@ async function loadReferenceIndex() {
     rawReferenceIndexCache = { key: cacheKey, index };
   }
   try {
+    if (githubMergeCache.index && githubMergeCache.key === cacheKey && Date.now() - githubMergeCache.at < 15000) {
+      return githubMergeCache.index;
+    }
     const github = await loadGithubIndex();
     const githubEntries = githubReferenceEntries(github);
     if (!githubEntries.length) return index;
     const known = new Set((index.entries || []).map((entry) => entry.id));
     const extra = githubEntries.filter((entry) => !known.has(entry.id));
     if (!extra.length) return index;
-    return { ...index, entries: [...extra, ...(index.entries || [])] };
+    const merged = { ...index, entries: [...extra, ...(index.entries || [])] };
+    githubMergeCache = { key: cacheKey, at: Date.now(), index: merged };
+    return merged;
   } catch {
     return index;
   }
@@ -8796,10 +8802,22 @@ async function loadReferenceIndex() {
 // The index is rebuilt automatically at app load and after a source changes.
 // A signature of the saved folders/links makes that cheap: an index that
 // already matches the sources is reused instead of re-crawled.
-const REFERENCE_INDEX_TTL = 10 * 60 * 1000;
-// Folder trees can be huge. Keep a generous overall cap but reserve room for
-// URL entries so a large asset library can never push documentation out.
-const REFERENCE_INDEX_MAX_ENTRIES = 10000;
+// A completed index stays valid until the saved sources actually change. The
+// old 10-minute TTL re-crawled hundreds of sources over and over and made the
+// index look like it was constantly losing itself.
+const REFERENCE_INDEX_TTL = 24 * 60 * 60 * 1000;
+// A stuck "running" flag from a crashed pass must not lock the index forever.
+const REFERENCE_INDEX_LOCK_TTL = 30 * 60 * 1000;
+const REFERENCE_INDEX_MAX_ENTRIES = 9000;
+// Separate budgets: a large folder library must never push saved URLs out.
+const REFERENCE_INDEX_LOCAL_BUDGET = 6400;
+const REFERENCE_INDEX_URL_BUDGET = 2600;
+// Full page bodies were the reason a re-index could allocate gigabytes and
+// black-screen the renderer. Keep enough text to read and search, not the
+// whole page.
+const REFERENCE_STORED_TEXT = 2400;
+const REFERENCE_STORED_SUMMARY = 420;
+const REFERENCE_STORED_KEYWORDS = 120;
 
 function referenceSourceSignature(settings) {
   const folders = (settings.references?.folders || [])
@@ -8811,14 +8829,82 @@ function referenceSourceSignature(settings) {
   return createHash("sha1").update(JSON.stringify({ folders, links })).digest("hex");
 }
 
+function referenceIndexLockIsStale(index) {
+  const started = index?.progress?.startedAt
+    ? new Date(index.progress.startedAt).getTime()
+    : 0;
+  if (!Number.isFinite(started) || started <= 0) return true;
+  return Date.now() - started > REFERENCE_INDEX_LOCK_TTL;
+}
+
 function referenceIndexIsFresh(index, signature) {
   if (!index?.updatedAt || !Array.isArray(index.entries)) return false;
   if (index.signature && index.signature !== signature) return false;
-  // A pass interrupted by an app restart must resume, never count as fresh,
-  // or a 600-source library that never finished stays "done" forever.
+  // A pass interrupted by an app restart resumes. It is never "fresh" until
+  // the pass completes, and an old (stale) lock must also resume rather than
+  // freeze the index as permanently partial.
   if (index.progress?.running === true) return false;
+  if (index.complete === false) return false;
   const age = Date.now() - new Date(index.updatedAt).getTime();
   return Number.isFinite(age) && age >= 0 && age < REFERENCE_INDEX_TTL;
+}
+
+function referenceEntryScope(entry) {
+  const type = String(entry?.type || "");
+  if (type === "url") return "url";
+  if (type === "github-repo" || type === "github-file") return "github";
+  return "local";
+}
+
+/**
+ * Fair, deterministic cap. Entries are grouped per source and handed out
+ * round-robin, so one giant folder can never consume the whole budget and
+ * saved links are guaranteed their own reserved slice. Duplicate ids are
+ * removed, which is what made the index look like it shrank and grew at
+ * random between passes.
+ */
+function capReferenceEntries(entries) {
+  const seen = new Set();
+  const unique = [];
+  for (const entry of entries || []) {
+    if (!entry || !entry.id || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    unique.push(entry);
+  }
+  const pick = (kind, budget) => {
+    const groups = new Map();
+    for (const entry of unique) {
+      if (referenceEntryScope(entry) !== kind) continue;
+      const key = String(entry.sourceId || entry.type || "misc");
+      let list = groups.get(key);
+      if (!list) {
+        list = [];
+        groups.set(key, list);
+      }
+      list.push(entry);
+    }
+    const lists = [...groups.values()];
+    const out = [];
+    let cursor = 0;
+    while (out.length < budget) {
+      let progressed = false;
+      for (const list of lists) {
+        if (out.length >= budget) break;
+        if (cursor < list.length) {
+          out.push(list[cursor]);
+          progressed = true;
+        }
+      }
+      if (!progressed) break;
+      cursor += 1;
+    }
+    return out;
+  };
+  return [
+    ...pick("local", REFERENCE_INDEX_LOCAL_BUDGET),
+    ...pick("url", REFERENCE_INDEX_URL_BUDGET),
+    ...pick("github", Math.max(0, REFERENCE_INDEX_MAX_ENTRIES - REFERENCE_INDEX_LOCAL_BUDGET - REFERENCE_INDEX_URL_BUDGET)),
+  ].slice(0, REFERENCE_INDEX_MAX_ENTRIES);
 }
 
 let referenceIndexChain = Promise.resolve();
@@ -8913,7 +8999,8 @@ async function refreshReferenceSource(kind, id) {
     const next = {
       updatedAt: new Date().toISOString(),
       signature: referenceSourceSignature(settings),
-      entries: [...kept, ...added].slice(0, REFERENCE_INDEX_MAX_ENTRIES),
+      complete: index.complete !== false,
+      entries: capReferenceEntries([...kept, ...added]),
     };
     await writeReferenceIndex(next);
     log("info", "references", "source re-indexed", { kind, id, added: added.length, count: next.entries.length });
@@ -8946,7 +9033,8 @@ function scheduleReferenceIndexCleanup(sourceId) {
     await writeReferenceIndex({
       updatedAt: new Date().toISOString(),
       signature: referenceSourceSignature(settings),
-      entries,
+      complete: index.complete !== false,
+      entries: capReferenceEntries(entries),
     });
   }).catch(() => {});
 }
@@ -9029,8 +9117,10 @@ async function scanReferenceFolder(folder, entries, maxEntries = 2000) {
             " " +
             text.slice(Math.max(0, text.length - 2000)),
         ),
-        summary: textExt ? stripHtml(text).slice(0, 500) : "Reference file: " + name,
-        text: text.slice(0, 8000),
+        summary: textExt
+          ? stripHtml(text).slice(0, REFERENCE_STORED_SUMMARY)
+          : "Reference file: " + name,
+        text: text.slice(0, REFERENCE_STORED_TEXT),
         updatedAt: new Date().toISOString(),
       });
     }
@@ -9112,10 +9202,13 @@ async function scanReferenceLink(link, entries, maxDepth = 1) {
         linkId: link.id,
         linkLabel: link.label,
         keywords: tokenizeReference(
-          link.label + " " + title + " " + (keywordsMatch?.[1] || "") + " " + headings + " " + text.slice(0, 5000),
+          link.label + " " + title + " " + (keywordsMatch?.[1] || "") + " " + headings + " " + text.slice(0, 2500),
         ),
-        summary: stripHtml(descriptionMatch?.[1] || text.slice(0, 500)).slice(0, 700),
-        text: text.slice(0, 12000),
+        summary: stripHtml(descriptionMatch?.[1] || text.slice(0, 500)).slice(
+          0,
+          REFERENCE_STORED_SUMMARY,
+        ),
+        text: text.slice(0, REFERENCE_STORED_TEXT),
         depth,
         updatedAt: new Date().toISOString(),
       });
@@ -9149,18 +9242,22 @@ async function scanLinksConcurrently(links, entries) {
 }
 
 async function writeReferenceIndex(index) {
-  await writeJsonAtomic(REFERENCE_INDEX_FILE(), index);
+  const entries = capReferenceEntries(index.entries);
+  const next = { ...index, entries };
+  await writeJsonAtomic(REFERENCE_INDEX_FILE(), next);
   const notes = [
     "# Reference Index",
     "",
-    "Generated " + index.updatedAt,
+    "Generated " + next.updatedAt,
     "",
-    ...index.entries.slice(0, REFERENCE_INDEX_MAX_ENTRIES).map((entry) => {
+    ...entries.slice(0, 2000).map((entry) => {
       const location = entry.url || entry.path || "";
       return "- [" + entry.type + "] **" + entry.title + "** - " + location + "\n  " + (entry.summary || "");
     }),
+    ...(entries.length > 2000 ? ["", `... ${entries.length - 2000} more entries in reference-index.json`] : []),
   ].join("\n");
   await fs.writeFile(REFERENCE_NOTES_FILE(), notes, "utf8");
+  return next;
 }
 
 async function scanReferenceSources(settingsOverride, options = {}) {
@@ -9195,9 +9292,12 @@ async function scanReferenceSources(settingsOverride, options = {}) {
     if (!force && now - lastFlush < 2500) return;
     lastFlush = now;
     await writeJsonAtomic(REFERENCE_INDEX_FILE(), {
-      updatedAt: new Date().toISOString(),
+      // Do not move updatedAt on every progress flush: the UI polls this and
+      // would re-render the whole entry list every couple of seconds.
+      updatedAt: existing.updatedAt || new Date().toISOString(),
       signature,
-      entries: entries.slice(0, REFERENCE_INDEX_MAX_ENTRIES),
+      complete: false,
+      entries: capReferenceEntries(entries),
       progress: {
         running: true,
         done: referenceIndexProgress.done,
@@ -9209,7 +9309,12 @@ async function scanReferenceSources(settingsOverride, options = {}) {
     });
   };
 
-  const perFolder = Math.max(200, Math.min(2000, Math.floor(6000 / Math.max(1, folders.length))));
+  // Scale each folder's slice to the number of saved folders so a 600-folder
+  // library cannot materialise a million entries in memory before the cap runs.
+  const perFolder = Math.max(
+    12,
+    Math.min(800, Math.floor(REFERENCE_INDEX_LOCAL_BUDGET / Math.max(1, folders.length))),
+  );
   const scanSource = async (kind, source) => {
     if (doneIds.has(source.id)) return;
     referenceIndexProgress.current =
@@ -9246,7 +9351,9 @@ async function scanReferenceSources(settingsOverride, options = {}) {
   const index = {
     updatedAt: new Date().toISOString(),
     signature,
-    entries: entries.slice(0, REFERENCE_INDEX_MAX_ENTRIES),
+    complete: true,
+    entries: capReferenceEntries(entries),
+    progress: { ...referenceProgressSnapshot(), running: false, doneIds: [] },
   };
   await writeReferenceIndex(index);
   referenceIndexProgress.running = false;
@@ -9264,7 +9371,8 @@ async function scanReferenceLinksOnly() {
   const index = {
     updatedAt: new Date().toISOString(),
     signature: referenceSourceSignature(settings),
-    entries: [...kept, ...entries].slice(0, REFERENCE_INDEX_MAX_ENTRIES),
+    complete: true,
+    entries: capReferenceEntries([...kept, ...entries]),
   };
   await writeReferenceIndex(index);
   return { index, links: links.length, urlEntries: entries.length };
@@ -9275,13 +9383,34 @@ const REFERENCE_MEDIA_EXT =
 const REFERENCE_MEDIA_QUERY =
   /(audio|sound|sfx|music|song|track|texture|image|photo|picture|model|mesh|animation|video|clip|asset|sprite|icon|font|material)/i;
 
+function expandSearchTerm(term) {
+  // Plural / tense mismatches were the main reason "faces" did not find a
+  // keyword indexed as "face". Match the obvious English variants without
+  // inflating the stored keyword dictionary.
+  const value = String(term || "").toLowerCase();
+  const out = [];
+  const add = (variant) => {
+    if (!variant || variant.length < 3 || out.includes(variant)) return;
+    out.push(variant);
+  };
+  add(value);
+  if (value.endsWith("ies") && value.length > 4) add(value.slice(0, -3) + "y");
+  if (/(?:ches|shes|sses|xes|zes)$/.test(value) && value.length > 4) add(value.slice(0, -2));
+  if (value.endsWith("s") && !value.endsWith("ss") && value.length > 3) add(value.slice(0, -1));
+  if (value.endsWith("ing") && value.length > 5) {
+    add(value.slice(0, -3));
+    add(value.slice(0, -3) + "e");
+  }
+  if (value.endsWith("ed") && value.length > 4) add(value.slice(0, -2));
+  return out;
+}
+
 function searchReferenceEntries(index, query, limit = 10, options = {}) {
-  // Manual Reference Library searches stay permissive; the automatic pre-flight
-  // briefing only keeps distinctive matches so it never distracts a coder.
   const strict = options.strict === true;
   const terms = tokenizeReference(query).filter((term) => !RESEARCH_STOPWORDS.has(term));
   if (!terms.length || !index?.entries?.length) return [];
   const mediaQuery = REFERENCE_MEDIA_QUERY.test(String(query || ""));
+  const phrase = String(query || "").toLowerCase().replace(/\s+/g, " ").trim();
   const items = index.entries.map((entry) => ({
     entry,
     title: String(entry.title || "").toLowerCase(),
@@ -9291,29 +9420,31 @@ function searchReferenceEntries(index, query, limit = 10, options = {}) {
     text: String(entry.text || "").toLowerCase(),
     media: REFERENCE_MEDIA_EXT.test(String(entry.path || entry.url || "")),
   }));
+  const expanded = terms.map((term) => expandSearchTerm(term));
   // Down-weight words that appear across the whole index ("game", "file") so a
   // rare project name outranks a common word in a song title.
   const documentFrequency = new Map();
-  for (const term of terms) {
+  expanded.forEach((variants, index) => {
     let count = 0;
     for (const item of items) {
       if (
-        item.title.includes(term) ||
-        item.keywords.includes(term) ||
-        item.location.includes(term) ||
-        item.summary.includes(term)
+        variants.some(
+          (variant) =>
+            item.title.includes(variant) ||
+            item.keywords.includes(variant) ||
+            item.location.includes(variant) ||
+            item.summary.includes(variant),
+        )
       ) {
-        count++;
+        count += 1;
       }
     }
-    documentFrequency.set(term, count);
-  }
-  // A distinctive word ("zombie", "three.js") is what proves an entry is
-  // related. Common words ("game", "player") match hundreds of unrelated files,
-  // so a multi-word coding prompt must hit at least one rare term.
-  const rareTerms = new Set(
-    terms.filter((term) => (documentFrequency.get(term) || 0) <= Math.max(20, items.length * 0.01)),
-  );
+    documentFrequency.set(index, count);
+  });
+  const rareTerms = new Set();
+  expanded.forEach((variants, index) => {
+    if ((documentFrequency.get(index) || 0) <= Math.max(20, items.length * 0.01)) rareTerms.add(index);
+  });
   const requireRare = terms.length > 2 && rareTerms.size > 0;
   const scored = [];
   for (const item of items) {
@@ -9324,30 +9455,39 @@ function searchReferenceEntries(index, query, limit = 10, options = {}) {
     let strong = false;
     let rareHit = false;
     const matchedTerms = [];
-    for (const term of terms) {
-      const weight = 1 / (1 + Math.log(1 + (documentFrequency.get(term) || 0)));
+    expanded.forEach((variants, index) => {
+      const weight = 1 / (1 + Math.log(1 + (documentFrequency.get(index) || 0)));
       let termScore = 0;
-      if (item.title.includes(term)) {
+      if (variants.some((variant) => item.title.includes(variant))) {
         termScore += 5;
         strong = true;
-        if (rareTerms.has(term)) rareHit = true;
+        if (rareTerms.has(index)) rareHit = true;
       }
-      if (item.keywords.includes(term)) {
+      if (variants.some((variant) => item.keywords.includes(variant))) {
         termScore += 3;
-        if (rareTerms.has(term)) rareHit = true;
+        if (rareTerms.has(index)) rareHit = true;
       }
-      if (item.location.includes(term)) {
+      if (variants.some((variant) => item.location.includes(variant))) {
         termScore += 2;
         strong = true;
-        if (rareTerms.has(term)) rareHit = true;
+        if (rareTerms.has(index)) rareHit = true;
       }
-      if (item.summary.includes(term)) termScore += 1;
-      if (item.text.includes(term)) termScore += 1;
-      if (termScore > 0) matchedTerms.push(term);
+      if (variants.some((variant) => item.summary.includes(variant))) termScore += 1;
+      if (variants.some((variant) => item.text.includes(variant))) termScore += 1;
+      if (termScore > 0) matchedTerms.push(terms[index]);
       score += termScore * weight;
+    });
+    if (score <= 0) continue;
+    // Strict mode is only for the automatic pre-flight briefing. A human
+    // search must be able to find a phrase that lives in a summary or body.
+    if (strict && (!strong || (requireRare && !rareHit))) continue;
+    if (
+      phrase.length > 3 &&
+      (item.title.includes(phrase) || item.keywords.includes(phrase) || item.summary.includes(phrase))
+    ) {
+      score += 6;
+      if (!strict) strong = true;
     }
-    if (!strong || score <= 0) continue;
-    if (strict && requireRare && !rareHit) continue;
     scored.push({ entry: item.entry, score, matchedTerms });
   }
   scored.sort((a, b) => b.score - a.score);
@@ -9548,46 +9688,84 @@ const RESEARCH_STOPWORDS = new Set([
   "actually", "currently", "random", "application", "someone", "anyone", "nobody",
 ]);
 
+// Meta-words that dominate a prompt ABOUT the app but are useless as search keys
+// against a large reference index ("fix", "issue", "central" ...). Domain words
+// like editor/engine/face/line/snap/sketchup are deliberately NOT here: those
+// genuinely live in the index and should still surface.
+const RESEARCH_META_STOPWORDS = new Set([
+  "app", "applet", "central", "fix", "fixes", "fixed", "fixing", "issue", "issues",
+  "bug", "bugs", "problem", "problems", "behave", "behaves", "behavior", "behaviour",
+  "feeling", "feel", "exactly", "identical", "identically", "properly", "perfectly",
+  "perfect", "serious", "seriously", "critical", "critically", "extremely", "insanely",
+  "really", "true", "truly", "deep", "deeply", "complete", "completely", "fully",
+  "whole", "entire", "entirely", "rewrite", "clone", "merge", "port", "match",
+  "matches", "matching", "version", "need", "needs", "needed", "want", "wants",
+  "wanted", "back", "better", "best", "way", "ways", "thing", "things", "stuff",
+  "able", "please", "help", "request", "prompt", "currently", "instead", "lots",
+  "lot", "much", "many", "tons", "ton", "bunch", "several", "various",
+]);
+
 function researchTerms(input, limit = 12) {
   const raw = String(input || "").replace(/```[\s\S]*?```/g, " ");
-  const counts = new Map();
-  const first = new Map();
-  const order = [];
-  const add = (token, position) => {
-    const term = String(token || "").toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
-    if (!term) return;
-    if (term.length <= 2 && !SIGNIFICANT_SHORT_TERMS.has(term)) return;
-    if (RESEARCH_STOPWORDS.has(term)) return;
-    if (!counts.has(term)) {
-      counts.set(term, 0);
-      first.set(term, position);
-      order.push(term);
-    }
-    counts.set(term, counts.get(term) + 1);
+  const out = [];
+  const seen = new Set();
+  const push = (term) => {
+    const t = String(term || "").toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
+    if (!t) return;
+    if (t.length <= 2 && !SIGNIFICANT_SHORT_TERMS.has(t)) return;
+    if (RESEARCH_STOPWORDS.has(t) || RESEARCH_META_STOPWORDS.has(t)) return;
+    if (seen.has(t)) return;
+    seen.add(t);
+    out.push(t);
   };
+
+  // 1. Quoted / backtick phrases are the most precise signal of the real topic.
+  for (const m of raw.matchAll(/[`"']([^`"']{3,40})[`"']/g)) {
+    if (/\s/.test(m[1])) push(m[1]);
+  }
+  // 2. snake_case / kebab identifiers that name a real symbol in the dump
+  //    ("orient_faces", "compute_snap", "edge_grid").
+  for (const m of raw.matchAll(/\b[a-z0-9]+(?:[_-][a-z0-9]+){1,3}\b/gi)) {
+    push(m[0]);
+  }
+
+  // 3. Significant words with their positions, camelCase split.
+  const words = [];
+  const positions = [];
   let position = 0;
   for (const token of raw.split(/[^a-z0-9_+#.:-]+/i)) {
-    position += 1;
     if (!token) continue;
-    // Keep the full token (internal "-" / "_" preserved) so hyphenated
-    // concepts like "pre-flight" survive, then add each part too so a prompt
-    // word like "faces" still matches an identifier like "rebuildFaces".
-    add(token, position);
-    const expanded = token.replace(/([a-z0-9])([A-Z])/g, "$1 $2");
-    for (const part of expanded.split(/[^a-zA-Z0-9]+/)) add(part, position);
+    const pieces = String(token)
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .split(/[^a-zA-Z0-9]+/)
+      .map((p) => p.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, ""))
+      .filter(Boolean);
+    for (const piece of pieces) {
+      if (piece.length <= 2 && !SIGNIFICANT_SHORT_TERMS.has(piece)) continue;
+      if (RESEARCH_STOPWORDS.has(piece)) continue;
+      words.push(piece);
+      positions.push(position);
+    }
+    position += 1;
   }
-  const scored = order.map((term) => {
-    const freq = counts.get(term) || 1;
-    const pos = first.get(term) || 0;
-    // Repeats and longer words are the strongest signals of the real topic;
-    // position is only a gentle tiebreaker so a distinctive late word still
-    // outranks a generic early one.
-    const lengthBoost = 1 + Math.min(term.length, 12) * 0.07;
-    const score = (freq + 0.4) * lengthBoost * (1 + 0.4 / (4 + pos * 0.15));
-    return { term, score };
-  });
-  scored.sort((a, b) => b.score - a.score || a.term.localeCompare(b.term));
-  return scored.slice(0, Math.max(1, limit)).map((item) => item.term);
+
+  // 4. Bigrams of adjacent significant words are real phrases ("reference
+  //    index", "snap point", "face line") and far more precise than one word.
+  for (let i = 0; i < words.length - 1; i += 1) {
+    const adjacent = positions[i + 1] - positions[i] <= 1;
+    const aOk = !RESEARCH_META_STOPWORDS.has(words[i]);
+    const bOk = !RESEARCH_META_STOPWORDS.has(words[i + 1]);
+    if (adjacent && aOk && bOk) push(words[i] + " " + words[i + 1]);
+  }
+
+  // 5. Single significant words last, so phrases/identifiers always lead.
+  // Include the obvious stem ("faces" -> "face", "snapping" -> "snap") so the
+  // same prompt matches singular keywords and GitHub repository names.
+  for (const word of words) {
+    for (const variant of expandSearchTerm(word)) push(variant);
+  }
+
+  return out.slice(0, Math.max(1, limit));
 }
 
 const REFERENCE_SCOPE_TYPES = {
@@ -9600,14 +9778,10 @@ async function referencePreflight(text, limit = 10) {
   try {
     const index = await loadReferenceIndex();
     const updatedAt = index.updatedAt || null;
-    const age = updatedAt ? Date.now() - new Date(updatedAt).getTime() : Infinity;
-    const stale = !Number.isFinite(age) || age > REFERENCE_INDEX_TTL;
-    // A coding prompt should never wait on a crawl, but it should also never
-    // trust a cold index. Search what exists and top the index up in the
-    // background for the next prompt.
-    if (stale) scheduleReferenceIndex(400);
-    const entries = index.entries || [];
     const settings = await getSettings().catch(() => null);
+    const signature = settings ? referenceSourceSignature(settings) : "";
+    const stale = !referenceIndexIsFresh(index, signature);
+    const entries = index.entries || [];
     const coverage = settings ? referenceIndexCoverage(index, settings) : null;
     const counts = {
       total: entries.length,
@@ -9764,6 +9938,13 @@ function buildPreflightBriefing(text, local, remote, elapsedMs) {
   const lines = [
     "# Pre-flight research (already completed for this prompt)",
     "The studio searched the local Reference Library, the URL/documentation index, the GitHub knowledge index and public GitHub before you were called. Read this briefing before your first command, file write or file edit.",
+    "",
+    "| Scope | Searchable | Matched |",
+    "| --- | ---: | ---: |",
+    "| Local folders & files | " + (local.counts?.local ?? 0) + " | " + (local.local?.length || 0) + " |",
+    "| Documentation URLs | " + (local.counts?.url ?? 0) + " | " + (local.urls?.length || 0) + " |",
+    "| GitHub knowledge | " + (local.counts?.github ?? 0) + " | " + (local.github?.length || 0) + " |",
+    "| Public GitHub | live | " + remote.repositories.length + " repos, " + remote.code.length + " code hits |",
   ];
   const counts = {
     references: local.matches.length,
@@ -9787,13 +9968,7 @@ function buildPreflightBriefing(text, local, remote, elapsedMs) {
   };
 
   // Index snapshot: what was actually searchable when this prompt ran.
-  lines.push(
-    "",
-    "## Index snapshot",
-    "- Local folders & files: " + (local.counts?.local ?? 0) + " entries searched, " + (local.local?.length || 0) + " matched",
-    "- Documentation URLs: " + (local.counts?.url ?? 0) + " entries searched, " + (local.urls?.length || 0) + " matched",
-    "- GitHub knowledge: " + (local.counts?.github ?? 0) + " entries searched, " + (local.github?.length || 0) + " matched",
-  );
+  lines.push("", "## Index health");
   if (local.coverage) {
     const complete = local.coverage.sourcesIndexed >= local.coverage.sourcesTotal;
     lines.push(
@@ -10292,7 +10467,52 @@ app.get("/api/references/search", async (req, res) => {
 app.get("/api/references/index", async (req, res) => {
   try {
     const index = await loadReferenceIndex();
-    res.json({ ok: true, updatedAt: index.updatedAt, count: index.entries?.length || 0, entries: (index.entries || []).slice(0, 300) });
+    const all = index.entries || [];
+    const limit = Math.max(1, Math.min(300, Number(req.query.limit || 200)));
+    const offset = Math.max(0, Number(req.query.offset || 0));
+    const scope = String(req.query.scope || "all").toLowerCase();
+    const types =
+      scope === "local"
+        ? REFERENCE_SCOPE_TYPES.local
+        : scope === "url"
+          ? REFERENCE_SCOPE_TYPES.url
+          : scope === "github"
+            ? REFERENCE_SCOPE_TYPES.github
+            : null;
+    const filtered = types ? all.filter((entry) => types.includes(entry.type)) : all;
+    const typeCounts = all.reduce((out, entry) => {
+      out[entry.type] = (out[entry.type] || 0) + 1;
+      return out;
+    }, {});
+    // A slim projection only: the renderer never needs the full body text or the
+    // keyword list, and shipping them for hundreds of entries at once was what
+    // black-screened the Index tab during a re-index. Pagination bounds the DOM.
+    const slim = filtered.slice(offset, offset + limit).map((entry) => ({
+      id: entry.id,
+      type: entry.type,
+      title: entry.title,
+      path: entry.path,
+      url: entry.url,
+      folderId: entry.folderId,
+      folderLabel: entry.folderLabel,
+      linkId: entry.linkId,
+      linkLabel: entry.linkLabel,
+      summary: entry.summary,
+      bytes: entry.bytes,
+      updatedAt: entry.updatedAt,
+    }));
+    res.json({
+      ok: true,
+      updatedAt: index.updatedAt,
+      complete: index.complete !== false,
+      scope,
+      count: filtered.length,
+      total: all.length,
+      typeCounts,
+      offset,
+      limit,
+      entries: slim,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -10301,47 +10521,22 @@ app.get("/api/references/index", async (req, res) => {
 app.get("/api/references/keywords", async (req, res) => {
   try {
     const index = await loadReferenceIndex();
-    const entries = index.entries || [];
     const query = String(req.query.q || "").toLowerCase().trim();
-    const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 300)));
+    const limit = Math.max(1, Math.min(400, Number(req.query.limit || 300)));
     const offset = Math.max(0, Number(req.query.offset || 0));
-    // Aggregate every indexed keyword into a dictionary of term -> entry count
-    // with a per-scope breakdown (local folders/files, URLs, GitHub). A term
-    // that maps to many entries is a busy topic; a rare term is a precise
-    // discriminator the AI and the user can lean on for manual lookup.
-    const map = new Map();
-    for (const entry of entries) {
-      const keywords = entry.keywords || [];
-      const seen = new Set();
-      const scope = REFERENCE_SCOPE_TYPES.local.includes(entry.type)
-        ? "local"
-        : REFERENCE_SCOPE_TYPES.url.includes(entry.type)
-          ? "url"
-          : "github";
-      for (const keyword of keywords) {
-        const term = String(keyword).toLowerCase();
-        if (!term || seen.has(term)) continue;
-        seen.add(term);
-        let record = map.get(term);
-        if (!record) {
-          record = { term, count: 0, local: 0, url: 0, github: 0 };
-          map.set(term, record);
-        }
-        record.count += 1;
-        record[scope] += 1;
-      }
-    }
-    let list = [...map.values()];
-    if (query) list = list.filter((record) => record.term.includes(query));
-    list.sort((a, b) => b.count - a.count || a.term.localeCompare(b.term));
-    const totalKeywords = list.length;
-    const totalConnections = list.reduce((sum, record) => sum + record.count, 0);
+    // The dictionary is aggregated once per index version, not on every
+    // keystroke. The old per-request scan of millions of keywords was what
+    // locked the process while the renderer waited.
+    const dictionary = keywordDictionaryFor(index);
+    const source = query ? dictionary.list.filter((record) => record.term.includes(query)) : dictionary.list;
     res.json({
       ok: true,
       updatedAt: index.updatedAt,
-      totalKeywords,
-      totalConnections,
-      keywords: list.slice(offset, offset + limit),
+      totalKeywords: source.length,
+      totalConnections: source.reduce((sum, record) => sum + record.count, 0),
+      allKeywords: dictionary.list.length,
+      allConnections: dictionary.totalConnections,
+      keywords: source.slice(offset, offset + limit),
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
