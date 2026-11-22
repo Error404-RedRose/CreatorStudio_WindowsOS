@@ -1,0 +1,544 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Marco Sumari Tellez and IngeTrazo contributors.
+"""Help ▸ About IngeTrazo, with the contributors rolling like film credits.
+
+The list of people whose work is IN the program keeps growing — a
+draftsman's reports, a reviewer's drafting norms, a translation, the Mac
+package, a whole tool — and a static paragraph of names would soon push
+the dialog off the screen. So they roll up slowly in a band a few lines
+tall, like the credits at the end of a film, round and round: nothing to
+click, several people in view at once (Marco, 23-09 — a one-at-a-time
+carousel paused under the mouse and read as needing clicks). AUTHORS
+says what each one gave, in full.
+"""
+from __future__ import annotations
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QHBoxLayout,
+    QLabel,
+    QVBoxLayout,
+    QWidget,
+)
+
+from core.i18n import tr
+
+#: (name, what they gave — English source for tr(), link or "").
+#: Those who have given the most — a star beside their name, first in
+#: the roll (Marco, 18-10): measured by merged pull requests, reports and
+#: the work they carried, not by order of arrival.
+STARRED = frozenset({
+    "Pedro Caeiro",
+    "Gabriel Rodríguez Arregin",
+    "Félix Riestra",
+    "Rafael García Rodríguez",
+    "Ahsan Mehmood",
+})
+
+CONTRIBUTORS = [
+    ("Pedro Caeiro",
+     "Draftsman. Pull requests and dozens of issue reports from daily "
+     "drafting work: much of how IngeTrazo draws today.",
+     "https://github.com/pacaeiro"),
+    ("Gabriel Rodríguez Arregin",
+     "Architect. The units system, the Browser, Layers 2.0, the Solid "
+     "Inspector, Fillet 3D bevels, Bridge, Join Segments, Camera ▸ Axes, "
+     "soft ambient occlusion, round curved surfaces, view layouts, scenes "
+     "as tabs, cleaner exports and many everyday editing tools.",
+     "https://github.com/canalsecuario-blip"),
+    ("Félix Riestra",
+     "The macOS package: IngeTrazo for Mac. Components that come apart "
+     "(parts, cut list, exploded view) and the Extension API 2.",
+     "https://github.com/felixriestra"),
+    ("Rafael García Rodríguez",
+     "Draftsman and 3D reviewer. Filmed reviews of the whole program and "
+     "the drafting standards for dimensions.",
+     "https://youtube.com/@Rafa3D"),
+    ("Ahsan Mehmood",
+     "Author of OpenSKP, the free reader behind the .skp import; "
+     "his plugin work became the Extensions system.",
+     "https://github.com/iamahsanmehmood"),
+    ("dafrobozao",
+     "Brazilian Portuguese translation of the interface.",
+     "https://github.com/dafrobozao"),
+    ("José Castro Basso (FADU–UDELAR)",
+     "Architect and teacher of architectural representation. Two-point "
+     "perspective, the current view as DXF, and the Levels extension.",
+     "https://github.com/castrobasso"),
+    ("Sherod Taylor",
+     "The First Person tool: walk the model like a game.",
+     "https://github.com/sherodtaylor"),
+    ("liuandy",
+     "Simplified Chinese translation of the interface.",
+     "https://github.com/liujvnes"),
+    ("deedend",
+     "Italian translation of the interface, and the 3D mouse's axes and "
+     "navigation profiles.",
+     "https://github.com/deedend"),
+    ("Rainjalin",
+     "Indonesian translation of the interface.",
+     "https://github.com/Rainjalin"),
+    ("Bane Andreev",
+     "Architect. The Windowizer example extension: parametric windows from "
+     "faces, and the extension API's menus and group data.",
+     ""),
+    ("Rony Leonel Janampa Monago",
+     "The Polygon properties example extension: area, centroid and "
+     "second moments of a face.",
+     "https://github.com/Ronyleonel6"),
+    ("Carlos Martins",
+     "Bug reports with videos that pinned down guides, group paint and "
+     "exploded groups; the Project Structure plugin behind the Outliner.",
+     "https://github.com/fafecm"),
+    ("mnavarromugas",
+     "First to test the 3D mouse on a real SpaceMouse; per-axis inversion.",
+     "https://github.com/mnavarromugas"),
+    ("xyont",
+     "Reports from mechanical modelling: pulling against a wall, units "
+     "for new files.",
+     "https://github.com/xyont"),
+    ("Roy Méndez Castro",
+     "Wrote down the Outliner: what a tree of nested groups needs.",
+     "https://github.com/roymendezcastro"),
+    ("kagehak",
+     "STL import, Simplify Mesh and the extension manager.",
+     "https://github.com/kagehak"),
+    ("FG-RVT",
+     "Push/Pull usability: a preselected face arms the tool, the real "
+     "result previewed on split faces, the distance kept ready to "
+     "retype.",
+     "https://github.com/FG-RVT"),
+    ("Guy Wydouw",
+     "Fixes for macOS (text layout, frame colours) and faces kept the "
+     "right way round when erasing a dividing line.",
+     "https://github.com/GWydouw"),
+    ("Aaron Kern",
+     "German fixes, Zoom Extents that frames reference images, and tags "
+     "kept on groups imported from .skp.",
+     "https://github.com/Aaron1992"),
+    ("Alex Joedt",
+     "Keeps the German translation up to date.",
+     "https://github.com/alexjoedt"),
+    ("PESI3D",
+     "German translation of the interface.",
+     "https://github.com/PESI3D"),
+    ("Yann Steffan",
+     "French translation of the interface.",
+     "https://github.com/YannFR81"),
+    ("Piotr Szmitkowski",
+     "Polish translation of the interface.",
+     "https://github.com/jackalski"),
+    ("RomanErshow",
+     "Russian translation of the interface.",
+     "https://github.com/RomanErshow"),
+    ("vandang890615",
+     "Vietnamese translation of the interface.",
+     "https://github.com/vandang890615"),
+    ("BoneNI",
+     "Lao translation of the interface.",
+     "https://github.com/bounkirdni-2025"),
+    ("Prida Takon",
+     "Thai translation of the interface.",
+     "https://github.com/PRIDA-TAKON"),
+    ("ChangWoo Lee",
+     "Korean translation of the interface, and the AI key from an "
+     "environment variable.",
+     "https://github.com/ultracat"),
+    ("nonasige-ui",
+     "Japanese translation of the interface.",
+     "https://github.com/nonasige-ui"),
+    ("Francis Rebouças",
+     "Sheet dimensions and level marks in the document's units, "
+     "dimensions that follow their object, Push/Pull fixes and the "
+     "«System language» choice.",
+     "https://github.com/francisreboucas"),
+    ("pkoska",
+     "Fixes for the location map, Move's rotation grips, typed values, "
+     "the Line tool, snapping, long thin rectangles, .skp thumbnails and "
+     "the extension manager's downloads on Windows, and DWG conversion "
+     "with a Cancel button.",
+     "https://github.com/pkoska"),
+    ("Kone Venkatesh",
+     "Fixes deep in the modelling core: windows cut at a box's corner, "
+     "lines over other edges, Follow Me's undo and splitting edges.",
+     "https://github.com/konevenkatesh"),
+    ("Clint Armstrong",
+     "A failed scripted import that gives back what it had removed.",
+     "https://github.com/clinta"),
+    ("nicolasmarc",
+     "DXF polyface and mesh entities imported as faces, merged part by "
+     "part.",
+     "https://github.com/nicolasmarc"),
+    ("BastelBaus",
+     "DAE and .skp imports that keep the file's groups, nested and named, "
+     "BIM tags inside groups and Help ▸ Documentation.",
+     "https://github.com/BastelBaus"),
+    ("David",
+     "The choice of tool cursor: the tool's icon, a crosshair or an "
+     "arrow.",
+     "https://github.com/Booshdag-io"),
+    ("Matt Van Horn",
+     "A fix for the AI Assistant crash in the Flatpak.",
+     "https://github.com/mvanhorn"),
+    ("Luis Romo",
+     "Offset with its distance live in the measurements box, ready to "
+     "retype.",
+     "https://github.com/luisfergromo"),
+    ("Victor Crespo",
+     "A confirmation before installing an extension nobody has reviewed, "
+     "safer archives from outside, COLLADA export with groups and tags, "
+     "and fixes for copies and undone imports.",
+     "https://github.com/vicc3d"),
+    ("APBureauEtude",
+     "OBJ and MTL files read and written as UTF-8 on every system, the "
+     "active layer's pencil in the accent colour and clearer group "
+     "editing.",
+     "https://github.com/APBureauEtude"),
+    ("SebWell",
+     "A cleaner macOS package.",
+     "https://github.com/SebWell"),
+    ("BlackFlash73",
+     "Exports that take colours with transparency.",
+     "https://github.com/blackflash73"),
+    ("borborborja",
+     "Documents with textual curve IDs open again.",
+     "https://github.com/borborborja"),
+    ("lelopes05",
+     "Sturdier value labels for extensions.",
+     "https://github.com/lelopes05"),
+    ("PINYO PATTANAWASANPORN",
+     "The fix for the base map that closed the program on Windows with "
+     "AMD graphics.",
+     "https://github.com/PINYOPATTANAWASANPORN"),
+    ("Orian Beltrame",
+     "Performance: hover with Line and Move up to twice as fast, the "
+     "pick index split into cells, and the interaction benchmark.",
+     "https://github.com/orianbsilva"),
+    ("jonson7777",
+     "Bug reports and requests from daily use: Push/Pull, Offset, "
+     "toolbars and the sidebars.",
+     "https://github.com/jonson7777"),
+    ("tomlai-git",
+     "Reports on installation, the extension manager, shortcuts and "
+     "curved surfaces.",
+     "https://github.com/tomlai-git"),
+    ("arthurarquitetoamb",
+     "Feature requests from modelling practice: 3D text, copies along "
+     "Follow Me, points and Push/Pull on lines.",
+     "https://github.com/arthurarquitetoamb"),
+    ("tony1233200",
+     "Fixes for reopened dimensions, New's materials, the extension "
+     "manager, face areas, textures on rotated groups, unnamed groups "
+     "and .skp scale, and a faster viewer.",
+     "https://github.com/tony1233200"),
+    ("Bogdan Demchenko",
+     "Extension toolbars back in place at start-up, the Rectangle's "
+     "preview, Measure from the line under the cursor, Offset's "
+     "reference, pool water and Push/Pull on edge midpoints.",
+     "https://github.com/hamzah1985"),
+    ("Alexis",
+     "Ctrl+Enter in the leader-text dialog.",
+     "https://github.com/bernalalexis-try"),
+    ("SPMech",
+     "Reports and requests from mechanical modelling.",
+     "https://github.com/SPMech"),
+    ("xcd-droid",
+     "Reports on snapping, the Rectangle and pasting.",
+     "https://github.com/xcd-droid"),
+    ("Oleksandr Bolotov",
+     "Ukrainian translation of the interface.",
+     "https://github.com/bolotov"),
+    ("Amer Alhlhli",
+     "Arabic translation of the interface: the first right-to-left one.",
+     "https://github.com/Alhlhli"),
+    ("Nicolas Grossi",
+     "The OpenCode Go provider and a readable chat for the AI Assistant.",
+     "https://github.com/changastyle"),
+    ("Alexey Tkachenko",
+     ".skp components scaled by −1 that keep their front, and nested "
+     "groups that wear their nearest painted container.",
+     "https://github.com/alteralto"),
+    ("Aashish — IngeTrazo Tutorials",
+     "The IngeTrazo Tutorials channel on YouTube, and nine extensions: "
+     "MultiView, Phasing Animator, Kitchen Maker, Taper and more.",
+     "https://github.com/aashishzharbade-arch"),
+    ("Phillip Edwards (Eddy)",
+     "Twenty-three extensions in the catalogue: period doors and windows, "
+     "roof tiles, brick and block, gutters, fences, Loft, Wrap and more.",
+     "https://github.com/eddy-99"),
+    ("Dugan Caswell",
+     "Levels: heights in the document's units.",
+     "https://github.com/consumr"),
+    ("David Mavrov",
+     "The Bulgarian translation.",
+     "https://github.com/davidsmavrov-debug"),
+    ("KuoYaMu",
+     "The Traditional Chinese translation.",
+     "https://github.com/KuoYaMu"),
+    ("DarkBiscuits",
+     "A .skp component 10 000 times too big, traced.",
+     "https://github.com/DarkBiscuits"),
+]
+
+#: Roll speed: pixels per tick, and the tick.
+ROLL_PX = 1
+ROLL_MS = 45
+
+
+def _credits_html(people) -> str:
+    rows = []
+    for name, role, link in people:
+        who = (f"<a href='{link}'><b>{name}</b></a>" if link
+               else f"<b>{name}</b>")
+        if name in STARRED:
+            who = f"<span style='color:#e8a33d'>★</span> {who}"
+        rows.append(f"<p{_DIR()} style='margin:0 0 10px 0'>{who}<br>{tr(role)}</p>")
+    return "".join(rows)
+
+
+def _DIR() -> str:  # noqa: N802
+    """A paragraph's direction attribute: rich text picks each paragraph's
+    direction from its first letter, and a credit starts with a Latin
+    name — right to left (#1067) it is said outright. Nothing left to
+    right."""
+    from views.rtl import is_rtl_ui
+    return " dir='rtl'" if is_rtl_ui() else ""
+
+
+class _Fade(QWidget):
+    """Soft top and bottom edges over the roll, in the window's colour."""
+
+    def __init__(self, parent) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        from PySide6.QtGui import QColor, QLinearGradient, QPainter
+        bg = self.palette().window().color()
+        clear = QColor(bg)
+        clear.setAlpha(0)
+        p = QPainter(self)
+        edge = min(22, self.height() // 4)
+        for y0, y1, a, b in ((0, edge, bg, clear),
+                             (self.height() - edge, self.height(), clear, bg)):
+            g = QLinearGradient(0, y0, 0, y1)
+            g.setColorAt(0.0, a)
+            g.setColorAt(1.0, b)
+            p.fillRect(0, y0, self.width(), y1 - y0, g)
+        p.end()
+
+
+class _Credits(QWidget):
+    """Every contributor, rolling up slowly and looping, like film credits.
+    Two copies of the list sit one above the other; when the first has
+    rolled out of view the roll starts over, seamlessly. The pointer over
+    it stops the roll and the wheel scrolls it by hand, both ways (Marco:
+    «me gustaría poder scrollear para saber qué usuarios hay apoyando»);
+    it rolls on again when the pointer leaves."""
+
+    LINES = 11
+
+    def __init__(self, people, parent=None) -> None:
+        super().__init__(parent)
+        self._people = list(people)
+        html = _credits_html(self._people)
+        self._copies = []
+        for _ in range(2):
+            lab = QLabel(html, self)
+            lab.setWordWrap(True)
+            lab.setTextFormat(Qt.RichText)
+            lab.setOpenExternalLinks(True)
+            lab.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+            self._copies.append(lab)
+        self._fade = _Fade(self)
+        self.setFixedHeight(self.fontMetrics().lineSpacing() * self.LINES + 8)
+        self._offset = 0.0
+        self._span = 1
+        self._timer = QTimer(self)
+        self._timer.setInterval(ROLL_MS)
+        self._timer.timeout.connect(self.tick)
+        self._timer.start()
+
+    @property
+    def running(self) -> bool:
+        return self._timer.isActive()
+
+    @property
+    def offset(self) -> float:
+        return self._offset
+
+    @property
+    def span(self) -> int:
+        return self._span
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        w = self.width()
+        self._span = max(1, self._copies[0].heightForWidth(w))
+        for lab in self._copies:
+            lab.resize(w, self._span)
+        self._fade.setGeometry(0, 0, w, self.height())
+        self._place()
+
+    def tick(self) -> None:
+        self._offset = (self._offset + ROLL_PX) % self._span
+        self._place()
+
+    def scroll_by(self, pixels: float) -> None:
+        """Move the roll by hand (positive = on down the list), looping."""
+        self._offset = (self._offset + pixels) % self._span
+        self._place()
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        self._timer.stop()
+        steps = event.angleDelta().y() / 120.0
+        self.scroll_by(-steps * self.fontMetrics().lineSpacing() * 3)
+        event.accept()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._timer.stop()                  # read a name without it moving
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._timer.start()
+        super().leaveEvent(event)
+
+    def _place(self) -> None:
+        y = -int(self._offset)
+        self._copies[0].move(0, y)
+        self._copies[1].move(0, y + self._span)
+        self._fade.raise_()
+
+
+def system_info(version: str, gl_line: str = "") -> str:
+    """The lines a bug report needs (#476), as plain text to paste in an
+    issue: program, system, Python, Qt, OpenGL, screen and language.
+
+    Always in English, whatever the interface language, so whoever reads
+    the report can read it too. Nothing personal: no user name, no paths."""
+    import platform
+
+    import PySide6
+    from PySide6.QtCore import qVersion
+    from PySide6.QtWidgets import QApplication
+
+    from core.i18n import current_language
+
+    lines = [f"IngeTrazo {version} ({_build()})",
+             f"OS: {_os_name()} ({platform.machine()})",
+             f"Python: {platform.python_version()}",
+             f"Qt: {qVersion()}, PySide6: {PySide6.__version__}"]
+    if gl_line:
+        lines.append(f"OpenGL: {gl_line}")
+    app = QApplication.instance()
+    screen = app.primaryScreen() if app is not None else None
+    if screen is not None:
+        size = screen.size()
+        lines.append(f"Screen: {size.width()}x{size.height()} "
+                     f"@ {screen.devicePixelRatio():g}x")
+    lines.append(f"Language: {current_language()}")
+    return "\n".join(lines)
+
+
+def _build() -> str:
+    """How this copy runs: a Flatpak or an AppImage say so — a Flatpak is
+    not frozen, and read «from source» in reports."""
+    import os
+    import sys
+    if os.environ.get("FLATPAK_ID"):
+        return "Flatpak"
+    if os.environ.get("APPIMAGE"):
+        return "AppImage"
+    return "packaged" if getattr(sys, "frozen", False) else "from source"
+
+
+def _os_name() -> str:
+    """The system, in words no locale translates. ``platform.platform()``
+    asks ``uname -p``, which answers in the user's language: a Spanish
+    Linux reported «…-x86_64-desconocido-with-glibc2.43»."""
+    import platform
+    system = platform.system()
+    if system == "Darwin":
+        return f"macOS {platform.mac_ver()[0]}"
+    if system == "Windows":
+        return f"Windows {platform.release()} ({platform.version()})"
+    name = f"{system} {platform.release()}"
+    try:
+        pretty = platform.freedesktop_os_release().get("PRETTY_NAME")
+    except OSError:
+        pretty = None
+    return f"{name}, {pretty}" if pretty else name
+
+
+class AboutDialog(QDialog):
+    def __init__(self, parent, version: str, gl_line: str = "") -> None:
+        super().__init__(parent)
+        self.setWindowTitle(tr("About IngeTrazo"))
+        self.setMinimumWidth(480)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(18, 18, 18, 14)
+        outer.setSpacing(16)
+        from PySide6.QtWidgets import QApplication
+        icon = QApplication.windowIcon()
+        if not icon.isNull():
+            pic = QLabel(self)
+            pic.setPixmap(icon.pixmap(64, 64))
+            pic.setAlignment(Qt.AlignTop)
+            outer.addWidget(pic, 0, Qt.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(4)
+        outer.addLayout(col, 1)
+
+        def para(html: str) -> QLabel:
+            if _DIR():
+                html = f"<div{_DIR()}>{html}</div>"
+            lab = QLabel(html, self)
+            lab.setWordWrap(True)
+            lab.setTextFormat(Qt.RichText)
+            lab.setOpenExternalLinks(True)
+            col.addWidget(lab)
+            return lab
+
+        # The top is one compact block, so the credits below get the room
+        # (Marco, 23-09).
+        gl = f"<br><small>OpenGL: {gl_line}</small>" if gl_line else ""
+        from core._native import engine
+        # Which engine computes the heavy parts (Rust when the experimental
+        # native engine is on and loads) — the first thing a report needs.
+        gl += f"<br><small>{tr('Engine')}: {engine()}</small>"
+        para("<b style='font-size:15px'>IngeTrazo</b> "
+             f"{tr('Version')} {version}{gl}<br>"
+             f"{tr('Free 3D modeler for architecture, engineering and 3D design.')}<br>"
+             f"{tr('Created by')} <b>Marco Sumari Tellez</b> — "
+             f"{tr('Civil Engineer — Arequipa, Peru')}")
+        head = para(f"<b>{tr('With contributions from')}</b>")
+        head.setContentsMargins(0, 8, 0, 0)
+        self.credits = _Credits(CONTRIBUTORS, self)
+        col.addWidget(self.credits)
+        para("<small><a href='https://github.com/ingelibre/ingetrazo-extensions'>"
+             f"{tr('Thanks as well to all the authors of the extensions catalogue')}"
+             "</a>.</small>")
+        para(f"<small>{tr('And thanks to everyone who tries IngeTrazo and reports what they find.')}</small>")
+        para(f"<small>{tr('Licensed under GPL-3.0-or-later.')} · "
+             "<a href='https://github.com/ingelibre/ingetrazo'>"
+             "github.com/ingelibre/ingetrazo</a></small>")
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok, self)
+        buttons.accepted.connect(self.accept)
+        # What to paste in a bug report, one click away (#476).
+        self._info = system_info(version, gl_line)
+        self.copy_button = buttons.addButton(
+            tr("Copy to clipboard"), QDialogButtonBox.ActionRole)
+        self.copy_button.setToolTip(self._info)
+        self.copy_button.clicked.connect(self.copy_info)
+        col.addWidget(buttons)
+
+    def copy_info(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(self._info)
+        self.copy_button.setText(tr("Copied"))
+        # Tied to the button: closing the dialog first cancels the reset.
+        QTimer.singleShot(
+            1500, self.copy_button,
+            lambda: self.copy_button.setText(tr("Copy to clipboard")))

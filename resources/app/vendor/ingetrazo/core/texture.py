@@ -1,0 +1,740 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Marco Sumari Tellez and IngeTrazo contributors.
+"""Image textures, mapped the .skp way for interchange compatibility.
+
+A .skp material is a colour plus an optional texture image with a
+**real-world tile size** (the model-unit width/height one repeat of the image
+covers). The default mapping is a **planar projection**: a face's UVs come from
+its world position projected onto the face plane, divided by the tile size. The
+projection basis depends only on the face normal — the .skp format's own, see
+:func:`projection_basis` — so coplanar faces share it and the texture tiles
+**seamlessly** across a flat surface, and a face painted here shows the image
+where the .skp file places it.
+
+A textured face carries ``attrs["texture"] = {"path", "sw", "sh"}``. Colour and
+texture are independent (a face can have either or both).
+
+``path`` is always a real file on disk (the renderer, and every exporter, load
+the image from there). Images that came in *inside* something — extracted from
+an imported ``.skp``, unpacked from an ``.igz`` container — live in the app's
+own **texture cache** (:func:`texture_cache_root`), never next to the user's
+files.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import re
+from pathlib import Path
+
+from PySide6.QtGui import QVector3D
+
+from core.triangulate import plane_axes
+
+
+def texture_cache_root() -> Path:
+    """Root of the app's texture cache: ``<user data>/IngeTrazo/textures``
+    (``~/.local/share/…`` on Linux, ``%LOCALAPPDATA%\\…`` on Windows). Built
+    from ``GenericDataLocation`` rather than ``AppDataLocation`` so the path
+    does not depend on ``QCoreApplication``'s org/app names being set (scripts
+    and tests would otherwise land in a different folder).
+    ``$INGETRAZO_TEXTURE_CACHE`` overrides it (tests, and users who want the
+    images somewhere else).
+
+    Two subfolders, one per source: ``skp/`` (images extracted from an imported
+    ``.skp``) and ``embedded/`` (images unpacked from an ``.igz`` container)."""
+    import os
+    override = os.environ.get("INGETRAZO_TEXTURE_CACHE")
+    if override:
+        return Path(override)
+    base = ""
+    try:
+        from PySide6.QtCore import QStandardPaths
+        base = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.GenericDataLocation)
+    except Exception:  # noqa: BLE001 — no Qt paths (headless odd env): use $HOME
+        base = ""
+    root = Path(base) if base else Path.home() / ".local" / "share"
+    return root / "IngeTrazo" / "textures"
+
+
+def texture_cache_stats() -> tuple[int, int]:
+    """``(file count, total bytes)`` currently held in the texture cache."""
+    root = texture_cache_root()
+    count = total = 0
+    if root.is_dir():
+        for f in root.rglob("*"):
+            try:
+                if f.is_file():
+                    count += 1
+                    total += f.stat().st_size
+            except OSError:
+                continue
+    return count, total
+
+
+def clear_texture_cache() -> int:
+    """Delete the whole texture cache. Returns the number of files removed.
+    Documents saved as ``.igz`` containers re-extract their images the next
+    time they are opened; faces whose image came from a ``.skp`` import lose
+    their texture until the ``.skp`` is imported again — the caller is expected
+    to confirm first."""
+    import shutil
+    root = texture_cache_root()
+    count = texture_cache_stats()[0]
+    if root.is_dir():
+        shutil.rmtree(root, ignore_errors=True)
+    return count
+
+
+_DIGEST_PREFIX = re.compile(r"^(?:[0-9a-f]{16}-)+")
+NAME_LIMIT = 64     # characters kept of an image name inside the cache
+
+
+def image_has_cutout(path, cache={}) -> bool:
+    """Whether the image carries REAL transparency (some pixels see-through)
+    — the signature of a photo sprite (a person, a tree, a raschel mesh)
+    versus an opaque photo panel (a sign or mural). What makes a textured
+    material *translucent* in the .skp format's sense. Cached per path; an
+    unreadable image reads as opaque."""
+    cached = cache.get(path)
+    if cached is not None:
+        return cached
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QImage
+    img = QImage(str(path))
+    ok = False
+    if not img.isNull() and img.hasAlphaChannel():
+        small = img.scaled(32, 32, Qt.IgnoreAspectRatio, Qt.FastTransformation)
+        for yy in range(small.height()):
+            for xx in range(small.width()):
+                if small.pixelColor(xx, yy).alpha() < 32:
+                    ok = True
+                    break
+            if ok:
+                break
+    cache[path] = ok
+    return ok
+
+
+def texture_file_name(name: str) -> str:
+    """Filesystem-safe base name for an image called ``name``: characters
+    outside the safe set dropped, any content-hash prefix the name already
+    carried (from a cached file or an archive member) stripped, and the whole
+    clipped to :data:`NAME_LIMIT`. Stripping is what keeps a document from
+    stacking ``<hash>-<hash>-…-sumari.png`` one level deeper on every save —
+    0.3.10 did exactly that until the cache path outgrew Windows' 260-character
+    limit and the file refused to open; clipping keeps any name inside it."""
+    safe = "".join(c for c in Path(name).name
+                   if c.isalnum() or c in " ._-").strip(" .")
+    safe = _DIGEST_PREFIX.sub("", safe).strip(" .")
+    if len(safe) > NAME_LIMIT:
+        stem, dot, ext = safe.rpartition(".")
+        if dot and 0 < len(ext) <= 5 and ext.isalnum():
+            safe = stem[:NAME_LIMIT - len(ext) - 1].rstrip(" .") + "." + ext
+        else:
+            safe = safe[:NAME_LIMIT].rstrip(" .")
+    return safe or "texture.png"
+
+
+_IMAGE_MAGIC = (
+    b"\x89PNG\r\n\x1a\n",            # PNG
+    b"\xff\xd8\xff",                   # JPEG
+    b"GIF87a", b"GIF89a",
+    b"BM",                              # BMP
+    b"II*\x00", b"MM\x00*",             # TIFF
+)
+
+
+def is_image_bytes(data: bytes) -> bool:
+    """True when ``data`` starts like an image file (PNG, JPEG, GIF, BMP,
+    TIFF, WebP). TGA has no signature: it is accepted only through
+    :func:`is_image_file` by extension plus a Qt decode."""
+    head = bytes(data[:16])
+    if head.startswith(_IMAGE_MAGIC):
+        return True
+    return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+
+
+def is_image_file(path) -> bool:
+    """True when ``path`` is a readable image. A document names its texture
+    files by path, and saving or exporting copies those files out: without
+    this check a crafted document pointing at ``~/.ssh/id_ed25519`` would
+    get that key embedded in the next save."""
+    p = Path(path)
+    try:
+        with open(p, "rb") as fh:
+            head = fh.read(16)
+    except OSError:
+        return False
+    if is_image_bytes(head):
+        return True
+    if p.suffix.lower() == ".tga":
+        from PySide6.QtGui import QImageReader
+        reader = QImageReader(str(p), b"tga")
+        return reader.canRead()
+    return False
+
+
+def cache_image(data: bytes, name: str, subdir: str) -> Path:
+    """Store ``data`` in the texture cache under ``subdir`` and return its
+    path. **Content-addressed**: the file name carries a hash of the bytes, so
+    the same image shared by several documents is written (and uploaded to the
+    GPU) once, and a rewrite of the same file is a no-op. ``name`` goes through
+    :func:`texture_file_name`, so feeding a cached file's own name back in
+    lands on the same file instead of a longer one."""
+    import hashlib
+    digest = hashlib.sha1(data).hexdigest()[:16]
+    safe = texture_file_name(name)
+    out = texture_cache_root() / subdir / f"{digest}-{safe}"
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if not out.exists() or out.stat().st_size != len(data):
+            out.write_bytes(data)
+        return out
+    except OSError:
+        import tempfile
+        tmp = Path(tempfile.mkdtemp(prefix="ingetrazo-tex-")) / safe
+        tmp.write_bytes(data)
+        return tmp
+
+
+@dataclass
+class Texture:
+    path: str          # image file
+    sw: float = 1.0    # real-world width of one tile (metres)
+    sh: float = 1.0    # real-world height of one tile (metres)
+
+    def as_dict(self) -> dict:
+        return {"path": self.path, "sw": self.sw, "sh": self.sh}
+
+    @staticmethod
+    def from_dict(d: dict) -> "Texture":
+        return Texture(d["path"], float(d.get("sw", 1.0)), float(d.get("sh", 1.0)))
+
+
+#: |Z × n| below which the .skp projection maps a face with the world axes
+#: (X, ±Y) instead of the cross product — measured, see
+#: :func:`projection_basis`.
+VERTICAL_TOLERANCE = 1e-3
+
+
+def projection_basis(normal) -> tuple[tuple[float, float, float],
+                                      tuple[float, float, float]]:
+    """The .skp format's in-plane axes for a face normal ``(nx, ny, nz)`` — the
+    basis its default texture projection AND its per-face texture matrices
+    are expressed in: ``xr = normalize(Z × n)``, ``yr = n × xr``; for a
+    vertical normal ``(X, Y)`` looking up and ``(−X, Y)`` looking down.
+    Plain tuples: the ``.skp`` importer runs this per vertex over large
+    models.
+
+    THE one recipe for the whole app. The renderer, the OBJ/glTF writers and
+    the paste preview used to project with ``core.triangulate.plane_axes``
+    (world X projected onto the plane) while the ``.skp`` importer already
+    used this one: on a wall facing +Y or −X the two differ by 180°, so a
+    texture painted in IngeTrazo showed upside-down against the reference
+    rendering of the very same file (measured through the former external
+    converter, 2026-09-04). Calibrated against that ground truth for every
+    orientation, not just the axis-aligned ones.
+
+    ``Z × n`` is discontinuous at the vertical: for ``n = (ε, 0, 1)`` it
+    points along +Y however small ε is, for ``(0, ε, 1)`` along −X. The .skp
+    reference resolves that with a tolerance, measured (2026-09-04) on
+    faces tilted by ε from 1e-10 to 1e-2: the world axes
+    ``(X, ±Y)`` while ``|Z × n| < 1e-3`` (the sine of the tilt), the cross
+    product from 1.0001e-3 up. The same tolerance here keeps a horizontal
+    face whose normal carries float noise — up to 6e-4 on the small faces
+    of Marco's pool — projected the way the .skp reference projects the
+    plane it reads back from the file; with the old 1e-9 every such face came out
+    turned 90°."""
+    nx, ny, nz = float(normal[0]), float(normal[1]), float(normal[2])
+    ln = (nx * nx + ny * ny + nz * nz) ** 0.5
+    if ln > 1e-30:
+        nx, ny, nz = nx / ln, ny / ln, nz / ln
+    xx, xy = -ny, nx                      # Z × n
+    lx = (xx * xx + xy * xy) ** 0.5
+    if lx < VERTICAL_TOLERANCE:
+        # Measured, not derived: a face looking DOWN gets (−X, +Y), the
+        # 180° turn of the upward (X, Y) — not the (X, −Y) mirror the
+        # reader assumed. Every underside of the pool (slabs, benches,
+        # countertops) came out upside-down until measurement said so.
+        return ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)) if nz > 0 \
+            else ((-1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    xx, xy = xx / lx, xy / lx
+    return (xx, xy, 0.0), (-nz * xy, nz * xx, nx * xy - ny * xx)   # n × xr
+
+
+def projection_axes(normal, rot: float = 0.0) -> tuple[QVector3D, QVector3D]:
+    """:func:`projection_basis` as ``QVector3D`` axes, turned in-plane by
+    ``rot`` degrees (the .skp texture rotation)."""
+    n = QVector3D(normal)
+    xr, yr = projection_basis((n.x(), n.y(), n.z()))
+    u_axis, v_axis = QVector3D(*xr), QVector3D(*yr)
+    if rot:
+        import math
+        a = math.radians(rot)
+        cos_a, sin_a = math.cos(a), math.sin(a)
+        u_axis, v_axis = (u_axis * cos_a + v_axis * sin_a,
+                          v_axis * cos_a - u_axis * sin_a)
+    return u_axis, v_axis
+
+
+def planar_uv(normal: QVector3D, positions, sw: float, sh: float,
+              rot: float = 0.0):
+    """.skp-style planar-projected ``(u, v)`` for each world ``positions``
+    point: project onto the .skp plane basis for ``normal`` (so coplanar
+    faces tile seamlessly), scaled by the tile size. ``rot`` turns the texture
+    in-plane by that many degrees (the .skp texture rotation). ``sw``/``sh``
+    ≤ 0 fall back to 1 to avoid a divide-by-zero."""
+    u_axis, v_axis = projection_axes(normal, rot)
+    sw = sw if abs(sw) > 1e-9 else 1.0
+    sh = sh if abs(sh) > 1e-9 else 1.0
+    return [(QVector3D.dotProduct(p, u_axis) / sw,
+             QVector3D.dotProduct(p, v_axis) / sh) for p in positions]
+
+
+def face_uvs(face, tex: dict):
+    """Planar UVs for ``face``'s outer-loop vertices from a texture attrs dict."""
+    return planar_uv(face.normal(), list(face.vertices),
+                     float(tex.get("sw", 1.0)), float(tex.get("sh", 1.0)),
+                     float(tex.get("rot", 0.0)))
+
+
+def fit_uv_affine(points, uvs):
+    """World→UV affine map ``[gu.xyz, u0, gv.xyz, v0]`` fitted from a polygon's
+    vertices and their explicit UVs (a COLLADA/OBJ import). Any UV assignment
+    on a planar polygon is affine over its plane, so evaluating the map at a
+    vertex reproduces its UV exactly — which lets coplanar triangles of the
+    same original face merge and still texture correctly. Returns ``None``
+    when the polygon is degenerate."""
+    n = len(points)
+    if n < 3 or len(uvs) < n:
+        return None
+    if hasattr(points[0], "x"):
+        pts = [p.toTuple() for p in points]
+    else:
+        pts = points
+    # The edge pair with the largest cross product gives the stablest fit.
+    # The search is O(n²); |a×b|² = |a|²|b|² − (a·b)² keeps it cheap. Small
+    # polygons (the bulk) run pure Python; big ones (imported faces can carry
+    # hundreds of vertices) go through one NumPy Gram matmul — a per-pair
+    # Python loop over those dominated .skp import.
+    x0, y0, z0 = pts[0]
+    d = [(x - x0, y - y0, z - z0) for x, y, z in pts[1:]]
+    m = n - 1
+    if m <= 12:
+        best = 1e-24
+        bi = bj = -1
+        for i in range(m):
+            ax, ay, az = d[i]
+            for j in range(i + 1, m):
+                bx, by, bz = d[j]
+                cx = ay * bz - az * by
+                cy = az * bx - ax * bz
+                cz = ax * by - ay * bx
+                c2 = cx * cx + cy * cy + cz * cz
+                if c2 > best:
+                    best = c2
+                    bi, bj = i, j
+        if bi < 0:
+            return None
+    else:
+        import numpy as np
+        dn = np.asarray(d, dtype=np.float64)
+        gram = dn @ dn.T
+        n2 = np.einsum("ij,ij->i", dn, dn)
+        cl2 = np.multiply.outer(n2, n2) - gram * gram
+        flat = int(np.argmax(cl2))
+        bi, bj = flat // m, flat % m
+        if cl2[bi, bj] <= 1e-24:
+            return None
+    e1x, e1y, e1z = d[bi]
+    e2x, e2y, e2z = d[bj]
+    g11 = e1x * e1x + e1y * e1y + e1z * e1z
+    g12 = e1x * e2x + e1y * e2y + e1z * e2z
+    g22 = e2x * e2x + e2y * e2y + e2z * e2z
+    det = g11 * g22 - g12 * g12
+    if abs(det) < 1e-18:
+        return None
+    i = bi + 1
+    j = bj + 1
+    out = []
+    for k in (0, 1):                       # u, then v
+        d1 = uvs[i][k] - uvs[0][k]
+        d2 = uvs[j][k] - uvs[0][k]
+        a = (d1 * g22 - d2 * g12) / det
+        b = (d2 * g11 - d1 * g12) / det
+        gx = e1x * a + e2x * b
+        gy = e1y * a + e2y * b
+        gz = e1z * a + e2z * b
+        c = uvs[0][k] - (gx * x0 + gy * y0 + gz * z0)
+        out.extend([gx, gy, gz, c])
+    return out
+
+
+def affine_uv(uvw, positions):
+    """Evaluate a fitted world→UV map (see :func:`fit_uv_affine`) at points
+    — ``QVector3D`` or plain ``(x, y, z)`` sequences alike."""
+    ux, uy, uz, uc = uvw[0], uvw[1], uvw[2], uvw[3]
+    vx, vy, vz, vc = uvw[4], uvw[5], uvw[6], uvw[7]
+    out = []
+    for p in positions:
+        if hasattr(p, "x"):
+            x, y, z = p.x(), p.y(), p.z()
+        else:
+            x, y, z = p[0], p[1], p[2]
+        out.append((ux * x + uy * y + uz * z + uc,
+                    vx * x + vy * y + vz * z + vc))
+    return out
+
+
+def face_uv_axes(tex: dict, normal):
+    """The affine world→UV map a textured face renders with, as
+    ``(gu, cu, gv, cv)``: ``u = gu·p + cu`` and ``v = gv·p + cv`` at any
+    world point ``p``.
+
+    ONE definition of "where does the texture sit on this face", so the
+    renderer and the ``.skp`` exporter cannot drift apart — the exporter had
+    no UV recipe at all and wrote textured faces with no mapping, which is
+    why a .skp saved from IngeTrazo opened elsewhere with every texture
+    gone and only its average colour left.
+
+    Two sources, matching what the face carries: a fitted ``uvw`` (an import
+    that brought its own texture coordinates) or, failing that, the .skp
+    planar projection of world position (:func:`projection_axes`), so
+    coplanar faces tile seamlessly and a ``planar`` face — which the .skp
+    exporter writes with NO per-face record — lands in the .skp file exactly
+    where the viewport drew it."""
+    uvw = tex.get("uvw")
+    if uvw:
+        return (QVector3D(uvw[0], uvw[1], uvw[2]), float(uvw[3]),
+                QVector3D(uvw[4], uvw[5], uvw[6]), float(uvw[7]))
+    u_axis, v_axis = projection_axes(normal, float(tex.get("rot", 0.0) or 0.0))
+    sw = tex.get("sw", 1.0) or 1.0
+    sh = tex.get("sh", 1.0) or 1.0
+    return (u_axis / sw, 0.0, v_axis / sh, 0.0)
+
+
+def placement_of(tex: dict, normal) -> tuple[float, float, float] | None:
+    """``(sw, sh, rot)`` — the tile size and in-plane rotation a positioned
+    texture (one carrying a fitted ``uvw``) shows on the face of ``normal``:
+    the lengths of the tile axes dual to the map's gradients, and the angle
+    from the .skp projection basis to the U axis. ``None`` when the map is
+    missing or degenerate. What the eyedropper hands to a face on ANOTHER
+    plane: the map itself only means something on its own plane, but the
+    look — the scale and the turn — travels (Marco, 2026-09-15: «debería
+    poder copiar esa muestra… y aplicarlo a otra cara»). Shear and a mirror
+    have no planar equivalent and are dropped."""
+    import math
+    uvw = tex.get("uvw")
+    if not uvw or len(uvw) != 8:
+        return None
+    n = QVector3D(normal)
+    if n.lengthSquared() < 1e-18:
+        return None
+    n = n.normalized()
+    gu = QVector3D(uvw[0], uvw[1], uvw[2])
+    gv = QVector3D(uvw[4], uvw[5], uvw[6])
+    gu = gu - n * QVector3D.dotProduct(gu, n)
+    gv = gv - n * QVector3D.dotProduct(gv, n)
+    g11 = QVector3D.dotProduct(gu, gu)
+    g12 = QVector3D.dotProduct(gu, gv)
+    g22 = QVector3D.dotProduct(gv, gv)
+    det = g11 * g22 - g12 * g12
+    if abs(det) < 1e-24:
+        return None
+    e_u = (gu * g22 - gv * g12) / det
+    e_v = (gv * g11 - gu * g12) / det
+    sw, sh = e_u.length(), e_v.length()
+    if sw < 1e-9 or sh < 1e-9:
+        return None
+    u_axis, v_axis = projection_axes(n)
+    rot = math.degrees(math.atan2(QVector3D.dotProduct(e_u, v_axis),
+                                  QVector3D.dotProduct(e_u, u_axis)))
+    return sw, sh, rot
+
+
+def flattened_texture(tex: dict, normal=None) -> dict:
+    """``tex`` without its per-face map, keeping the look it had on the
+    plane of ``normal`` as a planar projection: ``sw``/``sh``/``rot`` from
+    :func:`placement_of` when a map was fitted there, else the dict as it
+    is minus ``uvw``."""
+    flat = {k: v for k, v in tex.items() if k != "uvw"}
+    if normal is None or not tex.get("uvw"):
+        return flat
+    placed = placement_of(tex, normal)
+    if placed is None:
+        return flat
+    sw, sh, rot = placed
+    flat["sw"], flat["sh"] = float(sw), float(sh)
+    if abs(rot) > 1e-6:
+        flat["rot"] = float(round(rot, 6))
+    else:
+        flat.pop("rot", None)
+    return flat
+
+
+def _rotated_map(gu, cu, gv, cv, axis_point, axis_dir, cos_t, sin_t):
+    """The map ``uv(p) = g·p + c`` carried across a hinge: the new face's
+    map is ``uv(R⁻¹ p)`` for the rotation ``R`` about the shared edge that
+    lays the previous face onto the new one, so the image continues across
+    the edge without a cut. ``g' = R·g``, ``c' = c + g·A − g'·A``."""
+    def rot(v):
+        return (v * cos_t + QVector3D.crossProduct(axis_dir, v) * sin_t
+                + axis_dir * (QVector3D.dotProduct(axis_dir, v) * (1.0 - cos_t)))
+    gu2, gv2 = rot(gu), rot(gv)
+    cu2 = cu + QVector3D.dotProduct(gu, axis_point) - QVector3D.dotProduct(gu2, axis_point)
+    cv2 = cv + QVector3D.dotProduct(gv, axis_point) - QVector3D.dotProduct(gv2, axis_point)
+    return gu2, cu2, gv2, cv2
+
+
+def continuous_maps(mesh, faces, seed, tex: dict) -> dict:
+    """Per-face texture dicts that make ``tex`` run CONTINUOUSLY over a
+    curved surface — ``faces`` joined by soft edges — the classic way to
+    paint a cylinder or a rounded corner: the image is laid on ``seed``
+    (its planar projection, or the map it already carries) and walked to
+    each neighbour across their shared soft edge, turned about that edge
+    into the neighbour's plane, so bricks wrap around the bend instead of
+    restarting on every facet (Marco's rounded corner, 2026-09-15).
+
+    Returns ``{id(face): tex dict with uvw}`` for the faces reached from
+    ``seed``; faces of the set not connected to it are left out (the
+    caller paints them the ordinary way)."""
+    faces = list(faces)
+    if seed is None or not faces:
+        return {}
+    ids = {id(f) for f in faces}
+    gu, cu, gv, cv = face_uv_axes(tex, seed.normal())
+    out = {id(seed): (gu, cu, gv, cv)}
+    stack = [seed]
+    while stack:
+        f = stack.pop()
+        g_u, c_u, g_v, c_v = out[id(f)]
+        n1 = f.normal()
+        if n1.lengthSquared() < 1e-18:
+            continue
+        n1 = n1.normalized()
+        for lp in (f.loop, *f.hole_loops):
+            n = len(lp)
+            for i in range(n):
+                e = mesh.find_edge(lp[i], lp[(i + 1) % n])
+                if e is None or not e.soft:
+                    continue
+                for g in e.faces:
+                    if g is f or id(g) not in ids or id(g) in out:
+                        continue
+                    n2 = g.normal()
+                    d = e.b - e.a
+                    if n2.lengthSquared() < 1e-18 or d.lengthSquared() < 1e-18:
+                        continue
+                    n2 = n2.normalized()
+                    d = d.normalized()
+                    cos_t = QVector3D.dotProduct(n1, n2)
+                    sin_t = QVector3D.dotProduct(d, QVector3D.crossProduct(n1, n2))
+                    if cos_t < -0.999:
+                        continue                # folded back: no hinge
+                    out[id(g)] = _rotated_map(g_u, c_u, g_v, c_v, e.a, d,
+                                              cos_t, sin_t)
+                    stack.append(g)
+    result = {}
+    base = {k: v for k, v in tex.items() if k not in ("uvw", "rot")}
+    for f in faces:
+        m = out.get(id(f))
+        if m is None:
+            continue
+        gu, cu, gv, cv = m
+        result[id(f)] = {**base, "uvw": [gu.x(), gu.y(), gu.z(), float(cu),
+                                         gv.x(), gv.y(), gv.z(), float(cv)]}
+    return result
+
+
+def uv_reference_points(points, normal=None):
+    """Three points on the face's plane, forming a well-conditioned triangle,
+    for pinning an affine UV map. ``None`` when the face is degenerate.
+
+    NOT face vertices: the map is affine, so it can be sampled anywhere on
+    the plane, and picking real corners is what broke the first attempt. A
+    long thin face gives three nearly collinear corners — one sampled face in
+    piscina.igz had two of them 1.8 inches apart and the third 19 away — and
+    fitting a map through that sliver amplifies float error enough to come
+    back rotated. A right-angled triad on the face's own plane, sized to the
+    face, is exact and always conditioned."""
+    pts = [QVector3D(p) for p in points]
+    if len(pts) < 3:
+        return None
+    centre = QVector3D()
+    for p in pts:
+        centre += p
+    centre /= float(len(pts))
+    n = QVector3D(normal) if normal is not None else None
+    if n is None or n.lengthSquared() < 1e-18:
+        # Newell over the ring: robust for any polygon, and the caller may
+        # not have a normal to give.
+        n = QVector3D()
+        count = len(pts)
+        for i in range(count):
+            a, b = pts[i], pts[(i + 1) % count]
+            n += QVector3D((a.y() - b.y()) * (a.z() + b.z()),
+                           (a.z() - b.z()) * (a.x() + b.x()),
+                           (a.x() - b.x()) * (a.y() + b.y()))
+    if n.lengthSquared() < 1e-18:
+        return None
+    e1, e2 = plane_axes(n.normalized())
+    span = max((p - centre).length() for p in pts)
+    if span < 1e-9:
+        return None
+    return centre, centre + e1 * span, centre + e2 * span
+
+
+# ---- Colourize (tinted .skp materials) -----------------------------------
+#
+# The .skp format lets a TEXTURED material also carry a colour, and re-tints the
+# image toward it. Two modes, and they are genuinely different pictures:
+# ``SHIFT`` moves every pixel by the delta between the image average and the
+# target (the stone keeps its veining, moved in tone), ``TINT`` replaces hue
+# and saturation outright and keeps only the per-pixel lightness.
+#
+# This lived in ``formats.skp_openskp`` when the only caller was the .skp
+# import. It is engine, not import: the material editor tints from here too,
+# and the importer now calls in.
+
+COLORIZE_SHIFT = 0
+COLORIZE_TINT = 1
+
+
+def rgb_to_hls(rgb):
+    """Vectorized colorsys.rgb_to_hls over an (..., 3) float array in 0..1."""
+    import numpy as np
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    maxc = rgb.max(axis=-1)
+    minc = rgb.min(axis=-1)
+    lum = (maxc + minc) / 2.0
+    delta = maxc - minc
+    nz = delta > 1e-12
+    denom = np.where(lum <= 0.5, maxc + minc, 2.0 - maxc - minc)
+    sat = np.where(nz & (denom > 1e-12), delta / np.where(denom > 1e-12, denom, 1.0), 0.0)
+    safe = np.where(nz, delta, 1.0)
+    rc = (maxc - r) / safe
+    gc = (maxc - g) / safe
+    bc = (maxc - b) / safe
+    hue = np.where(maxc == r, bc - gc,
+                   np.where(maxc == g, 2.0 + rc - bc, 4.0 + gc - rc))
+    hue = np.where(nz, (hue / 6.0) % 1.0, 0.0)
+    return hue, lum, sat
+
+
+def hls_to_rgb(hue, lum, sat):
+    """Vectorized colorsys.hls_to_rgb; returns an (..., 3) float array."""
+    import numpy as np
+    m2 = np.where(lum <= 0.5, lum * (1.0 + sat), lum + sat - lum * sat)
+    m1 = 2.0 * lum - m2
+
+    def channel(h):
+        h = h % 1.0
+        return np.where(h < 1.0 / 6.0, m1 + (m2 - m1) * h * 6.0,
+               np.where(h < 0.5, m2,
+               np.where(h < 2.0 / 3.0, m1 + (m2 - m1) * (2.0 / 3.0 - h) * 6.0,
+                        m1)))
+
+    return np.stack([channel(hue + 1.0 / 3.0), channel(hue),
+                     channel(hue - 1.0 / 3.0)], axis=-1)
+
+
+def colorize_image(data, target_rgb, ctype=COLORIZE_SHIFT):
+    """Re-tint a shared texture the way the .skp format defines a
+    colourized material copy ("[Name]1", ``type="2"``).
+
+    ``ctype`` 0 ("shift") moves every pixel's hue/lightness/saturation by
+    the delta between the image average and the material colour; ``1``
+    ("tint") replaces hue/saturation outright, keeping the per-pixel
+    lightness variation. Alpha is preserved (the chain-link cutout must
+    survive). Returns PNG bytes, or ``data`` unchanged on any failure."""
+    try:
+        import numpy as np
+        from PySide6.QtCore import QBuffer
+        from PySide6.QtGui import QImage
+        img = QImage.fromData(data)
+        if img.isNull():
+            return data
+        img = img.convertToFormat(QImage.Format.Format_RGBA8888)
+        w, h = img.width(), img.height()
+        buf = np.frombuffer(img.constBits(), dtype=np.uint8,
+                            count=h * img.bytesPerLine())
+        px = buf.reshape(h, img.bytesPerLine())[:, : w * 4].reshape(h, w, 4)
+        rgb = px[..., :3].astype(np.float64) / 255.0
+        alpha = px[..., 3]
+        vis = alpha > 0
+        avg = rgb[vis].mean(axis=0) if vis.any() else rgb.mean(axis=(0, 1))
+        h0, l0, s0 = rgb_to_hls(avg.reshape(1, 3))
+        ht, lt, st = rgb_to_hls(
+            np.array([[c / 255.0 for c in target_rgb[:3]]]))
+        hue, lum, sat = rgb_to_hls(rgb)
+        if ctype == 1:
+            hue = np.full_like(hue, float(ht[0]))
+            sat = np.full_like(sat, float(st[0]))
+        else:
+            hue = (hue + (float(ht[0]) - float(h0[0]))) % 1.0
+            sat = np.clip(sat + (float(st[0]) - float(s0[0])), 0.0, 1.0)
+        lum = np.clip(lum + (float(lt[0]) - float(l0[0])), 0.0, 1.0)
+        out = np.clip(hls_to_rgb(hue, lum, sat) * 255.0 + 0.5,
+                      0, 255).astype(np.uint8)
+        result = np.dstack([out, alpha])
+        tinted = QImage(result.tobytes(), w, h, w * 4,
+                        QImage.Format.Format_RGBA8888)
+        qbuf = QBuffer()
+        qbuf.open(QBuffer.OpenModeFlag.WriteOnly)
+        tinted.save(qbuf, "PNG")
+        return bytes(qbuf.data())
+    except Exception:
+        return data
+
+def tinted_texture(tex: dict, color, ctype: int = COLORIZE_SHIFT) -> dict:
+    """A copy of the ``attrs["texture"]`` dict *tex*, re-tinted toward
+    ``color`` (RGB floats 0–1).
+
+    The tint is BAKED into the image the entry points at, and the untinted
+    source is remembered under ``"base"``. That split is what makes the
+    feature both cheap and non-destructive:
+
+    - ``"path"`` keeps meaning "the image to draw", so the renderer, the six
+      exporters, the compositor and the takeoffs need no changes at all —
+      ``tex["path"]`` is read in 37 places across 13 files.
+    - re-tinting always starts from ``"base"``, never from the last result,
+      so sliding through colours cannot degrade the picture, and removing the
+      colour restores the original exactly (:func:`untinted_texture`).
+
+    The cache is content-addressed, so the same base tinted the same way is
+    written and uploaded once, however many materials ask for it. Returns
+    *tex* unchanged if the source image cannot be read.
+    """
+    base = tex.get("base") or tex.get("path")
+    if not base:
+        return dict(tex)
+    try:
+        data = Path(base).read_bytes()
+    except OSError:
+        return dict(tex)
+    rgb255 = tuple(int(round(max(0.0, min(1.0, c)) * 255.0))
+                   for c in tuple(color)[:3])
+    out = colorize_image(data, rgb255, ctype)
+    if out is data:                       # colorize failed: leave it alone
+        return dict(tex)
+    try:
+        path = cache_image(out, Path(base).name, "tinted")
+    except OSError:
+        return dict(tex)
+    entry = dict(tex)
+    entry["path"] = str(path)
+    entry["base"] = str(base)
+    entry["tint"] = [float(c) for c in tuple(color)[:3]]
+    entry["tint_mode"] = int(ctype)
+    return entry
+
+
+def untinted_texture(tex: dict) -> dict:
+    """The entry with its colour removed: back to the original image."""
+    base = tex.get("base")
+    entry = {k: v for k, v in tex.items()
+             if k not in ("base", "tint", "tint_mode")}
+    if base:
+        entry["path"] = base
+    return entry

@@ -11,6 +11,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createLicenseService } from "./license.mjs";
 import { createModService } from "./mods.mjs";
+import { registerForumRoutes } from "./forum.mjs";
 import { createSpeechService } from "./speech.mjs";
 import { MATERIALIZE_MAPS, materializeTextureFile } from "./materialize.mjs";
 import { discoverLocalAiEndpoints, ensureHermesApiServer, readHermesDirectProviders } from "./ai-endpoints.mjs";
@@ -177,7 +178,12 @@ const CHAT_WS_URL =
 const CHAT_SERVER_USER = process.env.TWIX_LICENSE_USER || "admin";
 const CHAT_SERVER_PASS = process.env.TWIX_LICENSE_PASS || "380112";
 const CHAT_TOKEN_TTL = 10 * 60 * 1000;
-const CHAT_CHANNEL_NAME = "CreatorStudio.Main";
+const CHAT_DEFAULT_STUDIO_NAME = "Twilight Studio";
+const CHAT_DEFAULT_STUDIO_SLUG = "TwilightStudio";
+const CHAT_DEFAULT_STUDIO_ID = "studio:TwilightStudio";
+const CHAT_CHANNEL_NAME = "TwilightStudio.Main";
+// Keep the legacy id: every existing message is stored against this channel.
+// Renaming the record keeps the history and makes the app show the new name.
 const CHAT_CHANNEL_ID = "global:CreatorStudio:CreatorStudio.Main";
 const CHAT_MAX_FILE_BYTES = 5 * 1024 * 1024 * 1024;
 const CHAT_FILE_TTL_MS = 10 * 60 * 1000;
@@ -4582,18 +4588,34 @@ async function chatServerToken(force = false) {
   if (!force && chatTokenCache.token && Date.now() - chatTokenCache.at < CHAT_TOKEN_TTL) {
     return chatTokenCache.token;
   }
-  const response = await fetch(CHAT_SERVER_URL + "/api/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
-    body: JSON.stringify({ username: CHAT_SERVER_USER, password: CHAT_SERVER_PASS }),
-    signal: AbortSignal.timeout(12000),
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || !data?.token) {
-    throw new Error("Chat server login failed (HTTP " + response.status + ").");
+  const loginPaths = ["/api/login", "/login", "/api/auth/login"];
+  let lastStatus = 0;
+  let lastError = "";
+  for (const loginPath of loginPaths) {
+    try {
+      const response = await fetch(CHAT_SERVER_URL + loginPath, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
+        body: JSON.stringify({ username: CHAT_SERVER_USER, password: CHAT_SERVER_PASS }),
+        signal: AbortSignal.timeout(12000),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data?.token) {
+        chatTokenCache = { token: String(data.token), at: Date.now() };
+        return chatTokenCache.token;
+      }
+      lastStatus = response.status;
+      lastError = String(data?.error || data?.message || "");
+      // Only walk to the next route when the endpoint itself is missing.
+      if (response.status !== 404 && response.status !== 405) break;
+    } catch (error) {
+      lastError = String(error?.message || error);
+    }
   }
-  chatTokenCache = { token: String(data.token), at: Date.now() };
-  return chatTokenCache.token;
+  throw new Error(
+    "Chat server login failed (HTTP " + (lastStatus || "offline") + ") at " + CHAT_SERVER_URL + "." +
+      (lastError ? " " + lastError : ""),
+  );
 }
 
 async function chatServerFetch(pathname, options = {}) {
@@ -4629,54 +4651,647 @@ app.get("/api/chat/config", (req, res) => {
     fileTtlMs: CHAT_FILE_TTL_MS,
     maxFileBytes: CHAT_MAX_FILE_BYTES,
     defaultBandwidthKbps: 4096,
+    defaultStudio: CHAT_DEFAULT_STUDIO_ID,
+    defaultStudioSlug: CHAT_DEFAULT_STUDIO_SLUG,
   });
 });
 
-async function ensureChatChannel() {
-  const data = await chatServerFetch("/api/bitboy_chat_channels");
-  const records = data.records || {};
-  const found = Object.entries(records).find(([id, channel]) => {
-    const name = String(channel.n || channel.name || "").toLowerCase();
-    return id === CHAT_CHANNEL_ID || name === CHAT_CHANNEL_NAME.toLowerCase();
-  });
-  if (found) {
-    const [id, channel] = found;
-    return {
-      id: channel.id || channel.__id || id,
-      name: channel.n || channel.name || CHAT_CHANNEL_NAME,
-      type: channel.t || channel.type || "global",
-      server: channel.sv || channel.server || "CreatorStudio",
-      description: channel.d || channel.desc || "Creator Studio developer chat and direct file transfer",
-      position: Number(channel.pos || 0),
-    };
-  }
-  const created = await chatServerFetch("/api/bitboy_chat_channels", {
-    method: "POST",
-    body: {
-      id: CHAT_CHANNEL_ID,
-      n: CHAT_CHANNEL_NAME,
-      t: "global",
-      sv: "CreatorStudio",
-      d: "Creator Studio developer chat and direct file transfer",
-      pos: 0,
-    },
-  });
+function chatRecordEntries(data) {
+  return Object.entries(data?.records || {}).map(([id, row]) => ({
+    ...row,
+    id: String(row?.__id || row?.id || id),
+  }));
+}
+
+function chatStudioSlugify(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+}
+
+function chatStudioPascal(value) {
+  return (
+    String(value || "")
+      .trim()
+      .replace(/[^a-zA-Z0-9]+/g, "")
+      .slice(0, 28) || "Studio"
+  );
+}
+
+function chatChannelFromRow(row, fallbackName = "") {
+  const id = String(row.id || row.__id || "");
+  const name = String(row.n || row.name || fallbackName || "channel");
   return {
-    id: created.id || created.__id || CHAT_CHANNEL_ID,
-    name: created.n || CHAT_CHANNEL_NAME,
-    type: created.t || "global",
-    server: created.sv || "CreatorStudio",
-    description: created.d || "Creator Studio developer chat and direct file transfer",
-    position: 0,
+    id,
+    name,
+    type: String(row.t || row.type || "global"),
+    server: String(row.sv || row.server || CHAT_DEFAULT_STUDIO_SLUG),
+    description: String(row.d || row.desc || ""),
+    position: Number(row.pos || 0),
+    main:
+      Boolean(row.main) ||
+      /.main$/i.test(name) ||
+      id === CHAT_CHANNEL_ID,
   };
 }
 
-app.get("/api/chat/channels", async (req, res) => {
+function chatStudioFromRow(row, channelRows) {
+  const slug =
+    String(row.sv || row.slug || "").trim() || chatStudioPascal(row.n || row.name);
+  const studioId = String(row.id || row.__id || "studio:" + slug);
+  const channels = (channelRows || [])
+    .filter((channel) => {
+      const recordId = String(channel.id || "");
+      if (recordId === studioId || recordId.startsWith("studio:")) return false;
+      if (String(channel.t || channel.type || "").toLowerCase() === "dm") return false;
+      const channelStudio = String(channel.studio || "").trim();
+      const channelServer = String(channel.sv || channel.server || "").trim();
+      return (
+        channelStudio === studioId ||
+        channelServer.toLowerCase() === slug.toLowerCase()
+      );
+    })
+    .map((channel) => chatChannelFromRow(channel))
+    .sort((a, b) => a.position - b.position || a.name.localeCompare(b.name));
+  const mainId = String(row.main || "").trim();
+  const main =
+    channels.find((channel) => channel.id === mainId) ||
+    channels.find((channel) => channel.main) ||
+    channels[0];
+  return {
+    id: studioId,
+    slug,
+    name: String(row.n || row.name || slug),
+    owner: String(row.owner || row.o || ""),
+    description: String(row.d || row.desc || ""),
+    mainChannel: main?.id || mainId || "",
+    channels,
+    members: Number(row.members || 0),
+    createdAt: row.__created_at || "",
+  };
+}
+
+async function chatChannelRows() {
+  const data = await chatServerFetch("/api/bitboy_chat_channels");
+  return chatRecordEntries(data);
+}
+
+async function ensureDefaultChatStudio(rows) {
+  const all = rows || (await chatChannelRows());
+  const slug = CHAT_DEFAULT_STUDIO_SLUG;
+  const studioId = CHAT_DEFAULT_STUDIO_ID;
+  let mainRow =
+    all.find((row) => String(row.id) === CHAT_CHANNEL_ID) ||
+    all.find(
+      (row) =>
+        String(row.n || row.name || "").toLowerCase() ===
+        CHAT_CHANNEL_NAME.toLowerCase(),
+    );
+  if (!mainRow) {
+    const created = await chatServerFetch("/api/bitboy_chat_channels", {
+      method: "POST",
+      body: {
+        id: CHAT_CHANNEL_ID,
+        n: CHAT_CHANNEL_NAME,
+        t: "global",
+        sv: slug,
+        studio: studioId,
+        d: "Twilight Studio main channel",
+        pos: 0,
+      },
+    });
+    mainRow = { ...created, id: created.__id || created.id || CHAT_CHANNEL_ID };
+  } else if (String(mainRow.n || "") !== CHAT_CHANNEL_NAME) {
+    try {
+      await chatServerFetch("/api/bitboy_chat_channels", {
+        method: "POST",
+        body: {
+          ...mainRow,
+          id: mainRow.id || CHAT_CHANNEL_ID,
+          n: CHAT_CHANNEL_NAME,
+          t: "global",
+          sv: slug,
+          studio: studioId,
+          d: mainRow.d || "Twilight Studio main channel",
+        },
+      });
+      mainRow = { ...mainRow, n: CHAT_CHANNEL_NAME, sv: slug, studio: studioId };
+    } catch (error) {
+      log("warning", "chat", "main channel rename failed", {
+        message: error.message,
+      });
+    }
+  }
+  let studioRow = all.find((row) => String(row.id) === studioId);
+  if (!studioRow) {
+    const created = await chatServerFetch("/api/bitboy_chat_channels", {
+      method: "POST",
+      body: {
+        id: studioId,
+        n: CHAT_DEFAULT_STUDIO_NAME,
+        t: "studio",
+        sv: slug,
+        owner: "TwilightStudio.Dev",
+        d: "The official Twilight Studio community hub",
+        main: mainRow.id || CHAT_CHANNEL_ID,
+        pos: -10,
+      },
+    });
+    studioRow = { ...created, id: created.__id || created.id || studioId };
+  } else if (!studioRow.main) {
+    try {
+      await chatServerFetch("/api/bitboy_chat_channels", {
+        method: "POST",
+        body: {
+          ...studioRow,
+          id: studioRow.id || studioId,
+          main: mainRow.id || CHAT_CHANNEL_ID,
+        },
+      });
+      studioRow = { ...studioRow, main: mainRow.id || CHAT_CHANNEL_ID };
+    } catch {}
+  }
+  const channelRows = all.filter(
+    (row) => !String(row.id || "").startsWith("studio:"),
+  );
+  return chatStudioFromRow(
+    { ...studioRow, main: studioRow.main || mainRow.id || CHAT_CHANNEL_ID },
+    channelRows,
+  );
+}
+
+async function listChatStudios() {
+  let rows = await chatChannelRows();
+  const defaultStudio = await ensureDefaultChatStudio(rows);
+  rows = await chatChannelRows();
+  const studioRows = rows.filter(
+    (row) =>
+      String(row.id || "").startsWith("studio:") ||
+      String(row.t || "").toLowerCase() === "studio",
+  );
+  const channelRows = rows.filter(
+    (row) =>
+      !String(row.id || "").startsWith("studio:") &&
+      String(row.t || "").toLowerCase() !== "studio",
+  );
+  const studios = studioRows.map((row) =>
+    chatStudioFromRow(row, channelRows),
+  );
+  if (!studios.some((studio) => studio.id === defaultStudio.id)) {
+    studios.unshift(defaultStudio);
+  }
+  studios.sort((a, b) =>
+    a.id === defaultStudio.id ? -1 : b.id === defaultStudio.id ? 1 : a.name.localeCompare(b.name),
+  );
   try {
-    const channel = await ensureChatChannel();
-    // Creator Studio has exactly one channel. BitBoy's public and review
-    // channels stay on the server but are never shown in this applet.
-    res.json({ ok: true, channels: [channel] });
+    const profiles = await chatServerFetch("/api/creator_chat_profiles");
+    const records = Object.values(profiles.records || {});
+    for (const studio of studios) {
+      studio.members = records.filter(
+        (profile) =>
+          String(profile.studio || "") === studio.id ||
+          String(profile.studioSlug || "").toLowerCase() === studio.slug.toLowerCase(),
+      ).length;
+    }
+    // The official hub owner must always be a real CEO in the cloud profile
+    // table, not just the owner string on the studio row.
+    const owner = String(defaultStudio.owner || "").trim();
+    const ownerRecord = records.find(
+      (profile) => String(profile.u || "").toLowerCase() === owner.toLowerCase(),
+    );
+    if (owner && ownerRecord && !String(ownerRecord.studio || "")) {
+      await saveChatProfilePatch(owner, {
+        studio: defaultStudio.id,
+        studioSlug: defaultStudio.slug,
+        studioRole: "owner",
+      }).catch(() => null);
+    }
+  } catch {}
+  return { studios, defaultStudio };
+}
+
+function findChatStudio(studios, value) {
+  const needle = String(value || "").trim().toLowerCase();
+  if (!needle) return null;
+  return (
+    studios.find(
+      (studio) =>
+        studio.id.toLowerCase() === needle ||
+        studio.slug.toLowerCase() === needle ||
+        studio.name.toLowerCase() === needle,
+    ) || null
+  );
+}
+
+function canManageChatStudio(studio, username) {
+  const user = String(username || "").trim().toLowerCase();
+  return Boolean(
+    studio &&
+      user &&
+      (studio.owner.toLowerCase() === user || user === HUB_ADMIN_USERNAME),
+  );
+}
+
+async function chatProfileRecord(username) {
+  const data = await chatServerFetch("/api/creator_chat_profiles");
+  const entries = Object.entries(data.records || {});
+  const match = entries.find(
+    ([, row]) =>
+      String(row.u || row.username || "").toLowerCase() ===
+      String(username || "").toLowerCase(),
+  );
+  return match ? { ...match[1], id: match[0] } : null;
+}
+
+async function saveChatProfilePatch(username, patch) {
+  const current = await chatProfileRecord(username);
+  const body = {
+    ...(current || {
+      id: "profile:" + String(username || "").toLowerCase(),
+      u: username,
+      name: username,
+      avatar: "",
+      border: "none",
+      font: "system",
+      gradient: ["#7dd3fc", "#c084fc"],
+      effect: "none",
+    }),
+    ...patch,
+    id: current?.id || "profile:" + String(username || "").toLowerCase(),
+  };
+  return chatServerFetch("/api/creator_chat_profiles", {
+    method: "POST",
+    body,
+  });
+}
+
+let chatStudiosCache = { at: 0, data: null };
+
+app.get("/api/chat/studios", async (req, res) => {
+  try {
+    const { studios, defaultStudio } = await listChatStudios();
+    const payload = {
+      ok: true,
+      studios,
+      defaultStudio: defaultStudio.id,
+      defaultSlug: defaultStudio.slug,
+    };
+    chatStudiosCache = { at: Date.now(), data: payload };
+    res.json(payload);
+  } catch (error) {
+    // The cloud is reached through ngrok, which occasionally drops a request.
+    // Serve the last good studio tree instead of failing the whole chat applet.
+    if (chatStudiosCache.data) {
+      return res.json({
+        ...chatStudiosCache.data,
+        cached: true,
+        warning: error.message,
+      });
+    }
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/chat/studios", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const name = String(body.name || "").trim().slice(0, 40);
+    const owner = String(body.owner || body.username || "").trim();
+    if (name.length < 2) {
+      return res.status(400).json({ error: "Studio name needs at least 2 characters." });
+    }
+    if (!owner) {
+      return res.status(400).json({ error: "A studio owner username is required." });
+    }
+    const { studios } = await listChatStudios();
+    const owned = studios.find(
+      (studio) => studio.owner.toLowerCase() === owner.toLowerCase(),
+    );
+    if (owned) {
+      return res.status(409).json({
+        error: "You already own " + owned.name + ". Manage it from the Servers panel.",
+        studio: owned,
+      });
+    }
+    const currentProfile = await chatProfileRecord(owner);
+    const currentStudioId = String(currentProfile?.studio || "").trim();
+    const currentStillExists = studios.some((studio) => studio.id === currentStudioId);
+    if (currentStudioId && currentStillExists) {
+      return res.status(409).json({
+        error:
+          "You are already in a studio. Leave it before creating your own studio, so every member stays in one studio at a time.",
+        currentStudio: currentStudioId,
+      });
+    }
+    const slug = chatStudioPascal(name);
+    if (studios.some((studio) => studio.slug.toLowerCase() === slug.toLowerCase())) {
+      return res.status(409).json({ error: "That studio name is already taken." });
+    }
+    const studioId = "studio:" + slug;
+    const mainName = slug + ".Main";
+    const mainId = "global:" + slug + ":" + mainName;
+    await chatServerFetch("/api/bitboy_chat_channels", {
+      method: "POST",
+      body: {
+        id: mainId,
+        n: mainName,
+        t: "global",
+        sv: slug,
+        studio: studioId,
+        d: name + " main channel",
+        pos: 0,
+      },
+    });
+    const created = await chatServerFetch("/api/bitboy_chat_channels", {
+      method: "POST",
+      body: {
+        id: studioId,
+        n: name,
+        t: "studio",
+        sv: slug,
+        owner,
+        d: String(body.description || "A Creator Studio community hub").slice(0, 240),
+        main: mainId,
+        pos: 0,
+      },
+    });
+    const studio = {
+      id: studioId,
+      slug,
+      name,
+      owner,
+      description: String(body.description || "A Creator Studio community hub"),
+      mainChannel: mainId,
+      channels: [chatChannelFromRow({ id: mainId, n: mainName, t: "global", sv: slug, studio: studioId, d: name + " main channel", pos: 0 })],
+      members: 1,
+      createdAt: created.__created_at || "",
+    };
+    await saveChatProfilePatch(owner, {
+      studio: studioId,
+      studioSlug: slug,
+      studioRole: "owner",
+    }).catch(() => null);
+    log("info", "chat", "studio created", { studio: studioId, owner });
+    res.json({ ok: true, studio });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/chat/studios/join", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const username = String(body.username || "").trim();
+    if (!username) return res.status(400).json({ error: "username is required" });
+    const { studios } = await listChatStudios();
+    const studio = findChatStudio(studios, body.studio || body.studioId || body.studioSlug);
+    if (!studio) return res.status(404).json({ error: "That studio no longer exists." });
+    const currentProfile = await chatProfileRecord(username);
+    const currentStudio = String(currentProfile?.studio || "").trim();
+    const currentStillExists = studios.some((entry) => entry.id === currentStudio);
+    if (currentStudio && currentStudio !== studio.id && currentStillExists) {
+      return res.status(409).json({
+        error:
+          "You are already in a studio. Leave it before joining another studio, so you stay in one studio community at a time.",
+        currentStudio,
+      });
+    }
+    const role =
+      studio.owner.toLowerCase() === username.toLowerCase() ? "owner" : "member";
+    await saveChatProfilePatch(username, {
+      studio: studio.id,
+      studioSlug: studio.slug,
+      studioRole: role,
+    });
+    res.json({ ok: true, studio, role });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+async function deleteChatChannelMessages(channelId) {
+  // The cloud keeps messages keyed by channel. Delete them in small batches so
+  // a disbanded studio does not leave orphaned chat JSON behind.
+  for (let pass = 0; pass < 4; pass += 1) {
+    let rows = [];
+    try {
+      const data = await chatServerFetch(
+        "/api/channels/" +
+          encodeURIComponent(channelId) +
+          "/messages?newest=1&limit=200",
+        { timeoutMs: 15000 },
+      );
+      rows = Array.isArray(data?.messages) ? data.messages : [];
+    } catch {
+      return;
+    }
+    const ids = rows
+      .map((row) => String(row.id || row.__id || ""))
+      .filter(Boolean);
+    if (!ids.length) return;
+    for (let index = 0; index < ids.length; index += 8) {
+      const batch = ids.slice(index, index + 8);
+      await Promise.all(
+        batch.map((id) =>
+          chatServerFetch("/api/bitboy_chat_messages/" + encodeURIComponent(id), {
+            method: "DELETE",
+            timeoutMs: 12000,
+          }).catch(() => null),
+        ),
+      );
+    }
+    if (rows.length < 200) return;
+  }
+}
+
+async function clearStudioMembers(studio) {
+  try {
+    const data = await chatServerFetch("/api/creator_chat_profiles");
+    const entries = Object.entries(data?.records || {});
+    for (const [id, row] of entries) {
+      const matches =
+        String(row.studio || "") === studio.id ||
+        String(row.studioSlug || "").toLowerCase() === studio.slug.toLowerCase();
+      if (!matches) continue;
+      await chatServerFetch("/api/creator_chat_profiles", {
+        method: "POST",
+        body: { ...row, id, studio: "", studioSlug: "", studioRole: "" },
+        timeoutMs: 12000,
+      }).catch(() => null);
+    }
+  } catch {}
+}
+
+async function disbandChatStudio(studio) {
+  for (const channel of studio.channels) {
+    if (!channel.id) continue;
+    await deleteChatChannelMessages(channel.id);
+    await chatServerFetch(
+      "/api/bitboy_chat_channels/" + encodeURIComponent(channel.id),
+      { method: "DELETE", timeoutMs: 12000 },
+    ).catch(() => null);
+  }
+  await clearStudioMembers(studio);
+  await chatServerFetch(
+    "/api/bitboy_chat_channels/" + encodeURIComponent(studio.id),
+    { method: "DELETE", timeoutMs: 12000 },
+  ).catch(() => null);
+}
+
+app.post("/api/chat/studios/leave", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const username = String(body.username || "").trim();
+    if (!username) return res.status(400).json({ error: "username is required" });
+    const { studios } = await listChatStudios();
+    const studio = findChatStudio(studios, body.studio || body.studioId || body.studioSlug);
+    if (!studio) {
+      await saveChatProfilePatch(username, {
+        studio: "",
+        studioSlug: "",
+        studioRole: "",
+      });
+      return res.json({ ok: true });
+    }
+    if (studio.owner.toLowerCase() === username.toLowerCase()) {
+      if (studio.id === CHAT_DEFAULT_STUDIO_ID || studio.slug === CHAT_DEFAULT_STUDIO_SLUG) {
+        return res.status(403).json({
+          error: "The official Twilight Studio hub is the community default and cannot be disbanded.",
+        });
+      }
+      if (body.disband !== true) {
+        return res.status(409).json({
+          error:
+            "You own this studio. Leaving disbands it, removes every channel and cloud studio file, and removes its members. Confirm the disband to continue.",
+          requiresDisband: true,
+          studio,
+        });
+      }
+      await disbandChatStudio(studio);
+      await saveChatProfilePatch(username, {
+        studio: "",
+        studioSlug: "",
+        studioRole: "",
+      });
+      log("info", "chat", "studio disbanded", {
+        studio: studio.id,
+        owner: username,
+      });
+      return res.json({ ok: true, disbanded: true, studio });
+    }
+    await saveChatProfilePatch(username, {
+      studio: "",
+      studioSlug: "",
+      studioRole: "",
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+const chatChannelsCache = new Map();
+
+app.get("/api/chat/channels", async (req, res) => {
+  const requested = String(req.query.studio || "default");
+  try {
+    const { studios, defaultStudio } = await listChatStudios();
+    const studio =
+      findChatStudio(studios, req.query.studio) || defaultStudio;
+    const channels = studio.channels.length
+      ? studio.channels
+      : [chatChannelFromRow({ id: studio.mainChannel || CHAT_CHANNEL_ID, n: CHAT_CHANNEL_NAME, sv: studio.slug })];
+    const payload = { ok: true, studio, channels };
+    chatChannelsCache.set(requested, payload);
+    chatChannelsCache.set(studio.id, payload);
+    chatChannelsCache.set(studio.slug, payload);
+    if (studio.id === CHAT_DEFAULT_STUDIO_ID) chatChannelsCache.set("default", payload);
+    res.json(payload);
+  } catch (error) {
+    const cached =
+      chatChannelsCache.get(requested) || chatChannelsCache.get("default");
+    if (cached) {
+      return res.json({ ...cached, cached: true, warning: error.message });
+    }
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/chat/channels", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const username = String(body.username || body.owner || "").trim();
+    const { studios } = await listChatStudios();
+    const studio = findChatStudio(studios, body.studio || body.studioId || body.studioSlug);
+    if (!studio) return res.status(404).json({ error: "Studio not found." });
+    if (!canManageChatStudio(studio, username)) {
+      return res.status(403).json({ error: "Only this studio's owner can add channels." });
+    }
+    let name = String(body.name || "")
+      .trim()
+      .replace(/s+/g, "-")
+      .replace(/[^a-zA-Z0-9._-]/g, "");
+    if (!name) return res.status(400).json({ error: "Channel name is required." });
+    if (
+      name.toLowerCase() === studio.slug.toLowerCase() ||
+      name.toLowerCase() === "main"
+    ) {
+      name = "Main";
+    }
+    if (!name.toLowerCase().startsWith(studio.slug.toLowerCase() + ".")) {
+      name = studio.slug + "." + name;
+    }
+    if (studio.channels.some((channel) => channel.name.toLowerCase() === name.toLowerCase())) {
+      return res.status(409).json({ error: "That channel already exists in this studio." });
+    }
+    const id = "global:" + studio.slug + ":" + name;
+    const created = await chatServerFetch("/api/bitboy_chat_channels", {
+      method: "POST",
+      body: {
+        id,
+        n: name,
+        t: "global",
+        sv: studio.slug,
+        studio: studio.id,
+        d: "Text channel in " + studio.name,
+        pos: studio.channels.length + 1,
+      },
+    });
+    log("info", "chat", "studio channel created", { studio: studio.id, channel: id });
+    res.json({
+      ok: true,
+      channel: chatChannelFromRow({ ...created, id: created.__id || id }),
+    });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.delete("/api/chat/channels/:id", async (req, res) => {
+  try {
+    const id = decodeURIComponent(String(req.params.id || ""));
+    const username = String(req.query.username || req.body?.username || "").trim();
+    const { studios } = await listChatStudios();
+    const studio = studios.find((entry) =>
+      entry.channels.some((channel) => channel.id === id),
+    );
+    if (!studio) return res.status(404).json({ error: "Channel not found." });
+    if (!canManageChatStudio(studio, username)) {
+      return res.status(403).json({ error: "Only this studio's owner can remove channels." });
+    }
+    const channel = studio.channels.find((entry) => entry.id === id);
+    if (!channel) return res.status(404).json({ error: "Channel not found." });
+    if (channel.main || channel.id === CHAT_CHANNEL_ID || /.main$/i.test(channel.name)) {
+      return res.status(403).json({ error: "The Main channel cannot be removed." });
+    }
+    await chatServerFetch("/api/bitboy_chat_channels/" + encodeURIComponent(id), {
+      method: "DELETE",
+    });
+    log("info", "chat", "studio channel removed", { studio: studio.id, channel: id });
+    res.json({ ok: true, channel });
   } catch (error) {
     res.status(502).json({ error: error.message });
   }
@@ -4721,12 +5336,12 @@ async function chatLegacyPresence() {
   // Older builds and other clients wrote presence into the message table.
   // Keep reading that history so those users still get a correct dot while
   // they update to the build that heartbeats into creator_chat_presence.
-  if (Date.now() - chatLegacyPresenceCache.at < 60_000) return chatLegacyPresenceCache.entries;
+  if (Date.now() - chatLegacyPresenceCache.at < 5 * 60_000) return chatLegacyPresenceCache.entries;
   try {
     const data = await chatServerFetch(
       "/api/channels/" +
         encodeURIComponent(CHAT_CHANNEL_ID) +
-        "/messages?newest=1&limit=500",
+        "/messages?newest=1&limit=200",
       { timeoutMs: 12000 },
     );
     const entries = (Array.isArray(data?.messages) ? data.messages : [])
@@ -4740,7 +5355,14 @@ async function chatLegacyPresence() {
   }
 }
 
+let chatMergedPresenceCache = { at: 0, entries: [] };
+
 async function mergedChatPresence() {
+  // Presence is polled by every open app. Cache the merged cloud answer so a
+  // slow ngrok round-trip cannot be repeated by every client every few seconds.
+  if (Date.now() - chatMergedPresenceCache.at < 15_000) {
+    return chatMergedPresenceCache.entries;
+  }
   const merged = new Map();
   const add = (entry) => {
     if (!entry) return;
@@ -4755,12 +5377,14 @@ async function mergedChatPresence() {
   ]);
   for (const entry of cloudPresence) add(entry);
   for (const entry of legacyPresence) add(entry);
-  return [...merged.values()]
+  const entries = [...merged.values()]
     .map((entry) => ({
       ...entry,
       online: entry.online && Date.now() - entry.at < CHAT_PRESENCE_TTL_MS,
     }))
     .sort((a, b) => b.at - a.at);
+  chatMergedPresenceCache = { at: Date.now(), entries };
+  return entries;
 }
 
 app.get("/api/chat/presence", async (req, res) => {
@@ -4786,6 +5410,7 @@ app.post("/api/chat/presence", async (req, res) => {
       at: Date.now(),
     };
     chatPresence.set(key, entry);
+    chatMergedPresenceCache.at = 0;
     // Presence lives in its own cloud table. Keeping it out of the message
     // table means heartbeats can no longer push real chat messages out of the
     // newest-history window.
@@ -4879,6 +5504,42 @@ app.get("/api/chat/messages", async (req, res) => {
   }
 });
 
+const ensuredDmSessions = new Set();
+
+function dmSessionRecordId(first, second) {
+  return (
+    "dm:" +
+    [String(first || "").toLowerCase(), String(second || "").toLowerCase()]
+      .sort()
+      .join("__")
+  );
+}
+
+async function ensureDmSessionRecord(username, peer, channel) {
+  const id = dmSessionRecordId(username, peer);
+  if (ensuredDmSessions.has(id)) return id;
+  ensuredDmSessions.add(id);
+  try {
+    await chatServerFetch("/api/bitboy_chat_channels", {
+      method: "POST",
+      timeoutMs: 15000,
+      body: {
+        id,
+        n: "DM " + username + " / " + peer,
+        t: "dm",
+        sv: "CreatorStudio",
+        users: [username, peer].sort(),
+        channel,
+        lastAt: Date.now(),
+        d: "Direct message session between " + username + " and " + peer,
+      },
+    });
+  } catch {
+    ensuredDmSessions.delete(id);
+  }
+  return id;
+}
+
 app.post("/api/chat/send", async (req, res) => {
   try {
     const body = req.body || {};
@@ -4897,6 +5558,11 @@ app.post("/api/chat/send", async (req, res) => {
     for (const key of ["kind", "to", "file", "signal", "avatar", "name", "border", "font", "gradient", "effect", "expiresAt"]) {
       if (body[key] !== undefined) payload[key] = body[key];
     }
+    // The first message in a direct message thread creates a small DM session
+    // record on the cloud. An unused, opened hotline never gets a record.
+    if (payload.to) {
+      void ensureDmSessionRecord(username, String(payload.to), channel).catch(() => null);
+    }
     // The channel history endpoint reads bitboy_chat_messages, so persist there.
     // /api/messages is a different table and its rows never appear in history.
     const data = await chatServerFetch("/api/bitboy_chat_messages", { method: "POST", body: payload });
@@ -4913,8 +5579,38 @@ app.post("/api/chat/delete", async (req, res) => {
     const id = String(body.id || body.messageId || "").trim();
     const username = String(body.username || "").trim();
     if (!id) return res.status(400).json({ error: "A message id is required." });
-    if (!(await hubAdminAllowed(username, body.accountId))) {
-      return res.status(403).json({ error: "Only TwilightStudio.Dev can delete chat messages." });
+    if (!username) {
+      return res.status(403).json({ error: "A username is required to delete a message." });
+    }
+    let rows = [];
+    const idx = Number(body.idx || body.i || 0);
+    const query = idx
+      ? "before=" + encodeURIComponent(String(idx + 1)) + "&limit=10"
+      : "newest=1&limit=300";
+    try {
+      const data = await chatServerFetch(
+        "/api/channels/" + encodeURIComponent(channel) + "/messages?" + query,
+      );
+      rows = Array.isArray(data?.messages) ? data.messages : [];
+    } catch {
+      rows = [];
+    }
+    let row = rows.find((message) => String(message.id || message.__id || "") === id);
+    if (!row && idx) {
+      try {
+        const data = await chatServerFetch(
+          "/api/channels/" + encodeURIComponent(channel) + "/messages?newest=1&limit=300",
+        );
+        rows = Array.isArray(data?.messages) ? data.messages : [];
+        row = rows.find((message) => String(message.id || message.__id || "") === id);
+      } catch {}
+    }
+    if (!row) {
+      return res.status(404).json({ error: "That message is no longer on the cloud." });
+    }
+    const author = String(row.u || row.user || "").toLowerCase();
+    if (author !== username.toLowerCase()) {
+      return res.status(403).json({ error: "You can only delete your own messages." });
     }
     const attempts = [
       ["/api/bitboy_chat_messages/" + encodeURIComponent(id), { method: "DELETE" }],
@@ -4967,6 +5663,89 @@ app.post("/api/chat/delete", async (req, res) => {
   }
 });
 
+app.post("/api/chat/dm/delete", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const username = String(body.username || "").trim();
+    const peer = String(body.peer || "").trim();
+    if (!username || !peer) {
+      return res.status(400).json({ error: "username and peer are required" });
+    }
+    const me = username.toLowerCase();
+    const them = peer.toLowerCase();
+    const channelIds = new Set();
+    if (body.channel) channelIds.add(String(body.channel));
+    channelIds.add(CHAT_CHANNEL_ID);
+    try {
+      const data = await chatServerFetch("/api/bitboy_chat_channels", { timeoutMs: 15000 });
+      for (const row of chatRecordEntries(data)) {
+        const id = String(row.id || "");
+        if (!id || id.startsWith("studio:") || String(row.t || "") === "studio") continue;
+        channelIds.add(id);
+      }
+    } catch {}
+    try {
+      const { studios } = await listChatStudios();
+      for (const studio of studios) {
+        for (const channel of studio.channels || []) {
+          if (channel.id) channelIds.add(String(channel.id));
+        }
+      }
+    } catch {}
+
+    const dmRecordId = dmSessionRecordId(username, peer);
+    let deleted = 0;
+    for (const channel of channelIds) {
+      if (!channel) continue;
+      for (let pass = 0; pass < 3; pass += 1) {
+        let rows = [];
+        try {
+          const data = await chatServerFetch(
+            "/api/channels/" +
+              encodeURIComponent(channel) +
+              "/messages?newest=1&limit=500",
+            { timeoutMs: 15000 },
+          );
+          rows = Array.isArray(data?.messages) ? data.messages : [];
+        } catch {
+          break;
+        }
+        const matches = rows.filter((row) => {
+          const to = String(row.to || "").toLowerCase();
+          if (!to) return false;
+          const from = String(row.u || row.user || "").toLowerCase();
+          return (from === me && to === them) || (from === them && to === me);
+        });
+        if (!matches.length) break;
+        for (let index = 0; index < matches.length; index += 8) {
+          const batch = matches.slice(index, index + 8);
+          await Promise.all(
+            batch.map((row) => {
+              const id = String(row.id || row.__id || "");
+              if (!id) return null;
+              return chatServerFetch(
+                "/api/bitboy_chat_messages/" + encodeURIComponent(id),
+                { method: "DELETE", timeoutMs: 12000 },
+              ).catch(() => null);
+            }),
+          );
+          deleted += batch.length;
+        }
+        if (matches.length < 500) break;
+      }
+    }
+    await chatServerFetch(
+      "/api/bitboy_chat_channels/" + encodeURIComponent(dmRecordId),
+      { method: "DELETE", timeoutMs: 12000 },
+    ).catch(() => null);
+    ensuredDmSessions.delete(dmRecordId);
+    log("info", "chat", "dm session deleted", { username, peer, deleted });
+    res.json({ ok: true, deleted });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
 app.get("/api/chat/profiles", async (req, res) => {
   try {
     const data = await chatServerFetch("/api/creator_chat_profiles");
@@ -4990,6 +5769,9 @@ app.post("/api/chat/profiles", async (req, res) => {
     res.status(502).json({ error: error.message });
   }
 });
+
+/* Public forums share the cloud chat tables through their own module. */
+registerForumRoutes(app, { chatServerFetch, chatRecordEntries, log });
 
 /* ------------------------------------------------------------------ */
 /* API: Twilight Studio Hub                                            */
@@ -5954,6 +6736,38 @@ app.get("/api/research/preflight", async (req, res) => {
   }
 });
 
+app.get("/api/coding/prefs", async (req, res) => {
+  try {
+    const projectId = String(req.query.projectId || "");
+    if (!projectId) return res.status(400).json({ error: "projectId is required" });
+    const file = path.join(codingWorkspaceDir(projectId), "prefs.json");
+    const prefs = await readJson(file, {});
+    res.json({ ok: true, ...prefs });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/coding/prefs", async (req, res) => {
+  try {
+    const { projectId, rootDir, trusted, currentSession, sessionId, sessions } = req.body || {};
+    if (!projectId) return res.status(400).json({ error: "projectId is required" });
+    const dir = codingWorkspaceDir(projectId);
+    await ensureDir(dir);
+    await writeJsonAtomic(path.join(dir, "prefs.json"), {
+      rootDir: String(rootDir || ""),
+      trusted: Boolean(trusted),
+      currentSession: String(currentSession || ""),
+      sessionId: sessionId || null,
+      sessions: Array.isArray(sessions) ? sessions.slice(-30) : [],
+      updatedAt: new Date().toISOString(),
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post("/api/coding/prompt", async (req, res) => {
   try {
     const { projectId, sessionId, text, model, dir, trusted, images = [], githubRepo = null, history = [] } = req.body || {};
@@ -6002,6 +6816,11 @@ app.post("/api/coding/prompt", async (req, res) => {
     // and code plus the indexed local links and folders are all in the system
     // prompt before the first tool call can happen.
     const research = await preflightResearch(text || "");
+    // Per-prompt knowledge injection: system prompts are not reliably re-read
+    // on a continued OpenCode session, so the briefing is also a prompt part.
+    if (research.briefing) {
+      parts.unshift({ type: "text", text: research.briefing });
+    }
     const referenceContext = research.referenceText;
     const githubContext = research.githubText;
     const globalContext = await globalLearningContextFor(text || "", state.root);
@@ -6654,15 +7473,21 @@ app.post("/api/opencode/chat", async (req, res) => {
     let webContext = "";
     let globalContext = "";
     let sessionContext = "";
+    let preflight = null;
     if (!isDirectWriter) {
-      const [refs, github, web, global] = await Promise.all([
-        referenceContextFor(text),
-        githubContextFor(text),
+      // Required for every prompt: preflight before the model is called, even
+      // on the generic OpenCode chat route the Code applet uses.
+      const [research, web, global] = await Promise.all([
+        preflightResearch(text),
         agent === "research" ? webContextFor(text) : Promise.resolve(""),
         globalLearningContextFor(text),
       ]);
-      referenceContext = refs;
-      githubContext = github;
+      preflight = research;
+      if (research.briefing) {
+        parts.unshift({ type: "text", text: research.briefing });
+      }
+      referenceContext = research.referenceText;
+      githubContext = research.githubText;
       webContext = web;
       globalContext = global;
       sessionContext = await sessionContextFor(state, text);
@@ -6684,10 +7509,18 @@ app.post("/api/opencode/chat", async (req, res) => {
             : "";
     const systemWithReferences = isDirectWriter
       ? ""
-      : [system, agentGuard, knowledgeInstructions, globalContext, githubContext, referenceContext, webContext, sessionContext, historyContext]
+      : [system, agentGuard, knowledgeInstructions, preflight?.briefing || "", globalContext, githubContext, referenceContext, webContext, sessionContext, historyContext]
           .filter(Boolean)
           .join("\n");
-    log("info", "chat", "opencode prompt", { projectId, sessionId: sid, agent, model, images: images.length });
+    if (preflight) await writeResearchGate(projectId, preflight, text);
+    log("info", "chat", "opencode prompt", {
+      projectId,
+      sessionId: sid,
+      agent,
+      model,
+      images: images.length,
+      preflight: preflight?.counts || null,
+    });
     let sent;
     try {
       sent = await ocSendMessage(state, {
@@ -8717,6 +9550,10 @@ async function listReferenceFiles(dir, urlPrefix) {
 
 const REFERENCE_INDEX_FILE = () => path.join(DATA_DIR, "reference-index.json");
 const REFERENCE_NOTES_FILE = () => path.join(DATA_DIR, "reference-index.md");
+// The searchable dictionary is stored next to the index and loaded from disk on
+// boot. It is rebuilt only when the index itself changes, so a saved machine
+// never has to re-read a page just to answer a keyword query.
+const REFERENCE_DICTIONARY_FILE = () => path.join(DATA_DIR, "reference-dictionary.json");
 
 function tokenizeReference(text) {
   // Keywords are the search dictionary pre-flight research runs on. Keep one
@@ -8865,8 +9702,10 @@ function referenceIndexIsFresh(index, signature) {
   // freeze the index as permanently partial.
   if (index.progress?.running === true) return false;
   if (index.complete === false) return false;
-  const age = Date.now() - new Date(index.updatedAt).getTime();
-  return Number.isFinite(age) && age >= 0 && age < REFERENCE_INDEX_TTL;
+  // No TTL. A completed index is durable until the saved source list changes.
+  // Previously a 24h "age" check re-crawled every link on a timer, which is
+  // exactly why the library kept asking to re-index forever.
+  return Number.isFinite(Date.parse(index.updatedAt));
 }
 
 function referenceEntryScope(entry) {
@@ -8967,7 +9806,15 @@ async function autoIndexReferences(options = {}) {
     const signature = referenceSourceSignature(settings);
     const index = await loadReferenceIndex();
     if (!force && referenceIndexIsFresh(index, signature)) {
-      return { ok: true, skipped: true, updatedAt: index.updatedAt, count: index.entries.length, signature };
+      const repair = await repairReferenceCoverage(settings);
+      return {
+        ok: true,
+        skipped: repair.repaired === 0,
+        repaired: repair.repaired || 0,
+        updatedAt: repair.updatedAt || index.updatedAt,
+        count: repair.count ?? index.entries.length,
+        signature,
+      };
     }
     const next = await scanReferenceSources(settings, { resume: !force });
     return {
@@ -9021,11 +9868,90 @@ async function refreshReferenceSource(kind, id) {
       signature: referenceSourceSignature(settings),
       complete: index.complete !== false,
       entries: capReferenceEntries([...kept, ...added]),
+      indexedSourceIds: [...new Set([...(index.indexedSourceIds || []), id])],
     };
     await writeReferenceIndex(next);
     log("info", "references", "source re-indexed", { kind, id, added: added.length, count: next.entries.length });
     return { ok: true, kind, id, added: added.length, count: next.entries.length, updatedAt: next.updatedAt };
   });
+}
+
+async function repairReferenceCoverage(settings) {
+  const index = await loadReferenceIndex();
+  const folders = settings.references?.folders || [];
+  const links = settings.references?.links || [];
+  const present = new Set((index.entries || []).map((entry) => entry.sourceId).filter(Boolean));
+  const allIds = [...folders.map((f) => f.id), ...links.map((l) => l.id)];
+  const missing = [
+    ...folders.filter((folder) => !present.has(folder.id)).map((folder) => ({ kind: "folder", source: folder })),
+    ...links.filter((link) => !present.has(link.id)).map((link) => ({ kind: "link", source: link })),
+  ];
+  if (!missing.length) {
+    if (!Array.isArray(index.indexedSourceIds) || index.indexedSourceIds.length !== allIds.length) {
+      await writeReferenceIndex({ ...index, indexedSourceIds: allIds, complete: index.complete !== false });
+    }
+    return { ok: true, skipped: true, repaired: 0, count: (index.entries || []).length, updatedAt: index.updatedAt };
+  }
+
+  // One pass, one flush every few sources. The previous implementation wrote
+  // the whole 9 MB index after every single source, which made a large gap
+  // repair feel frozen. Progress is still durable: a restart resumes because
+  // finished sources have entries again.
+  const entries = [...(index.entries || [])];
+  const repairedIds = new Set();
+  referenceIndexProgress.running = true;
+  referenceIndexProgress.total = missing.length;
+  referenceIndexProgress.done = 0;
+  referenceIndexProgress.current = "";
+  referenceIndexProgress.startedAt = new Date().toISOString();
+  referenceIndexProgress.lastError = "";
+
+  const flush = async (final) => {
+    await writeReferenceIndex({
+      updatedAt: new Date().toISOString(),
+      signature: index.signature || referenceSourceSignature(settings),
+      complete: final ? true : index.complete !== false,
+      entries: capReferenceEntries(entries),
+      indexedSourceIds: final
+        ? allIds
+        : [...new Set([...(index.indexedSourceIds || []), ...repairedIds])],
+    });
+  };
+
+  let sinceFlush = 0;
+  for (const item of missing) {
+    referenceIndexProgress.current =
+      (item.kind === "folder" ? "Folder: " : "Link: ") +
+      String(item.source.label || item.source.url || item.source.path || "").slice(0, 90);
+    for (let i = entries.length - 1; i >= 0; i -= 1) {
+      if (entries[i].sourceId === item.source.id) entries.splice(i, 1);
+    }
+    try {
+      if (item.kind === "folder") await scanReferenceFolder(item.source, entries, 800);
+      else await scanReferenceLink(item.source, entries, 1);
+    } catch (error) {
+      referenceIndexProgress.lastError = String(error?.message || error).slice(0, 200);
+    }
+    repairedIds.add(item.source.id);
+    referenceIndexProgress.done += 1;
+    sinceFlush += 1;
+    if (sinceFlush >= 8) {
+      sinceFlush = 0;
+      await flush(false).catch(() => null);
+    }
+  }
+  await flush(true);
+  referenceIndexProgress.running = false;
+  referenceIndexProgress.current = "";
+  const repaired = repairedIds.size;
+  const next = await loadReferenceIndex();
+  return {
+    ok: true,
+    skipped: false,
+    repaired,
+    count: (next.entries || []).length,
+    updatedAt: next.updatedAt,
+  };
 }
 
 /** Re-index a single link or folder right after it is added. */
@@ -9055,6 +9981,7 @@ function scheduleReferenceIndexCleanup(sourceId) {
       signature: referenceSourceSignature(settings),
       complete: index.complete !== false,
       entries: capReferenceEntries(entries),
+      indexedSourceIds: (index.indexedSourceIds || []).filter((value) => value !== sourceId),
     });
   }).catch(() => {});
 }
@@ -9261,10 +10188,114 @@ async function scanLinksConcurrently(links, entries) {
   await Promise.all(Array.from({ length: workers }, () => worker()));
 }
 
+let keywordDictionaryCache = { key: "", dictionary: null };
+let persistedDictionary = null;
+let dictionaryPersistedKey = "";
+
+function referenceDictionaryKey(index) {
+  return [
+    String(index?.updatedAt || ""),
+    String(index?.entries?.length || 0),
+    String(index?.signature || ""),
+  ].join(":");
+}
+
+function buildReferenceDictionary(index) {
+  const records = new Map();
+  for (const entry of index?.entries || []) {
+    const scope = referenceEntryScope(entry);
+    const terms = new Set(
+      Array.isArray(entry.keywords) && entry.keywords.length
+        ? entry.keywords
+        : tokenizeReference(
+            [entry.title, entry.summary, entry.url, entry.path, entry.folderLabel, entry.linkLabel]
+              .filter(Boolean)
+              .join(" "),
+          ),
+    );
+    for (const term of terms) {
+      if (!term) continue;
+      let record = records.get(term);
+      if (!record) {
+        record = { term, count: 0, local: 0, url: 0, github: 0 };
+        records.set(term, record);
+      }
+      record.count += 1;
+      record[scope] += 1;
+    }
+  }
+  const list = [...records.values()].sort((a, b) => b.count - a.count || a.term.localeCompare(b.term));
+  return {
+    updatedAt: index?.updatedAt || null,
+    signature: index?.signature || "",
+    entryCount: index?.entries?.length || 0,
+    totalKeywords: list.length,
+    totalConnections: list.reduce((sum, record) => sum + record.count, 0),
+    list,
+  };
+}
+
+/** The dictionary for an index, cached in memory and backed by disk. */
+function keywordDictionaryFor(index) {
+  const key = referenceDictionaryKey(index);
+  if (keywordDictionaryCache.dictionary && keywordDictionaryCache.key === key) {
+    return keywordDictionaryCache.dictionary;
+  }
+  if (
+    persistedDictionary &&
+    persistedDictionary.updatedAt &&
+    persistedDictionary.updatedAt === index.updatedAt &&
+    Array.isArray(persistedDictionary.list)
+  ) {
+    keywordDictionaryCache = { key, dictionary: persistedDictionary };
+    return persistedDictionary;
+  }
+  const dictionary = buildReferenceDictionary(index);
+  keywordDictionaryCache = { key, dictionary };
+  persistedDictionary = dictionary;
+  return dictionary;
+}
+
+async function loadPersistedReferenceDictionary() {
+  if (persistedDictionary) return persistedDictionary;
+  persistedDictionary = await readJson(REFERENCE_DICTIONARY_FILE(), null);
+  if (persistedDictionary?.updatedAt) {
+    dictionaryPersistedKey = referenceDictionaryKey({
+      updatedAt: persistedDictionary.updatedAt,
+      signature: persistedDictionary.signature,
+      entries: { length: persistedDictionary.entryCount || 0 },
+    });
+  }
+  return persistedDictionary;
+}
+
+/** Write a dictionary object to disk at most once per index version. */
+async function ensureDictionaryPersisted(index, dictionary) {
+  const key = referenceDictionaryKey(index);
+  if (dictionaryPersistedKey === key) return;
+  dictionaryPersistedKey = key;
+  await writeJsonAtomic(REFERENCE_DICTIONARY_FILE(), dictionary);
+}
+
+async function writeReferenceDictionary(index) {
+  const dictionary = buildReferenceDictionary(index);
+  const key = referenceDictionaryKey(index);
+  keywordDictionaryCache = { key, dictionary };
+  persistedDictionary = dictionary;
+  dictionaryPersistedKey = key;
+  await writeJsonAtomic(REFERENCE_DICTIONARY_FILE(), dictionary);
+  return dictionary;
+}
+
 async function writeReferenceIndex(index) {
   const entries = capReferenceEntries(index.entries);
   const next = { ...index, entries };
   await writeJsonAtomic(REFERENCE_INDEX_FILE(), next);
+  // Persist the dictionary whenever the index reaches a stable state. During a
+  // progressive pass (complete === false) it is rebuilt at the end instead of
+  // writing a large file every 2.5 seconds.
+  if (next.complete !== false) await writeReferenceDictionary(next);
+  else keywordDictionaryCache = { key: "", dictionary: null };
   const notes = [
     "# Reference Index",
     "",
@@ -9303,9 +10334,12 @@ async function scanReferenceSources(settingsOverride, options = {}) {
   referenceIndexProgress.startedAt = resumable ? existing.progress.startedAt : new Date().toISOString();
   referenceIndexProgress.lastError = "";
 
-  // Pending sources keep their previous entries visible until each one is
-  // re-scanned, so coverage never goes down during a pass.
-  const entries = (existing.entries || []).filter((entry) => !entry.sourceId || !doneIds.has(entry.sourceId));
+  // Keep the existing entries for this pass. Completed sources keep their
+  // flushed entries; pending sources are replaced one at a time inside
+  // scanSource (which deletes that source's old rows first). The old filter
+  // here dropped completed sources entirely, which is how folders disappeared
+  // from a resumed index.
+  const entries = [...(existing.entries || [])];
   let lastFlush = 0;
   const flush = async (force) => {
     const now = Date.now();
@@ -9373,6 +10407,7 @@ async function scanReferenceSources(settingsOverride, options = {}) {
     signature,
     complete: true,
     entries: capReferenceEntries(entries),
+    indexedSourceIds: [...doneIds],
     progress: { ...referenceProgressSnapshot(), running: false, doneIds: [] },
   };
   await writeReferenceIndex(index);
@@ -10380,7 +11415,17 @@ app.get("/api/references/status", async (req, res) => {
         links: settings.references?.links?.length || 0,
       },
       coverage: referenceIndexCoverage(index, settings),
-      ttlMs: REFERENCE_INDEX_TTL,
+      dictionary: (() => {
+        const dictionary = keywordDictionaryCache.dictionary || persistedDictionary;
+        if (!dictionary || !Array.isArray(dictionary.list)) return null;
+        return {
+          keywords: dictionary.totalKeywords || dictionary.list.length,
+          connections: dictionary.totalConnections || 0,
+          updatedAt: dictionary.updatedAt || null,
+        };
+      })(),
+      persisted: true,
+      ttlMs: null,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -10551,6 +11596,7 @@ app.get("/api/references/keywords", async (req, res) => {
     // keystroke. The old per-request scan of millions of keywords was what
     // locked the process while the renderer waited.
     const dictionary = keywordDictionaryFor(index);
+    void ensureDictionaryPersisted(index, dictionary).catch(() => null);
     const source = query ? dictionary.list.filter((record) => record.term.includes(query)) : dictionary.list;
     res.json({
       ok: true,
@@ -14418,7 +15464,9 @@ bootLog("project and reference directories ready");
 bootLog("example mod ready");
 
 // Index saved reference folders and links as soon as the app boots. The
-// signature check keeps a warm index from being crawled again.
+// signature check keeps a warm index from being crawled again, and the saved
+// dictionary is loaded from disk so keyword search works immediately.
+await loadPersistedReferenceDictionary().catch(() => null);
 scheduleReferenceIndex(2500);
 
 const httpServer = server.listen(PORT, "127.0.0.1", () => {

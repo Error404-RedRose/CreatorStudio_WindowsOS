@@ -1,0 +1,1595 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Marco Sumari Tellez and IngeTrazo contributors.
+"""Adapter: an OpenSKP parse → an IngeTrazo geometry payload.
+
+Kept in its own module so ``import openskp`` happens lazily (only when this
+backend actually runs) — ``formats/skp.py`` must stay importable without the
+optional parser installed.
+
+OpenSKP 0.8-era data model (v0.2.0), discovered by introspection:
+
+* ``SkpFile.open(path).parse()`` → ``SkpModel`` with ``definitions`` (dict:
+  id → ``Definition``), ``materials``, ``layers``, ``version``.
+* ``Definition``: ``id``, ``name``, ``vertices`` (dict id → ``Vertex(x,y,z)``),
+  ``edges`` (dict id → ``Edge(v1_id, v2_id)``), ``faces`` (dict id → ``Face``),
+  ``instances`` (list of ``Instance``).
+* ``Face``: ``loops`` — a list of loops, each ``[(edge_id, sense), …]``; the
+  first loop is the outer boundary, the rest are holes. Plus ``normal`` and
+  ``material_id``. ``sense`` is NOT read: what it holds changed between
+  OpenSKP releases, so ``_ring_raw`` walks the loop's connectivity instead.
+* ``Instance``: ``matrix`` (a 3×3 rotation/scale row-major + a translation, 13
+  floats), ``ref_idx`` (→ the placed definition's id), ``children``.
+
+The .skp format stores lengths in **inches** and is **Z-up** — same up axis as
+IngeTrazo, so we only scale (inches → metres); no axis swap. The instance tree
+is flattened to world-space polygons (reference geometry, like the big-DAE
+import path). Per-face materials resolve through ``SkpModel.materials_by_id``
+(our upstream PR iamahsanmehmood/openskp#3): plain colours become
+``attrs["color"]``, and textured materials (``Material.texture``, PR openskp#4)
+become ``attrs["texture"]`` — image bytes extracted to the app's texture cache
+(see :func:`_texture_dir`), tile size in metres, rendered with IngeTrazo's planar projection
+(the .skp format's default texture behaviour; per-face UVs from the TLV are a
+later refinement). Both joins are guarded, so PyPI 0.2.0 still imports (uncoloured).
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+from PySide6.QtGui import QMatrix4x4, QVector3D
+
+from core.texture import fit_uv_affine, projection_basis
+
+_INCH = 0.0254          # .skp internal unit → metres
+_MAX_DEPTH = 32         # guard against pathological instance nesting
+
+
+def _ring_raw(defn, loop):
+    """Resolve one ``[(edge_id, sense), …]`` loop to raw local ``(x, y, z)``
+    tuples in INCHES. Returns ``None`` on any dangling reference.
+
+    The ring is read from the loop's CONNECTIVITY — each coedge contributes
+    the vertex it shares with the next one — and NOT from ``sense``, because
+    OpenSKP changed what that flag carries. It used to be the .skp format's
+    own storage bit (0 = forward, 1 = reversed); upstream 0cd14d7 normalized it
+    to the documented +1 / -1, and under ±1 BOTH values are truthy, so a
+    boolean test silently took the same endpoint for every coedge. Every
+    polygon with a reversed coedge then came out as a self-intersecting star:
+    plaza Yanque lost 68% of its surface (43008 → 13590 m², same faces, same
+    bounding box) and drew as spikes across the whole terrain.
+
+    Consecutive coedges connect head-to-tail under either encoding, so each
+    coedge ENDS at the vertex it shares with the next one — which is the very
+    vertex the flag used to select, so a parser on either contract now yields
+    the identical ring (verified corner-for-corner over a 116k-face file).
+    ``sense`` only breaks the tie for a degenerate loop whose neighbours share
+    both endpoints."""
+    n = len(loop)
+    edges = []
+    for eid, _sense in loop:
+        edge = defn.edges.get(eid)
+        if edge is None:
+            return None
+        edges.append(edge)
+    pts = []
+    vertices = defn.vertices
+    for i, edge in enumerate(edges):
+        a = edge.v1_id
+        b = edge.v2_id
+        nxt = edges[i + 1] if i + 1 < n else edges[0]
+        vid = None
+        if nxt is not edge:
+            na = nxt.v1_id
+            nb = nxt.v2_id
+            a_shared = a == na or a == nb
+            b_shared = b == na or b == nb
+            if a_shared != b_shared:
+                vid = b if b_shared else a
+        if vid is None:         # degenerate loop: fall back to the flag
+            vid = a if loop[i][1] else b
+        v = vertices.get(vid)
+        if v is None:
+            return None
+        pts.append((v.x, v.y, v.z))
+    return pts
+
+
+def _matrix(m) -> QMatrix4x4:
+    """An OpenSKP instance ``matrix`` (row-major 3×3 + translation, in inches)
+    as a ``QMatrix4x4`` whose translation is already in metres.
+
+    Element 12 is a uniform scale the reader has already worked out: a
+    placement stored with w = 100 reaches us as 0.01, with the 3×3 and the
+    translation as stored, so both are multiplied by it. Ignoring it brought
+    such a component in 100x large (#865); dividing by it, 10000x (#1196)."""
+    s = float(m[12]) if len(m) > 12 and m[12] else 1.0
+    return QMatrix4x4(
+        m[0] * s, m[1] * s, m[2] * s, m[9] * s * _INCH,
+        m[3] * s, m[4] * s, m[5] * s, m[10] * s * _INCH,
+        m[6] * s, m[7] * s, m[8] * s, m[11] * s * _INCH,
+        0.0, 0.0, 0.0, 1.0)
+
+
+def _texture_dir(skp_path) -> Path:
+    """Directory for a ``.skp``'s extracted texture images, inside the app's
+    own cache (``core.texture.texture_cache_root()``) — importing must never
+    litter the user's folders, which is what the old ``<stem>/`` next to the
+    ``.skp`` did. One subfolder per source file, keyed by its path + size +
+    mtime, so re-importing the same file reuses the images and an edited file
+    gets its own. Saving the document as ``.igz`` copies the images INTO the
+    container, so the cache is disposable. Falls back to a temp dir when the
+    cache is not writable."""
+    from core.texture import texture_cache_root
+    skp_path = Path(skp_path)
+    try:
+        st = skp_path.stat()
+        stamp = f"{skp_path.resolve()}|{st.st_size}|{st.st_mtime_ns}"
+    except OSError:
+        stamp = str(skp_path)
+    import hashlib
+    key = hashlib.sha1(stamp.encode("utf-8", "replace")).hexdigest()[:10]
+    # Keep the stem in the folder name so the cache stays human-readable, but
+    # strip anything the filesystem could choke on.
+    stem = "".join(c for c in skp_path.stem if c.isalnum() or c in " ._-").strip()
+    d = texture_cache_root() / "skp" / f"{stem or 'model'}-{key}"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    except OSError:
+        import tempfile
+        return Path(tempfile.mkdtemp(prefix="ingetrazo-skp-tex-"))
+
+
+
+
+
+
+# The colourize maths moved to core.texture (the material editor needs it
+# too); these names stay as the importer's local spelling.
+from core.texture import colorize_image as _colorize_image  # noqa: E402
+from core.texture import hls_to_rgb as _hls_to_rgb  # noqa: E402,F401
+from core.texture import rgb_to_hls as _rgb_to_hls  # noqa: E402,F401
+
+
+def _needs_tint(data, declared_rgb) -> bool:
+    """Whether a colourized-flagged texture actually needs re-tinting: only
+    when the declared material colour differs from the image's (alpha-
+    weighted) average — i.e. the user really recoloured it. The legacy
+    format flags more materials than were ever tinted."""
+    if not data or declared_rgb is None:
+        return False
+    from PySide6.QtGui import QImage
+    img = QImage.fromData(data)
+    if img.isNull():
+        return False
+    img = img.convertToFormat(QImage.Format_ARGB32)
+    small = img.scaled(16, 16)
+    sr = sg = sb = sa = 0
+    for y in range(small.height()):
+        for x in range(small.width()):
+            c = small.pixelColor(x, y)
+            a = c.alpha()
+            sr += c.red() * a
+            sg += c.green() * a
+            sb += c.blue() * a
+            sa += a
+    if sa == 0:
+        return False
+    avg = (sr / sa, sg / sa, sb / sa)
+    d = max(abs(avg[i] - declared_rgb[i]) for i in range(3))
+    return d > 24.0
+
+
+
+
+def _tile_size(width, height):
+    """The texture's physical tile as ``(sw, sh)`` in metres, from a
+    material's stored applied size.
+
+    A file need not carry a usable one. ``openskp.create`` writes a fixed
+    1-inch width and a SENTINEL for the height, which decodes as a denormal
+    around 1e-231 — and the UV reconstruction divides by it, so every
+    coordinate came out infinite and the mapping was lost. Anything that is
+    not a sane positive size reads as "not specified": fall back to the other
+    axis, or to the one-metre default this importer has always used when a
+    material carried no size at all.
+    """
+    def _sane(v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        # A tile below a micron or above a kilometre is not a size anyone
+        # meant; a denormal sentinel lands far outside both.
+        return v if 1e-6 < v < 1e5 else None
+
+    w, h = _sane(width), _sane(height)
+    if w is None and h is None:
+        w = h = 1.0 / _INCH
+    elif w is None:
+        w = h
+    elif h is None:
+        h = w
+    return w * _INCH, h * _INCH
+
+
+def _material_attrs(model, skp_path):
+    """Map ``material_id`` → IngeTrazo ``Face.attrs`` dict.
+
+    A textured material (``Material.texture``, our upstream PR openskp#4)
+    becomes ``{"texture": {"path", "sw", "sh"}}`` — image bytes written once
+    to :func:`_texture_dir`, tile size converted inches → metres (defaulting
+    to 1 m when the file omits it). A plain material becomes
+    ``{"color": [r, g, b]}`` in 0..1 (PR openskp#3). Empty when the installed
+    OpenSKP predates the joins.
+
+    Since the material registry (core.materials) each entry also carries
+    ``"mat"``: the .skp material NAME — "Concreto visto" stops
+    dissolving into an anonymous colour at the border. Returns
+    ``(attrs, materials)`` where *materials* is the registry payload
+    (one dict per named material, `.igz`-shaped)."""
+    attrs: dict = {}
+    tex_dir = None
+    for mid, mat in (getattr(model, "materials_by_id", None) or {}).items():
+        tex = getattr(mat, "texture", None)
+        if tex is not None and getattr(tex, "data", None):
+            if tex_dir is None:
+                tex_dir = _texture_dir(skp_path)
+            # A .skp often stores the author's FULL original path as the
+            # texture filename ("C:\Users\...\toro.png", "P:/Proyectos
+            # /.../x.png") — reduce to a safe basename or the image
+            # lands in nonexistent subdirectories (or an unwritable name on
+            # Windows). On a basename collision with different bytes, prefix
+            # the material id.
+            safe = (tex.filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+            data = tex.data
+            if getattr(mat, "colorized", False) and \
+                    _needs_tint(data, getattr(mat, "color", None)):
+                # Colourized copy ("[Name]1"): the stored image is SHARED
+                # with the source material — re-tint it toward the material
+                # colour (the .skp shift/tint) and keep it under its own
+                # name so the base texture stays untouched. The _needs_tint
+                # guard skips materials whose declared colour already IS the
+                # image average (the legacy colourized flag is greedy —
+                # e.g. geolocation snapshots would go greyscale otherwise).
+                data = _colorize_image(
+                    data, getattr(mat, "color", (128, 128, 128)),
+                    getattr(mat, "colorize_type", 0))
+                safe = f"{mid}_{safe or 'material.png'}"
+            img = tex_dir / (safe or f"material_{mid}.png")
+            try:
+                if img.exists() and img.stat().st_size != len(data):
+                    img = tex_dir / f"{mid}_{img.name}"
+                if not img.exists() or img.stat().st_size != len(data):
+                    img.write_bytes(data)
+            except OSError:
+                img = None
+            if img is not None:
+                sw, sh = _tile_size(getattr(tex, "width", None),
+                                    getattr(tex, "height", None))
+                entry = {"texture": {"path": str(img), "sw": sw, "sh": sh}}
+                op = getattr(mat, "transparency", 1.0)
+                if op < 0.999:
+                    entry["opacity"] = float(op)
+                attrs[mid] = entry
+                continue
+        color = getattr(mat, "color", None)
+        if color is not None and len(color) >= 3:
+            entry = {"color": [color[0] / 255.0, color[1] / 255.0,
+                               color[2] / 255.0]}
+            op = getattr(mat, "transparency", 1.0)
+            if op < 0.999:
+                entry["opacity"] = float(op)
+            attrs[mid] = entry
+
+    # Registry: give every named entry its identity. register() dedups —
+    # two .skp materials with the same name and the same recipe merge;
+    # same name with a different recipe gets "name (2)" so neither silently
+    # repaints the other's faces. The final name lands in the shared entry
+    # dict, so every face built from it carries attrs["mat"] for free.
+    from core.materials import Material, register
+    registry: dict = {}
+    for mid, mat in (getattr(model, "materials_by_id", None) or {}).items():
+        entry = attrs.get(mid)
+        name = getattr(mat, "name", "") or ""
+        if entry is None or not name.strip():
+            continue
+        color = entry.get("color")
+        final = register(registry, Material(
+            name=name.strip(),
+            color=tuple(color) if color is not None else None,
+            texture=dict(entry["texture"]) if entry.get("texture") else None,
+            opacity=entry.get("opacity"),
+        ))
+        entry["mat"] = final
+    return attrs, [m.to_dict() for m in registry.values()]
+
+
+def _face_attrs(face, attr_map, inherited=None):
+    """IngeTrazo ``Face.attrs`` for an OpenSKP face, or ``None``.
+
+    A face with no material of its own inherits ``inherited`` — the material
+    painted on the nearest enclosing instance (the .skp "paint the
+    component" rule; ``Instance.material_id``, our upstream PR openskp#5)."""
+    mid = getattr(face, "material_id", None)
+    if mid is None:
+        mid = inherited
+    return attr_map.get(mid) if mid is not None else None
+
+
+# The .skp format's canonical in-plane axes for a face normal — the basis its
+# per-face texture mapping is expressed in. Lives in core.texture now, as the
+# one recipe the renderer and every exporter share; this module was where it
+# was first calibrated (the controlled textura.skp) and keeps the short name.
+_plane_basis = projection_basis
+
+
+def _positioned_uvs(face, raw_ring, tex, matrix=None, projected=False):
+    """Per-vertex UVs for a face whose texture was positioned / photo-fitted
+    (``Face.uv_transform``, our upstream PR openskp#6), or ``None``.
+
+    The stored 3×3 row-major matrix maps texture space → face plane; the UV
+    of a local point ``p`` (INCHES) is ``[p·xr, p·yr, 1] @ inv(M)``, then
+    ``/q`` and ``/tile`` — the recipe calibrated against SDK ground truth
+    (exact for rotated and 4-pin distorted mappings alike). ``matrix``
+    overrides the face's front transform (e.g. ``uv_transform_back`` when
+    rendering a back-painted face)."""
+    mat = matrix if matrix is not None else getattr(face, "uv_transform", None)
+    if mat is None or len(mat) != 9:
+        return None
+    tw = (tex.get("sw", 0.0) or 0.0) / _INCH   # tile back to inches
+    th = (tex.get("sh", 0.0) or 0.0) / _INCH
+    if tw <= 0 or th <= 0:
+        return None
+    m = [list(mat[0:3]), list(mat[3:6]), list(mat[6:9])]
+    # Invert the 3×3 (adjugate / determinant).
+    det = (m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])
+           - m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0])
+           + m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]))
+    if abs(det) < 1e-15:
+        return None
+    inv = [[(m[1][1]*m[2][2]-m[1][2]*m[2][1])/det,
+            (m[0][2]*m[2][1]-m[0][1]*m[2][2])/det,
+            (m[0][1]*m[1][2]-m[0][2]*m[1][1])/det],
+           [(m[1][2]*m[2][0]-m[1][0]*m[2][2])/det,
+            (m[0][0]*m[2][2]-m[0][2]*m[2][0])/det,
+            (m[0][2]*m[1][0]-m[0][0]*m[1][2])/det],
+           [(m[1][0]*m[2][1]-m[1][1]*m[2][0])/det,
+            (m[0][1]*m[2][0]-m[0][0]*m[2][1])/det,
+            (m[0][0]*m[1][1]-m[0][1]*m[1][0])/det]]
+    if projected:
+        # PROJECTED texture (Add Location terrain drape): the mapping runs
+        # in the projection plane — plan XY for the vertical drape — so
+        # every face of the terrain samples one continuous image regardless
+        # of its tilt. (Non-vertical projection axes are not decoded yet.)
+        xr = yr = None
+    else:
+        xr, yr = _plane_basis(face.normal or (0.0, 0.0, 1.0))
+    uvs = []
+    for x, y, z in raw_ring:                    # local INCHES
+        if projected:
+            x2, y2 = x, y
+        else:
+            x2 = x * xr[0] + y * xr[1] + z * xr[2]
+            y2 = x * yr[0] + y * yr[1] + z * yr[2]
+        # row-vector: uvq = [x2, y2, 1] @ inv
+        u = x2*inv[0][0] + y2*inv[1][0] + inv[2][0]
+        v = x2*inv[0][1] + y2*inv[1][1] + inv[2][1]
+        q = x2*inv[0][2] + y2*inv[1][2] + inv[2][2]
+        if abs(q) < 1e-12:
+            return None
+        uvs.append((u/q/tw, v/q/th))
+    return uvs
+
+
+def _defn_geom(defn):
+    """The definition's face geometry, flattened once and cached: a
+    ``(P, 3)`` float64 array of every resolved ring corner in LOCAL METRES,
+    the same corners as INCH tuples (the frame the UV math runs in), and
+    per-face ``(face, outer_start, outer_end, [(hole_start, hole_end), …])``
+    metadata. An instanced component pays the ring resolution once; each
+    placement is then a single matrix multiply over the whole array instead
+    of a QVector3D construction + map per corner."""
+    geom = getattr(defn, "_geom", None)
+    if geom is not None:
+        return geom
+    import numpy as np
+    flat: list = []
+    meta: list = []
+    n = 0
+    for face in defn.faces.values():
+        loops = getattr(face, "loops", None)
+        if not loops:
+            continue
+        raw = _ring_raw(defn, loops[0])
+        if not raw or len(raw) < 3:
+            continue
+        s0 = n
+        flat.extend(raw)
+        n += len(raw)
+        s1 = n
+        hs = []
+        for lp in loops[1:]:
+            h = _ring_raw(defn, lp)
+            if h and len(h) >= 3:
+                hs.append((n, n + len(h)))
+                flat.extend(h)
+                n += len(h)
+        meta.append((face, s0, s1, hs))
+    pos_m = np.asarray(flat, dtype=np.float64).reshape(-1, 3) * _INCH
+    geom = (pos_m, flat, meta)
+    try:
+        defn._geom = geom
+    except AttributeError:          # __slots__ definition: skip the cache
+        pass
+    return geom
+
+
+def _world_points(pos_m, xform):
+    """``pos_m`` (local metres) transformed by the QMatrix4x4 ``xform``, as a
+    list of ``[x, y, z]`` lists. Float32-quantized so the payload carries the
+    same values a ``Vertex`` will store — welding and soft-edge matching key
+    on those."""
+    import numpy as np
+    if xform.isIdentity():
+        world = pos_m
+    else:
+        m = np.array(xform.data(), dtype=np.float64).reshape(4, 4, order="F")
+        world = pos_m @ m[:3, :3].T + m[:3, 3]
+    return world.astype(np.float32).astype(np.float64).tolist()
+
+
+def _face_entry(face, wl, raw_l, s0, s1, holes_sl, attr_map,
+                inherited=None, layer=None, mirrored=False):
+    """One payload face ``(outer, holes, attrs)`` for ``face``, its corners
+    already transformed in ``wl`` (see :func:`_world_points`; ``raw_l`` keeps
+    the same corners in local inches for the UV math). Bakes a positioned /
+    photo-fitted texture's exact per-face UVs (``Face.uv_transform``,
+    upstream PR openskp#6) into a world→UV affine — the ``"uvw"``
+    IngeTrazo's renderer and exporters already consume. Exact for triangles;
+    a per-face affine fit of the projective map otherwise.
+
+    ``layer`` is the .skp layer (tag) of the nearest enclosing tagged
+    instance — a face with no tag of its own carries it, so hiding the tag's
+    layer in IngeTrazo hides what the file marks as hidden.
+
+    ``mirrored`` says the corners in ``wl`` went through a placement with a
+    negative determinant (a component scaled by -1, #1045): that reverses the
+    winding, so the rings are walked backwards to keep the front where the
+    file has it."""
+    raw = raw_l[s0:s1]
+    outer = wl[s0:s1]
+    if mirrored:
+        raw = raw[::-1]
+        outer = outer[::-1]
+    # Material precedence (the .skp rule): the face's OWN material wins —
+    # front side first, then back side (flipping the face so the painted
+    # side fronts, what "Reverse Faces + paint" produces) — and only a face
+    # with no material of its own inherits the enclosing instance's paint.
+    # (An instance-painted group whose faces carry their own back materials —
+    # e.g. a bullring painted blue as a group but with grey/red faces —
+    # must show the faces' colours, not the blue.)
+    uv_mat = getattr(face, "uv_transform", None)
+    flipped = False
+    mid = getattr(face, "material_id", None)
+    attrs = attr_map.get(mid) if mid is not None else None
+    if attrs is None:
+        battrs = attr_map.get(getattr(face, "back_material_id", None))
+        if battrs is not None:
+            attrs = battrs
+            uv_mat = getattr(face, "uv_transform_back", None)
+            raw = raw[::-1]
+            outer = outer[::-1]
+            flipped = True
+        elif inherited is not None:
+            attrs = attr_map.get(inherited)
+    holes = []
+    for ha, hb in holes_sl:
+        h = wl[ha:hb]
+        if flipped != mirrored:
+            h = h[::-1]
+        holes.append(h)
+    def _bake_uvs(entry, uv_matrix, projected=False):
+        """Return ``entry`` with the texture's per-face ``uvw`` baked in."""
+        if not entry or "texture" not in entry:
+            return entry
+        if uv_matrix is not None:
+            uvs = _positioned_uvs(face, raw, entry["texture"], matrix=uv_matrix,
+                                  projected=projected)
+        else:
+            # The .skp DEFAULT mapping runs in the face's LOCAL frame:
+            # u = (p·xr)/tile, plane basis from the local normal (the recipe
+            # calibrated with the controlled textura.skp). Baking it per face
+            # keeps every slat of a component sampling the same patch — a
+            # world-space projection would give each slat (and each copy) a
+            # different slice of the tile.
+            tex = entry["texture"]
+            tw = (tex.get("sw", 0.0) or 0.0) / _INCH
+            th = (tex.get("sh", 0.0) or 0.0) / _INCH
+            uvs = None
+            if tw > 0 and th > 0:
+                xr, yr = _plane_basis(face.normal or (0.0, 0.0, 1.0))
+                uvs = [((x * xr[0] + y * xr[1] + z * xr[2]) / tw,
+                        (x * yr[0] + y * yr[1] + z * yr[2]) / th)
+                       for x, y, z in raw]
+        if uvs is not None:
+            uvw = fit_uv_affine(outer, uvs)
+            if uvw is not None:
+                tex = {**entry["texture"], "uvw": uvw}
+                if uv_matrix is None:
+                    # The .skp DEFAULT projection: the file carries no
+                    # per-face record for it, the material's applied size IS
+                    # the mapping. Marked so the exporter writes it back the
+                    # same way instead of pinning an explicit one.
+                    tex["planar"] = True
+                return {**entry, "texture": tex}
+        return entry
+
+    front_src = attrs
+    # projected = the format's per-side flag (legacy path) OR the geometric
+    # detection pre-pass (_mark_projected_faces, needed on the VFF path where
+    # the flag is absent).
+    uv_proj = (getattr(face, "uv_projected_back", False) if flipped
+               else getattr(face, "uv_projected", False)) \
+        or getattr(face, "_projected", False)
+    attrs = _bake_uvs(attrs, uv_mat, uv_proj)
+    # A .skp paints each side on its own. A back painted DIFFERENTLY
+    # (front green wall, back roof tiles — possibly via instance
+    # inheritance on the unpainted side) travels as its own material in
+    # attrs["back"]; a back painted the SAME as the front is a two-sided
+    # face (``back = True``); a back left unpainted is absent and shows the
+    # style's default back colour, as the file intends. Flipped
+    # faces already front their painted side, so their back is the default.
+    if not flipped:
+        back_src = attr_map.get(getattr(face, "back_material_id", None))
+        if back_src is None and inherited is not None:
+            back_src = attr_map.get(inherited)
+        if back_src is not None:
+            base = dict(attrs) if attrs else {}
+            if back_src is front_src:
+                base["back"] = True
+            else:
+                base["back"] = _bake_uvs(
+                    back_src, getattr(face, "uv_transform_back", None),
+                    getattr(face, "uv_projected_back", False))
+            attrs = base
+    lay = getattr(face, "layer", "") or layer
+    if lay:
+        attrs = {**(attrs or {}), "layer": lay}
+    return (outer, holes, attrs)
+
+
+def _image_has_cutout(path) -> bool:
+    """See :func:`core.texture.image_has_cutout` — one test for the import,
+    the renderer's back-side rule and the exporter."""
+    from core.texture import image_has_cutout
+    return image_has_cutout(path)
+
+
+def _image_quad_faces(child, placed, attr_map, inherited):
+    """Payload faces for an Image entity's quad, with whole-picture UVs.
+
+    An image quad always shows the whole picture once, so per-vertex UV =
+    the vertex's normalised position on the LOCAL quad, baked as an exact
+    world→UV affine (the default planar projection would sample in world
+    space, after the placement rotation/scale — wrong region entirely)."""
+    raws = [(_ring_raw(child, f.loops[0]) if getattr(f, "loops", None)
+             else None, f) for f in child.faces.values()]
+    pts = [p for raw, _f in raws if raw for p in raw]
+    if not pts:
+        return []
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    wspan = (x1 - x0) or 1.0
+    hspan = (y1 - y0) or 1.0
+    faces = []
+    for raw, face in raws:
+        if not raw or len(raw) < 3:
+            continue
+        outer = [placed.map(QVector3D(x * _INCH, y * _INCH, z * _INCH))
+                 for x, y, z in raw]
+        attrs = _face_attrs(face, attr_map, inherited)
+        if attrs and "texture" in attrs:
+            uvs = [((x - x0) / wspan, (y - y0) / hspan) for x, y, _z in raw]
+            uvw = fit_uv_affine(outer, uvs)
+            if uvw is not None:
+                attrs = {**attrs, "texture": {**attrs["texture"], "uvw": uvw}}
+        faces.append((outer, [], attrs))
+    return faces
+
+
+# How close an image may lie to a face and still count as stuck on it: the
+# logos of #429 sit 0–1.5 mm off their faces, the plaza's free-standing bull
+# and statue 8 m and 19 cm from anything parallel.
+_GLUE_TOL = 0.01
+
+
+def _face_boxes(defn):
+    """Per-face local bounding boxes of ``defn`` (metres), cached: ``(lo,
+    hi)`` arrays of shape ``(F, 3)`` in the order of ``_defn_geom``'s
+    metadata. Holes lie inside their outer ring, so a face's corners — holes
+    included — are one contiguous run and one ``reduceat`` boxes them all."""
+    boxes = getattr(defn, "_face_boxes", None)
+    if boxes is not None:
+        return boxes
+    import numpy as np
+    pos_m, _raw, meta = _defn_geom(defn)
+    if not meta:
+        boxes = (np.empty((0, 3)), np.empty((0, 3)))
+    else:
+        starts = np.fromiter((m[1] for m in meta), dtype=np.intp,
+                             count=len(meta))
+        boxes = (np.minimum.reduceat(pos_m, starts, axis=0),
+                 np.maximum.reduceat(pos_m, starts, axis=0))
+    try:
+        defn._face_boxes = boxes
+    except AttributeError:
+        pass
+    return boxes
+
+
+def _rests_on_a_face(roots, by_id, quad) -> bool:
+    """Whether the image quad ``quad`` (world ``QVector3D`` corners) lies ON
+    a face of the model: parallel to it, within ``_GLUE_TOL``, with its
+    centre over the face. That is a logo or a sign stuck to a surface, which
+    must stay put (#429); a cut-out standing free — the plaza's bull and
+    statue — is the one turned to face the camera.
+
+    Walks the placement tree in NumPy: each definition's face boxes are
+    tested against the image centre in that definition's own frame, and only
+    the few faces whose box holds it get the exact plane test."""
+    import numpy as np
+    q = np.array([[p.x(), p.y(), p.z()] for p in quad], dtype=np.float64)
+    if len(q) < 3:
+        return False
+    centre = q.mean(axis=0)
+    n = np.zeros(3)
+    for i in range(len(q)):
+        n += np.cross(q[i], q[(i + 1) % len(q)])
+    if np.linalg.norm(n) < 1e-12:
+        return False
+    n /= np.linalg.norm(n)
+
+    def on_face(world):
+        fn = np.zeros(3)
+        for i in range(len(world)):
+            fn += np.cross(world[i], world[(i + 1) % len(world)])
+        ln = np.linalg.norm(fn)
+        if ln < 1e-12:
+            return False
+        fn /= ln
+        if abs(abs(fn @ n) - 1.0) > 1e-3:
+            return False
+        if abs((centre - world[0]) @ fn) > _GLUE_TOL:
+            return False
+        # The centre over the face: even-odd in the face's own plane.
+        a = np.cross(fn, [1.0, 0.0, 0.0] if abs(fn[0]) < 0.9
+                     else [0.0, 1.0, 0.0])
+        a /= np.linalg.norm(a)
+        b = np.cross(fn, a)
+        uv = np.stack([(world - centre) @ a, (world - centre) @ b], axis=1)
+        inside = False
+        for i in range(len(uv)):
+            (x0, y0), (x1, y1) = uv[i], uv[i - 1]
+            if (y0 > 0) != (y1 > 0) and 0 < x0 + (x1 - x0) * (-y0) / (y1 - y0):
+                inside = not inside
+        return inside
+
+    def walk(defn, m, depth, stack):
+        if depth > _MAX_DEPTH or id(defn) in stack:
+            return False
+        stack = stack | {id(defn)}
+        lo, hi = _face_boxes(defn)
+        if len(lo):
+            inv = np.linalg.inv(m)
+            c = inv[:3, :3] @ centre + inv[:3, 3]
+            # The tolerance in this frame: a scaled-down copy needs more.
+            s = min(np.linalg.norm(m[:3, :3], axis=0).min(), 1.0) or 1.0
+            tol = _GLUE_TOL / s
+            hit = np.nonzero(np.all((lo - tol <= c) & (c <= hi + tol),
+                                    axis=1))[0]
+            if len(hit):
+                pos_m, _raw, meta = _defn_geom(defn)
+                for k in hit:
+                    _f, s0, s1, _hs = meta[k]
+                    world = pos_m[s0:s1] @ m[:3, :3].T + m[:3, 3]
+                    if on_face(world):
+                        return True
+        for ins in getattr(defn, "instances", []):
+            child = by_id.get(getattr(ins, "ref_idx", None))
+            if child is None or getattr(child, "is_image", False) or \
+                    getattr(child, "always_faces_camera", False):
+                continue
+            cm = np.array(_matrix(ins.matrix).data(),
+                          dtype=np.float64).reshape(4, 4, order="F")
+            if walk(child, m @ cm, depth + 1, stack):
+                return True
+        return False
+
+    return any(walk(r, np.eye(4), 0, frozenset()) for r in roots)
+
+
+def _soft_edge_segments(defn, xform, out) -> None:
+    """Append the transformed endpoint pairs of ``defn``'s soft/smooth/
+    hidden edges to ``out`` — the file's own edge-display flags, used by
+    ``apply_payload`` instead of angle-based softening.
+
+    The flagged endpoints (local metres) are cached on the definition as one
+    array — an instanced component pays the edge filter once, and each
+    placement is a single matrix multiply (float32-quantized like the face
+    corners, so the soft keys match the welded vertex positions)."""
+    import numpy as np
+    arr = getattr(defn, "_soft_arr", None)
+    if arr is None:
+        pairs = []
+        for e in getattr(defn, "edges", {}).values():
+            if not (getattr(e, "soft", False) or getattr(e, "smooth", False)
+                    or getattr(e, "hidden", False)):
+                continue
+            va = defn.vertices.get(e.v1_id)
+            vb = defn.vertices.get(e.v2_id)
+            if va is None or vb is None:
+                continue
+            pairs.append((va.x, va.y, va.z))
+            pairs.append((vb.x, vb.y, vb.z))
+        arr = np.asarray(pairs, dtype=np.float64).reshape(-1, 3) * _INCH
+        try:
+            defn._soft_arr = arr
+        except AttributeError:      # __slots__ definition: just skip the cache
+            pass
+    if not len(arr):
+        return
+    wl = _world_points(arr, xform)
+    for i in range(0, len(wl), 2):
+        a = wl[i]
+        b = wl[i + 1]
+        out.append(((a[0], a[1], a[2]), (b[0], b[1], b[2])))
+
+
+#: The tags the file being adapted hides, by name AND by id (an edge's
+#: ``layer`` is the tag's id in a 2021+ file): see _loose_edge_segments.
+_hidden_tags: frozenset = frozenset()
+
+
+def _loose_edge_segments(defn, xform, out) -> None:
+    """Append the transformed endpoint pairs of ``defn``'s LOOSE edges —
+    lines that bound no face — to ``out``. Only face rings were read, so a
+    group holding nothing but lines arrived empty and was dropped. Hidden
+    edges stay out (the file does not draw them), and so do the lines on a
+    tag the file hides (``_hidden_tags``, set by :func:`_adapt`): the
+    contour lines of a survey drawing kept on a hidden tag would otherwise
+    cover the plaza, and a line inside a group does not hide with its tag
+    here. Cached on the definition like the soft edges."""
+    import numpy as np
+    arr = getattr(defn, "_loose_arr", None)
+    if arr is None:
+        hidden_tags = _hidden_tags
+        used = set()
+        for face in getattr(defn, "faces", {}).values():
+            for loop in getattr(face, "loops", None) or ():
+                used.update(eid for eid, _sense in loop)
+        pairs = []
+        for eid, e in getattr(defn, "edges", {}).items():
+            if eid in used or getattr(e, "hidden", False):
+                continue
+            if hidden_tags and getattr(e, "layer", None) in hidden_tags:
+                continue
+            va = defn.vertices.get(e.v1_id)
+            vb = defn.vertices.get(e.v2_id)
+            if va is None or vb is None:
+                continue
+            pairs.append((va.x, va.y, va.z))
+            pairs.append((vb.x, vb.y, vb.z))
+        arr = np.asarray(pairs, dtype=np.float64).reshape(-1, 3) * _INCH
+        try:
+            defn._loose_arr = arr
+        except AttributeError:      # __slots__ definition: just skip the cache
+            pass
+    if not len(arr):
+        return
+    wl = _world_points(arr, xform)
+    for i in range(0, len(wl), 2):
+        a = wl[i]
+        b = wl[i + 1]
+        out.append(((a[0], a[1], a[2]), (b[0], b[1], b[2])))
+
+
+def _collect(defn, xform, by_id, attr_map, out, depth, stack,
+             proto_ids=frozenset(), proto_uses=None, inherited=None,
+             image_uses=None, edges_out=None, layer=None,
+             layer_uses=None, group_layer=None, loose_out=None) -> None:
+    """Append ``(outer, holes, attrs)`` faces for ``defn`` (transformed by
+    ``xform``) and, recursively, for every definition its instances place.
+
+    ``inherited`` is the material of the nearest enclosing painted instance —
+    faces with no material of their own take it (.skp inheritance).
+    ``layer`` is the layer (tag) of the nearest enclosing tagged instance,
+    carried onto the flattened faces the same way.
+    ``group_layer`` is the layer of the group the faces land in (the caller
+    puts it on that group, not on the faces). What is pulled OUT of the group
+    — images, face-me components, prototype placements — takes it when
+    nothing closer is tagged, so hiding the tag hides them too.
+
+    When ``layer_uses`` is given, a nested instance that carries its OWN
+    layer (tag) is NOT flattened here — it is recorded to become a separate
+    group with that layer, so hiding the layer in IngeTrazo hides exactly
+    what the file marks as hidden (reference-group chunks render whole groups;
+    per-face layers inside them are not filtered).
+
+    When an instance references a definition in ``proto_ids``, its geometry is
+    NOT flattened here — the composed placement matrix is recorded in
+    ``proto_uses[(def_id, inherited)]`` instead, so the shared prototype is
+    built once per inherited material and every copy becomes an O(1) instance
+    (``Group.xform``); the entry is ``(matrix, layer, instance name)``.
+
+    ``loose_out`` collects the loose edges (lines on no face), like
+    ``edges_out`` the soft ones."""
+    if depth > _MAX_DEPTH or id(defn) in stack:
+        return
+    stack = stack | {id(defn)}
+    pos_m, raw_l, meta = _defn_geom(defn)
+    if meta:
+        wl = _world_points(pos_m, xform)
+        mirrored = xform.determinant() < 0.0
+        for face, s0, s1, hs in meta:
+            entry = _face_entry(face, wl, raw_l, s0, s1, hs, attr_map,
+                                inherited, layer, mirrored)
+            if entry is not None:
+                out.append(entry)
+    if edges_out is not None:
+        _soft_edge_segments(defn, xform, edges_out)
+    if loose_out is not None:
+        _loose_edge_segments(defn, xform, loose_out)
+    for ins in getattr(defn, "instances", []):
+        rid = getattr(ins, "ref_idx", None)
+        child = by_id.get(rid)
+        if child is None:
+            continue
+        placed = xform * _matrix(ins.matrix)
+        child_inherited = getattr(ins, "material_id", None) or inherited
+        child_layer = getattr(ins, "layer", "") or layer
+        # What leaves the group as an object of its own carries the group's
+        # layer, which the flattened faces get from the group itself.
+        out_layer = child_layer or group_layer
+        cid = getattr(child, "id", None)
+        if getattr(child, "is_image", False):
+            if image_uses is not None:
+                # An Image entity (photo placed as an object): pulled out of
+                # its parent so it can become its own group — cutout images
+                # turn to face the camera (billboard), like the DAE import.
+                image_uses.append((child, placed, child_inherited,
+                                   out_layer))
+            else:
+                # Inside a face-me component being flattened: the image
+                # stays part of it, with its whole-picture UVs.
+                out.extend(_image_quad_faces(child, placed, attr_map,
+                                             child_inherited))
+            continue
+        if image_uses is not None and \
+                getattr(child, "always_faces_camera", False):
+            # An "always face camera" component (2D people like
+            # Susan): extracted as its own billboard group.
+            image_uses.append((child, placed, child_inherited, out_layer))
+            continue
+        if proto_uses is not None and cid in proto_ids:
+            proto_uses.setdefault((cid, child_inherited), []).append(
+                (placed, out_layer, getattr(ins, "name", "") or None))
+            continue
+        if layer_uses is not None and getattr(ins, "layer", ""):
+            # Tagged nested instance → its own group carrying the layer.
+            layer_uses.append((child, placed, child_inherited, ins.layer))
+            continue
+        _collect(child, placed, by_id, attr_map, out, depth + 1, stack,
+                 proto_ids, proto_uses, child_inherited, image_uses,
+                 edges_out, child_layer, layer_uses, group_layer, loose_out)
+
+
+def _subtree_polys(defn, by_id, memo, stack) -> int:
+    """Total polygon count of ``defn``'s subtree (own faces + instanced)."""
+    cid = id(defn)
+    if cid in stack:
+        return 0
+    cached = memo.get(cid)
+    if cached is not None:
+        return cached
+    stack = stack | {cid}
+    n = len(getattr(defn, "faces", {}) or {})
+    for ins in getattr(defn, "instances", []):
+        child = by_id.get(getattr(ins, "ref_idx", None))
+        if child is not None:
+            n += _subtree_polys(child, by_id, memo, stack)
+    memo[cid] = n
+    return n
+
+
+def _census(defn, by_id, uses, depth, stack) -> None:
+    """Count how many times each definition id is placed, walking only the
+    tree actually reachable from ``defn`` (dangling library definitions and
+    their internal references don't inflate the counts)."""
+    if depth > _MAX_DEPTH or id(defn) in stack:
+        return
+    stack = stack | {id(defn)}
+    for ins in getattr(defn, "instances", []):
+        rid = getattr(ins, "ref_idx", None)
+        child = by_id.get(rid)
+        if child is None:
+            continue
+        uses[getattr(child, "id", None)] = uses.get(
+            getattr(child, "id", None), 0) + 1
+        _census(child, by_id, uses, depth + 1, stack)
+
+
+def _mark_projected_faces(defn, attr_map) -> None:
+    """Detect PROJECTED textures (a geolocated terrain drape) and
+    set ``face._projected`` on them.
+
+    A projected texture shares one mapping matrix across many faces of a
+    curved/tilted surface — an aerial photo cast straight down, sampled in
+    plan. The FTC record itself carries no reliable projected flag on the
+    VFF (2021+) path, so this uses the definitive geometric test: group
+    textured faces by (material, matrix); if the face-LOCAL projection makes
+    the shared-vertex UVs badly discontinuous while the PLAN-XY projection
+    keeps them continuous, the group is a plan-projected drape. The test is
+    conservative — a face is only marked projected when plan-XY actually
+    resolves the seams, so it can never worsen a mapping it doesn't
+    understand (non-plan projection axes stay on the face-local path)."""
+    from collections import defaultdict
+
+    groups: dict = defaultdict(list)
+    for f in getattr(defn, "faces", {}).values():
+        mid = getattr(f, "material_id", None)
+        uvm = getattr(f, "uv_transform", None)
+        if mid is None or not uvm:
+            continue
+        tex = attr_map.get(mid)
+        if not tex or "texture" not in tex:
+            continue
+        groups[(mid, tuple(round(x, 1) for x in uvm))].append(f)
+
+    for (mid, _key), faces in groups.items():
+        if len(faces) < 8:                     # too few to judge a drape
+            continue
+        tex = attr_map[mid]["texture"]
+        sample = faces[:80]
+
+        def _disc(projected):
+            uv_at: dict = defaultdict(set)
+            for f in sample:
+                raw = _ring_raw(f_defn := defn, f.loops[0])
+                uvs = _positioned_uvs(f, raw, tex, matrix=f.uv_transform,
+                                      projected=projected)
+                if uvs is None:
+                    return None
+                for p, uv in zip(raw, uvs):
+                    uv_at[tuple(round(c, 1) for c in p)].add(
+                        (round(uv[0], 2), round(uv[1], 2)))
+            if not uv_at:
+                return None
+            bad = sum(1 for v in uv_at.values() if len(v) > 1)
+            return bad / len(uv_at)
+
+        local = _disc(False)
+        plan = _disc(True)
+        if local is not None and plan is not None \
+                and local > 0.3 and plan < 0.1:
+            for f in faces:
+                f._projected = True
+
+
+def _merge_equal_protos(protos):
+    """Fold prototypes with identical content onto one entry, repointing
+    every reference.
+
+    Prototypes are keyed while building by ``(definition, inherited
+    material)``, and a .skp can hold the SAME material under two ids — two
+    entries of the .skp material table that a component's placements paint
+    with interchangeably. That split the hedge's leaves into two identical
+    prototypes of 4480 and 5120 faces: 9600 faces stored twice for no reason.
+    Comparing the built content catches that, and any other route to the same
+    duplication, instead of trusting the ids.
+
+    Signatures are computed over child indices, so folding a child can make
+    two parents equal: the pass repeats until it settles. Candidates are
+    bucketed by cheap shape first, so the full comparison only ever runs
+    between prototypes that could actually be equal."""
+    if len(protos) < 2:
+        return protos
+    for _round in range(8):
+        buckets: dict = {}
+        for i, e in enumerate(protos):
+            buckets.setdefault(
+                (e["name"], len(e["faces"]), len(e["soft_edges"]),
+                 len(e["children"])), []).append(i)
+        remap: dict = {}
+        for bucket in buckets.values():
+            if len(bucket) < 2:
+                continue
+            seen: dict = {}
+            for i in bucket:
+                e = protos[i]
+                sig = repr((e["faces"], e["soft_edges"], e["children"],
+                            e.get("loose_edges"), e.get("component", True)))
+                first = seen.setdefault(sig, i)
+                if first != i:
+                    remap[i] = first
+        if not remap:
+            break
+        # Placements of a folded prototype move to the one that survives.
+        for i, keep in remap.items():
+            src, dst = protos[i], protos[keep]
+            if not src["instances"]:
+                continue
+            for key in ("instance_layers", "instance_names"):
+                if key in src or key in dst:
+                    dst.setdefault(key, [None] * len(dst["instances"])).extend(
+                        src.get(key) or [None] * len(src["instances"]))
+            dst["instances"].extend(src["instances"])
+        keep_ix = [i for i in range(len(protos)) if i not in remap]
+        new_of = {old_i: new_i for new_i, old_i in enumerate(keep_ix)}
+        out = []
+        for i in keep_ix:
+            e = protos[i]
+            e["children"] = [{**k, "proto": new_of[remap.get(k["proto"],
+                                                             k["proto"])]}
+                             for k in e["children"]]
+            out.append(e)
+        protos = out
+    return protos
+
+
+def file_layer_records(model):
+    """The file's layers (tags) as ``[{"name", "visible"}]`` — Scene-level,
+    so the importer can register them even when nothing sits on one yet.
+    The model's default layer never travels (it IS IngeTrazo's default).
+
+    openskp spells the switch ``hidden``; this asked for ``visible``, which
+    no generation of the library has ever had, so the ``getattr`` default
+    won every time and EVERY layer arrived visible however the author had
+    left it. Rafael's ``edificio.skp`` hides ``Camera_FOV_Lines`` and
+    ``Camera_FOV_Volume``: the author saw a small camera glyph, IngeTrazo
+    drew the whole frustum across the model (Marco, 2026-09-17, comparing
+    screenshots). ``visible`` is still honoured if a future library grows
+    it, but ``hidden`` is what decides today.
+    """
+    out = []
+    for ly in getattr(model, "layers", []) or []:
+        name = getattr(ly, "name", "")
+        if (not name or getattr(ly, "default", False)
+                or name in ("Layer0", "Untagged")):
+            continue
+        if hasattr(ly, "hidden"):
+            visible = not bool(ly.hidden)
+        else:
+            visible = bool(getattr(ly, "visible", True))
+        out.append({"name": name, "visible": visible})
+    return out
+
+
+def _is_empty_model(model, skp_path, legacy_era: bool) -> bool:
+    """True when the file is a .skp model with nothing in it, as opposed
+    to one whose geometry the parser failed to find. The parse alone cannot
+    tell the two apart, so ask the file: a 2021+ ``.skp`` carries its
+    authoring program's own render of the model
+    (``meta/model_thumbnail.png``), which is one flat
+    colour when there is no geometry. Legacy files, and any doubt, answer
+    False — the converter stays the fallback."""
+    if legacy_era or skp_path is None:
+        return False
+    root = getattr(model, "root", None)
+    if getattr(model, "definitions", None) or root is None:
+        return False
+    if any(getattr(root, a, None) for a in (
+            "faces", "edges", "instances", "texts", "dimensions",
+            "construction_lines", "construction_points")):
+        return False
+    import io
+    import zipfile
+    from PySide6.QtGui import QImage
+    try:
+        data = Path(skp_path).read_bytes()
+        start = data.find(b"PK\x03\x04")
+        if start < 0:
+            return False
+        from core import zip_limits
+        with zipfile.ZipFile(io.BytesIO(data[start:])) as zf:
+            png = zip_limits.read(zf, "meta/model_thumbnail.png")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return False
+    img = QImage.fromData(png)
+    if img.isNull():
+        return False
+    import numpy as np
+    img = img.convertToFormat(QImage.Format_RGBA8888)
+    px = np.frombuffer(img.constBits(), np.uint32, count=img.sizeInBytes() // 4)
+    return bool((px == px[0]).all())
+
+
+def _adapt(model, name: str, skp_path=None):
+    """An ``SkpModel`` → a payload ``{"backend", "groups", "protos"}`` or
+    ``None`` when it yields no geometry (the seam reports it as unreadable).
+
+    Grouped structure, mirroring the DAE reference import:
+
+    * the root's loose faces → one group named after the file;
+    * each top-level instance → its own group (its subtree flattened into it),
+      so every placed component is selectable/movable on its own;
+    * a definition placed ≥2 times whose subtree is worth sharing (same
+      thresholds as the DAE import) → ONE prototype, extracted at ANY depth,
+      each copy an O(1) placement matrix (``Group.xform``).
+
+    Definitions with faces that nothing instances are library entries not
+    placed in the model — they are not part of the visible model, so we skip
+    them.
+    ``skp_path`` anchors where extracted texture images land; the material
+    joins are guarded so PyPI 0.2.0 still imports (uncoloured)."""
+    from formats.dae import _INST_MIN_POLYS, _INST_MIN_SAVED
+
+    defs = getattr(model, "definitions", {}) or {}
+    attr_map, materials = _material_attrs(model, skp_path or name)
+    global _hidden_tags
+    from formats import openskp_compat
+    _hidden_tags = openskp_compat.hidden_tags(
+        r["name"] for r in file_layer_records(model) if not r["visible"])
+    # openskp ≥ 0.4 exposes the implicit root as its own field; older
+    # releases keep it inside ``definitions`` under the name ROOT_MODEL.
+    root = getattr(model, "root", None)
+    # The geometric drape detection exists because the VFF (2021+) path has
+    # no reliable per-side projected flag. The legacy walker DOES decode the
+    # real flag (FTC flags bit 1), so on legacy files the flag rules — the
+    # heuristic must not run there: a building painted with one identity-
+    # mapped texture across many orientations reads as "plan resolves the
+    # seams" and gets falsely draped (real 2018 file: every brick wall
+    # facing ±X rendered as 1-D stripes).
+    _ver_digits = "".join(
+        ch for ch in str(getattr(model, "version", "") or "").lstrip("{")
+        if ch.isdigit() or ch == "."
+    ).split(".")[0]
+    legacy_era = _ver_digits.isdigit() and int(_ver_digits) < 21
+    if not legacy_era:
+        if root is not None:
+            _mark_projected_faces(root, attr_map)
+        for d in defs.values():
+            _mark_projected_faces(d, attr_map)
+    by_id = {}
+    for d in defs.values():
+        by_id[getattr(d, "id", None)] = d
+        if root is None and getattr(d, "name", None) == "ROOT_MODEL":
+            root = d
+    roots = [root] if root is not None else list(defs.values())
+
+    # Shared-prototype census over the reachable tree.
+    uses: dict = {}
+    memo: dict = {}
+    for r in roots:
+        _census(r, by_id, uses, 0, set())
+    def _subtree_has_faceme(d, stack=frozenset()):
+        if getattr(d, "is_image", False) or \
+                getattr(d, "always_faces_camera", False):
+            return True
+        if id(d) in stack:
+            return False
+        for ins in getattr(d, "instances", []):
+            c = by_id.get(getattr(ins, "ref_idx", None))
+            if c is not None and _subtree_has_faceme(c, stack | {id(d)}):
+                return True
+        return False
+
+    def _subtree_has_tagged(d, stack=frozenset()):
+        if id(d) in stack:
+            return False
+        for ins in getattr(d, "instances", []):
+            if getattr(ins, "layer", ""):
+                return True
+            c = by_id.get(getattr(ins, "ref_idx", None))
+            if c is not None and _subtree_has_tagged(c, stack | {id(d)}):
+                return True
+        return False
+
+    def _shareable(d) -> bool:
+        # Face-me-carrying subtrees (images, face-camera components) are
+        # excluded from sharing: each copy's billboard needs its own world
+        # spot. Tagged-instance-carrying subtrees too: each copy's tagged
+        # subtree must extract as its own layer group (the tagged child
+        # itself usually re-shares one level down, with per-placement
+        # layers).
+        return not (_subtree_has_faceme(d) or _subtree_has_tagged(d))
+
+    proto_ids = set()
+    for did, cnt in uses.items():
+        d = by_id.get(did)
+        if d is None or cnt < 2 or not _shareable(d):
+            continue
+        polys = _subtree_polys(d, by_id, memo, set())
+        if polys >= _INST_MIN_POLYS and polys * (cnt - 1) >= _INST_MIN_SAVED:
+            proto_ids.add(did)
+    # A definition placed ONCE is still a definition. The thresholds above ask
+    # "does sharing this save memory", which is the wrong question for a
+    # component placed a single time: the answer is no, and the model's
+    # structure is lost for it — the library pieces in Marco's pool (the
+    # barbecue, the pool itself) are component definitions in the .skp and
+    # arrived as flat groups, with their placement matrix baked into the
+    # vertices. Keeping the placement means the group knows its own axes (the
+    # selection box has real ones to draw instead of derived), and Move,
+    # Rotate and copy take the O(1) instance paths.
+    #
+    # Starting where the definition is placed at the TOP level, and going
+    # down from there through every definition placed ONCE: a prototype
+    # keeps the prototypes it places as ``children`` (see ``_build_proto``),
+    # so the file's own nesting — «geometries» holding «closed» holding a
+    # circle and a rectangle — arrives as nested groups instead of flattened
+    # into the outermost one. A ``cnt == 1`` definition is placed exactly
+    # once, so promoting it can only keep it inside its parent, never pull it
+    # out next to it. Shared definitions below the sharing thresholds still
+    # flatten into what holds them, as before.
+    #
+    # Tagged placements inside are no reason to flatten any more: a
+    # prototype's children carry their own tag, so hiding it hides them
+    # whole. They only must not be flattened into the parent's mesh, where
+    # a tag survives as a per-face one the renderer does not filter — so a
+    # tagged placement, and a shared definition with tagged placements
+    # inside, becomes a prototype too. «01_EG» (walls, doors and furniture
+    # in subgroups on their own tags) arrived as one flat mesh.
+    def _promote_nested(d, stack=frozenset()):
+        if id(d) in stack:
+            return
+        for ins in getattr(d, "instances", []):
+            c = by_id.get(getattr(ins, "ref_idx", None))
+            if c is None or getattr(c, "is_image", False) or \
+                    getattr(c, "always_faces_camera", False):
+                continue
+            if uses.get(getattr(c, "id", None)) == 1:
+                proto_ids.add(c.id)
+            elif ((getattr(ins, "layer", "") or _subtree_has_tagged(c))
+                    and not _subtree_has_faceme(c)):
+                proto_ids.add(c.id)
+            _promote_nested(c, stack | {id(d)})
+
+    for r in roots:
+        for ins in getattr(r, "instances", []):
+            child = by_id.get(getattr(ins, "ref_idx", None))
+            if child is None or uses.get(getattr(child, "id", None)) != 1:
+                continue
+            if getattr(child, "is_image", False) or \
+                    getattr(child, "always_faces_camera", False):
+                continue
+            proto_ids.add(child.id)
+            _promote_nested(child)
+    # Which definitions the file places as GROUPS, not components (see
+    # openskp_compat): they import as groups.
+    from formats import openskp_compat
+    single_groups = {did for did in openskp_compat.group_definitions()
+                     if uses.get(did) == 1}
+    # A COMPONENT copied side by side at the top level is a component however
+    # small (#1029: six 6-face shelves of one definition arrived as six
+    # loose groups, so the file's components read as groups). The sharing
+    # thresholds above guard against a tiny part repeated inside a parent
+    # turning into hundreds of child objects; at the top level every copy is
+    # its own object either way, so sharing its mesh adds none. Only when
+    # the parse told groups from components, and only definitions placed
+    # nowhere else — a nested copy would be pulled out of its parent.
+    if openskp_compat.kinds_known(legacy_era):
+        group_ids = openskp_compat.group_definitions()
+        top_uses: dict = {}
+        for r in roots:
+            for ins in getattr(r, "instances", []):
+                cid = getattr(by_id.get(getattr(ins, "ref_idx", None)),
+                              "id", None)
+                if cid is not None:
+                    top_uses[cid] = top_uses.get(cid, 0) + 1
+        for cid, n in top_uses.items():
+            if n < 2 or uses.get(cid) != n or cid in group_ids \
+                    or cid in proto_ids:
+                continue
+            child = by_id[cid]
+            if getattr(child, "is_image", False) or \
+                    getattr(child, "always_faces_camera", False) \
+                    or not _shareable(child):
+                continue
+            proto_ids.add(cid)
+
+    groups: list = []
+    proto_uses: dict = {}
+    image_uses: list = []
+    layer_uses: list = []
+    for r in roots:
+        # The root's own loose faces (no instance recursion).
+        loose: list = []
+        ident = QMatrix4x4()
+        pos_m, raw_l, meta = _defn_geom(r)
+        if meta:
+            wl = _world_points(pos_m, ident)
+            for face, s0, s1, hs in meta:
+                entry = _face_entry(face, wl, raw_l, s0, s1, hs, attr_map)
+                if entry is not None:
+                    loose.append(entry)
+        lines: list = []
+        _loose_edge_segments(r, ident, lines)
+        if loose or lines:
+            loose_edges: list = []
+            _soft_edge_segments(r, ident, loose_edges)
+            groups.append({"name": name, "faces": loose,
+                           "soft_edges": loose_edges, "loose_edges": lines})
+        # Each top-level instance → its own group (or a shared-proto use).
+        # The instance's layer (tag) rides on the whole group; nested tagged
+        # instances land as per-face layers inside it.
+        for ins in getattr(r, "instances", []):
+            child = by_id.get(getattr(ins, "ref_idx", None))
+            if child is None:
+                continue
+            placed = _matrix(ins.matrix)
+            inh = getattr(ins, "material_id", None)
+            lay = getattr(ins, "layer", "") or None
+            if getattr(child, "is_image", False) or \
+                    getattr(child, "always_faces_camera", False):
+                image_uses.append((child, placed, inh, lay))
+                continue
+            ins_name = getattr(ins, "name", "") or None
+            if getattr(child, "id", None) in proto_ids:
+                proto_uses.setdefault((child.id, inh), []).append(
+                    (placed, lay, ins_name))
+                continue
+            sub: list = []
+            sub_edges: list = []
+            sub_lines: list = []
+            _collect(child, placed, by_id, attr_map, sub, 0, set(),
+                     proto_ids, proto_uses, inh, image_uses, sub_edges,
+                     layer_uses=layer_uses, group_layer=lay,
+                     loose_out=sub_lines)
+            if sub or sub_lines:
+                # The name the user gave the group or copy, else its
+                # definition's («Group#3» is all a .skp names a group).
+                gp = {"name": ins_name or getattr(child, "name", None) or name,
+                      "faces": sub, "soft_edges": sub_edges,
+                      "loose_edges": sub_lines,
+                      # The instance's own axes (issue #44): flattened into
+                      # world coordinates, it still faces the way it did.
+                      "axes": [float(x) for x in placed.data()]}
+                if lay:
+                    gp["layer"] = lay
+                groups.append(gp)
+
+    # Tagged nested instances → their own groups carrying the layer, so a
+    # layer toggle hides them whole (faces AND edges) with no renderer work.
+    # The list grows while we walk it: a tagged instance inside a tagged
+    # instance extracts recursively.
+    i = 0
+    while i < len(layer_uses):
+        child, placed, inh, lay = layer_uses[i]
+        i += 1
+        sub = []
+        sub_edges = []
+        _collect(child, placed, by_id, attr_map, sub, 0, set(),
+                 proto_ids, proto_uses, inh, image_uses, sub_edges,
+                 layer_uses=layer_uses, group_layer=lay)
+        if sub:
+            groups.append({"name": getattr(child, "name", None) or name,
+                           "faces": sub, "soft_edges": sub_edges,
+                           "layer": lay,
+                           "axes": [float(x) for x in placed.data()]})
+
+    # Build each shared prototype ONCE, in local coordinates — per inherited
+    # material, so a component painted red and green as a whole yields two
+    # prototypes, not one wrongly shared.
+    #
+    # A prototype KEEPS the prototypes its own subtree places, as ``children``
+    # (proto index + local matrix). Flattening them instead — the old
+    # "no proto-in-proto" rule — threw away the sharing the file had already
+    # done inside a component: the hedge in piscina.igz is 4480 + 5120 faces
+    # placed 48 times, and it arrived as 230400 real ones, twenty-four times
+    # over, for the element that is 89% of that model.
+    protos: list = []
+    index_of: dict = {}
+
+    def _build_proto(did, inh):
+        """Index of the prototype for ``(did, inh)``, building it (and any
+        prototype it places) on the way. Reserves its slot before recursing
+        so a cycle cannot spin."""
+        key = (did, inh)
+        if key in index_of:
+            return index_of[key]
+        d = by_id.get(did)
+        if d is None:
+            return None
+        idx = index_of[key] = len(protos)
+        protos.append(None)
+        local: list = []
+        local_edges: list = []
+        local_lines: list = []
+        local_images: list = []
+        child_uses: dict = {}
+        _collect(d, QMatrix4x4(), by_id, attr_map, local, 0, set(),
+                 proto_ids, child_uses, inh, local_images,
+                 edges_out=local_edges, loose_out=local_lines)
+        children: list = []
+        for (cid, cinh), places in child_uses.items():
+            ci = _build_proto(cid, cinh)
+            if ci is None:
+                continue
+            for xf, ly, nm in places:
+                kid = {"proto": ci, "xform": xf}
+                if ly:
+                    kid["layer"] = ly
+                if nm:
+                    kid["name"] = nm
+                children.append(kid)
+        protos[idx] = {"name": getattr(d, "name", None) or name,
+                       "faces": local, "soft_edges": local_edges,
+                       "loose_edges": local_lines,
+                       # A GROUP placed once is a group. Copies of a group
+                       # share its definition in the file; they stay
+                       # components here, so editing one cannot reach into
+                       # the mesh the others share.
+                       "component": did not in single_groups,
+                       "children": children, "instances": [],
+                       # face-me pieces inside, in local coordinates: they
+                       # leave as billboards once the placements are known
+                       "_images": local_images}
+        return idx
+
+    for (did, inh), uses in list(proto_uses.items()):
+        if not uses:
+            continue
+        idx = _build_proto(did, inh)
+        if idx is None:
+            continue
+        protos[idx]["instances"] = [xf for xf, _ly, _nm in uses]
+        if any(ly for _xf, ly, _nm in uses):
+            # Layer (tag) per PLACEMENT — copies of one component can sit on
+            # different layers.
+            protos[idx]["instance_layers"] = [ly for _xf, ly, _nm in uses]
+        if any(nm for _xf, _ly, nm in uses):
+            # Name per PLACEMENT too: each copy can carry its own.
+            protos[idx]["instance_names"] = [nm for _xf, _ly, nm in uses]
+
+    # The face-me pieces a prototype holds turn toward the camera from
+    # their own WORLD spot, so they leave it like the ones outside any
+    # prototype: one per placement, its matrix composed down the tree, its
+    # tag the nearest one above it.
+    def _expand_images(idx, world, tag, depth=0):
+        pr = protos[idx]
+        for child, placed, inh, lay in pr["_images"]:
+            image_uses.append((child, world * placed, inh, lay or tag))
+        if depth < 32:      # a malformed file must not spin
+            for kid in pr["children"]:
+                _expand_images(kid["proto"], world * kid["xform"],
+                               kid.get("layer") or tag, depth + 1)
+
+    for idx, pr in enumerate(protos):
+        lays = pr.get("instance_layers") or []
+        for i, xf in enumerate(pr["instances"]):
+            _expand_images(idx, xf, lays[i] if i < len(lays) else None)
+    for pr in protos:
+        del pr["_images"]
+
+    # Image entities → their own groups; cutout images (real alpha) become
+    # face-me billboards that turn toward the camera, opaque photos stay
+    # static panels — same rule as the DAE face-me import. An image quad
+    # always shows the WHOLE picture once (see _image_quad_faces). An
+    # "always faces camera" component (Susan) flattens its whole subtree
+    # into one billboard group — the flag decides, no heuristic needed.
+    for child, placed, inh, lay in image_uses:
+        if getattr(child, "is_image", False):
+            faces = _image_quad_faces(child, placed, attr_map, inh)
+            tex = next((a["texture"]["path"] for _o, _h, a in faces
+                        if a and "texture" in a), None)
+            # A cut-out turns to face the camera — unless it is stuck on a
+            # face, like a logo on a device (#429): the file has no face-me
+            # flag for images, SketchUp never turns one.
+            billboard = bool(tex and _image_has_cutout(tex)
+                             and not _rests_on_a_face(roots, by_id,
+                                                      faces[0][0]))
+        else:
+            faces = []
+            _collect(child, placed, by_id, attr_map, faces, 0, set(),
+                     inherited=inh)
+            billboard = True
+        if not faces:
+            continue
+        gp = {"name": getattr(child, "name", None) or name,
+              "faces": faces, "billboard": billboard}
+        if lay:
+            gp["layer"] = lay
+        groups.append(gp)
+    # NOT filtered: ``children`` reference prototypes by INDEX, so dropping
+    # an entry would silently repoint every reference after it. A container
+    # with no faces of its own is real anyway — the hedge's top definition
+    # holds nothing but one placement — and a wholly empty entry simply
+    # places nothing.
+    protos = _merge_equal_protos(protos)
+
+    payload = {"backend": "openskp", "groups": groups, "protos": protos}
+    if not groups and not any(e["faces"] or e["children"]
+                              or e.get("loose_edges") for e in protos):
+        # Nothing to draw. Either the parser missed the geometry (→ None,
+        # the caller reports it as unreadable) or the file really is empty
+        # — a template, #103: reporting THAT as unreadable would be wrong,
+        # it is a blank page.
+        if not _is_empty_model(model, skp_path, legacy_era):
+            return None
+        payload["empty"] = True
+    # The file's named materials → the scene registry (core.materials).
+    if materials:
+        payload["materials"] = materials
+    file_layers = file_layer_records(model)
+    if file_layers:
+        payload["layers"] = file_layers
+    # The file's saved scenes (camera + hidden layers), inches → metres.
+    scenes = []
+    for pg in getattr(model, "pages", []) or []:
+        if getattr(pg, "eye", None) is None or \
+                getattr(pg, "target", None) is None:
+            continue
+        scenes.append({
+            "name": pg.name or f"Scene {len(scenes) + 1}",
+            "eye": [c * _INCH for c in pg.eye],
+            "target": [c * _INCH for c in pg.target],
+            "up": list(pg.up or (0.0, 0.0, 1.0)),
+            "fov": getattr(pg, "fov", 35.0),
+            "parallel": getattr(pg, "parallel", False),
+            "ortho_height": getattr(pg, "ortho_height", 0.0) * _INCH,
+            "hidden_layers": list(getattr(pg, "hidden_layers", []) or []),
+        })
+    if scenes:
+        payload["scenes"] = scenes
+    # Linear dimensions (.skp dimension entities), inches → metres. Endpoints
+    # come in world space for model-root dimensions (the common case).
+    dims = []
+    for dm in getattr(model, "dimensions", []) or []:
+        if getattr(dm, "a", None) is None or getattr(dm, "b", None) is None:
+            continue
+        dims.append({
+            "a": [c * _INCH for c in dm.a],
+            "b": [c * _INCH for c in dm.b],
+            "offset": getattr(dm, "offset", 0.0) * _INCH,
+            "normal": list(dm.normal) if getattr(dm, "normal", None) else None,
+            "text": getattr(dm, "text", "") or "",
+        })
+    if dims:
+        payload["dimensions"] = dims
+    # Leader texts (.skp text entities), inches → metres. Only free
+    # (point-anchored) texts carry a resolved anchor; model-root texts are
+    # world space.
+    texts = []
+    root_def = getattr(model, "root", None)
+    for tx in (getattr(root_def, "texts", []) or []) if root_def else []:
+        pt = getattr(tx, "point", None)
+        body = (getattr(tx, "text", "") or "").strip()
+        if pt is None or not body:
+            continue
+        entry = {
+            "anchor": [c * _INCH for c in pt],
+            "text": body,
+            "hidden": bool(getattr(tx, "hidden", False)),
+        }
+        lp = getattr(tx, "label_point", None)
+        if lp is not None:
+            entry["label"] = [c * _INCH for c in lp]
+        texts.append(entry)
+    if texts:
+        payload["texts"] = texts
+    # The file's style back-face colour (our upstream PR openskp#10): adopt it
+    # so unpainted faces seen from behind read like they did for the author
+    # (instead of IngeTrazo's own blue-grey default).
+    for st in getattr(model, "styles", []) or []:
+        back = getattr(st, "back_color", None)
+        if back:
+            payload["back_color"] = tuple(c / 255.0 for c in back)
+            break
+    return payload
+
+
+def parse(path, progress=None):
+    """Parse ``path`` with OpenSKP and adapt it to a payload, or ``None`` when
+    no geometry comes out. Raises whatever OpenSKP raises on a file it cannot
+    read (the caller treats that as "fall back to the converter")."""
+    import openskp
+    from formats import openskp_compat
+    openskp_compat.apply()          # fixes still waiting upstream
+    openskp_compat.reset_group_definitions()
+    if progress is not None:
+        progress(0.1, "Parsing .skp (OpenSKP)…")
+    model = openskp.SkpFile.open(str(path)).parse()
+    openskp_compat.resolve_face_layers(model)   # tag ids → names (#700)
+    if progress is not None:
+        progress(0.6, "Building geometry…")
+    return _adapt(model, Path(path).stem, skp_path=path)

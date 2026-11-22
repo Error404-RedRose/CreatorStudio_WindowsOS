@@ -1,0 +1,952 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Marco Sumari Tellez and IngeTrazo contributors.
+"""AI plumbing shared by the AI plugins (invariant #5: the AI orchestrates
+ACTIONS over the deterministic engine, never raw meshes).
+
+Two halves:
+
+- :func:`run_transactional` — execute agent Python against the live
+  document with the Python Console's guarantees: one undo step per call,
+  whole-rollback on error, no undo entry for inspect-only runs. Used by the
+  AI Bridge (MCP) and the in-app Asistente IA.
+- A provider layer mirroring IngePresupuestos' ``ai_specs``: ONE API key,
+  provider auto-detected by its prefix (gsk_ → Groq, sk-ant- → Anthropic,
+  AIza → Gemini, sk-or- → OpenRouter, oc_sk_ → OpenCode Go, sk- → OpenAI)
+  plus local Ollama.
+  Anthropic speaks its native Messages API; everyone else goes through
+  their OpenAI-compatible endpoint — two wire formats cover them all,
+  images (viewport screenshots) included, stdlib urllib only.
+"""
+from __future__ import annotations
+
+import io
+import json
+import math
+import os
+import sys
+import re
+import traceback
+import urllib.error
+import time
+import urllib.request
+
+from core.history import SnapshotImport
+from core.version import USER_AGENT as _UA, __version__
+
+#: Cloudflare fronts several providers (Groq above all) and rejects
+#: urllib's default "Python-urllib/3.x" agent with HTTP 403 error 1010 —
+#: caught on the user's first real Groq key. Always send a real identity.
+USER_AGENT = _UA
+
+# ---- Transactional executor -------------------------------------------------
+
+
+def build_scope(viewport, scope: dict | None = None) -> dict:
+    """(Re)bind the live objects an agent scripts against."""
+    from PySide6.QtGui import QVector3D
+    from core import bim
+    from core.group import Group
+    from core.layers import Layer
+    from core.mesh import Edge, Face, Mesh, Vertex
+    scope = scope if scope is not None else {"__name__": "__ai__"}
+    scope.update(
+        viewport=viewport, scene=viewport.scene, model=viewport.scene,
+        mesh=viewport.scene.mesh, selection=viewport.scene.selection,
+        groups=viewport.scene.groups, layers=viewport.scene.layers, bim=bim,
+        QVector3D=QVector3D, Mesh=Mesh, Group=Group, Vertex=Vertex,
+        Edge=Edge, Face=Face, Layer=Layer)
+    scope.update(_recipe_helpers(viewport.scene))
+    return scope
+
+
+def _check_scene_lists(scene) -> None:
+    """Refuse a recipe that left something foreign in the scene's lists.
+    Asked for «dos láminas», a model wrote ``layers.append('Lámina 1')``:
+    the step went through and every paint, hover and the Layers panel
+    raised «'str' object has no attribute 'name'» until the user undid it.
+    Raising here rolls the step back whole and
+    tells the model what each list takes."""
+    from core.composition import Composicion
+    from core.group import Group
+    from core.layers import Layer
+    for attr, cls, hint in (
+            ("layers", Layer, "Layer('nombre') (una CAPA/etiqueta)"),
+            ("groups", Group, "Group(mesh, name=...)"),
+            ("compositions", Composicion,
+             "sheet('nombre') (una LÁMINA del compositor)")):
+        for item in getattr(scene, attr, None) or ():
+            if not isinstance(item, cls):
+                raise TypeError(
+                    f"scene.{attr} solo admite {cls.__name__}: se añadió "
+                    f"{type(item).__name__} {item!r:.40}. Usa {hint}.")
+
+
+def _recipe_helpers(scene) -> dict:
+    """One-line geometry builders for AI recipes. Watching real sessions,
+    every model hand-rolled its own ring-of-quads lathe per piece — 40
+    error-prone lines and a token bill each time, with faceted results
+    (no soft edges, wrong winding). These build correct solids instead."""
+    from PySide6.QtGui import QVector3D
+    from core.group import Group
+    from core.mesh import Mesh
+    from core.orient import orient_outward
+
+    def _soften(mesh, deg=42.0):
+        cos_t = math.cos(math.radians(deg))
+        for e in mesh.edges:
+            if len(e.faces) == 2 and QVector3D.dotProduct(
+                    e.faces[0].normal(), e.faces[1].normal()) > cos_t:
+                e.soft = True
+
+    def _finish(mesh, color, name):
+        if color is not None:
+            for f in mesh.faces:
+                f.attrs["color"] = tuple(color)
+        orient_outward(mesh)
+        _soften(mesh)
+        group = Group(mesh, name=name)
+        scene.groups.append(group)
+        return group
+
+    def revolve(profile, segments=32, scallop=None, closed=False,
+                name=None, color=None):
+        """Solid of revolution around Z from an (radius, z) profile,
+        bottom to top. Open profiles get end caps; ``closed=True`` treats
+        the profile as a closed cross-section ring (e.g. a basin wall).
+        ``scallop=(depth, lobes)`` carves festones INTO the radius, scaled
+        by r/r_max so rims wave and centers stay put."""
+        amp, lobes = scallop or (0.0, 0)
+        rmax = max(r for r, _z in profile) or 1.0
+        rows = []
+        for r, z in profile:
+            ring = []
+            for i in range(segments):
+                th = 2.0 * math.pi * i / segments
+                rr = r
+                if lobes:
+                    rr += (amp * 0.5 * (math.cos(lobes * th) - 1.0)
+                           * (r / rmax))
+                ring.append(QVector3D(rr * math.cos(th),
+                                      rr * math.sin(th), z))
+            rows.append(ring)
+        mesh = Mesh()
+        m = len(rows)
+        for j in range(m if closed else m - 1):
+            a, b = rows[j], rows[(j + 1) % m]
+            for i in range(segments):
+                i2 = (i + 1) % segments
+                quad = [a[i], a[i2], b[i2], b[i]]
+                if ((quad[0] - quad[3]).length() < 1e-6
+                        and (quad[1] - quad[2]).length() < 1e-6):
+                    continue
+                mesh.add_face(quad)
+        if not closed:
+            if profile[0][0] > 1e-6:
+                mesh.add_face(list(reversed(rows[0])))
+            if profile[-1][0] > 1e-6:
+                mesh.add_face(rows[-1])
+        return _finish(mesh, color, name)
+
+    def extrude(outline, z0, z1, name=None, color=None):
+        """Solid prism: an (x, y) outline swept from z0 up to z1."""
+        lo = [QVector3D(x, y, z0) for x, y in outline]
+        hi = [QVector3D(x, y, z1) for x, y in outline]
+        mesh = Mesh()
+        n = len(lo)
+        for i in range(n):
+            j = (i + 1) % n
+            mesh.add_face([lo[i], lo[j], hi[j], hi[i]])
+        mesh.add_face(list(reversed(lo)))
+        mesh.add_face(hi)
+        return _finish(mesh, color, name)
+
+    def _pt(p, z=None):
+        if hasattr(p, "x"):
+            return QVector3D(p)
+        if len(p) == 2:
+            return QVector3D(p[0], p[1], 0.0 if z is None else z)
+        return QVector3D(p[0], p[1], p[2])
+
+    def _prism_mesh(mesh, loop, vec, holes=()):
+        """Add a closed solid to ``mesh``: the planar polygon ``loop`` (3D
+        points, optional hole loops) swept along ``vec``."""
+        v = _pt(vec)
+        lo = [_pt(p) for p in loop]
+        hole_lo = [[_pt(p) for p in h] for h in holes or ()]
+        mesh.add_face(lo, hole_lo)
+        mesh.add_face([p + v for p in reversed(lo)],
+                      [[p + v for p in reversed(h)] for h in hole_lo])
+        for ring in (lo, *hole_lo):
+            n = len(ring)
+            for i in range(n):
+                a, b = ring[i], ring[(i + 1) % n]
+                mesh.add_face([a, b, b + v, a + v])
+
+    def box(origin, size, name=None, color=None):
+        """A box: ``origin`` its lowest corner (x, y, z), ``size`` (dx, dy,
+        dz). Small local models asked for «un cubo» reached for ``wall``
+        with openings (#461); one obvious name stops that."""
+        x, y, z = (float(c) for c in origin)
+        dx, dy, dz = (float(c) for c in size)
+        return extrude([(x, y), (x + dx, y), (x + dx, y + dy), (x, y + dy)],
+                       z, z + dz, name=name, color=color)
+
+    def prism(loop, vec, holes=None, name=None, color=None):
+        """Solid from a flat polygon (3D points, optional hole loops) swept
+        along ``vec``: a slab, a wall with a window, a roof plank."""
+        mesh = Mesh()
+        _prism_mesh(mesh, loop, vec, holes or ())
+        return _finish(mesh, color, name)
+
+    def _wall_mesh(mesh, a, b, height, thickness, openings=(), z0=0.0,
+                   peak=None):
+        """One wall into ``mesh``: base line a→b (x, y), the solid grows to
+        the LEFT of a→b by ``thickness`` (walk the footprint counter-
+        clockwise and the inside is the left). ``openings`` are
+        ``(offset, sill, width, height)`` along the wall from ``a``; a sill
+        at 0 is a door (a notch in the outline), above 0 a window (a hole).
+        ``peak=(offset, rise)`` raises the top to a gable point."""
+        ax, ay = a[0], a[1]
+        bx, by = b[0], b[1]
+        length = math.hypot(bx - ax, by - ay)
+        if length < 1e-9:
+            return
+        ux, uy = (bx - ax) / length, (by - ay) / length
+        nx, ny = -uy, ux                      # left of a→b
+        top = z0 + height
+
+        def P(s, z):
+            return QVector3D(ax + ux * s, ay + uy * s, z)
+        doors = sorted((o for o in openings if o[1] <= 1e-6), key=lambda o: o[0])
+        windows = [o for o in openings if o[1] > 1e-6]
+        outline = [P(0.0, z0)]
+        for off, _sill, w, h in doors:
+            s0, s1 = max(off, 0.0), min(off + w, length)
+            if s1 - s0 < 1e-6:
+                continue
+            outline += [P(s0, z0), P(s0, z0 + h), P(s1, z0 + h), P(s1, z0)]
+        outline.append(P(length, z0))
+        outline.append(P(length, top))
+        if peak is not None:
+            outline.append(P(peak[0], top + peak[1]))
+        outline.append(P(0.0, top))
+        # Drop the doubled corner when a door starts at 0.
+        clean = []
+        for q in outline:
+            if not clean or (q - clean[-1]).length() > 1e-9:
+                clean.append(q)
+        if (clean[0] - clean[-1]).length() < 1e-9:
+            clean.pop()
+        holes = []
+        for off, sill, w, h in windows:
+            s0, s1 = max(off, 0.0), min(off + w, length)
+            zt = min(z0 + sill + h, top - 0.05)
+            if s1 - s0 < 1e-6 or zt - (z0 + sill) < 1e-6:
+                continue
+            holes.append([P(s0, z0 + sill), P(s0, zt), P(s1, zt), P(s1, z0 + sill)])
+        _prism_mesh(mesh, clean, (nx * thickness, ny * thickness, 0.0), holes)
+
+    def wall(a, b, height=3.0, thickness=0.2, openings=(), z0=0.0,
+             peak=None, name=None, color=None):
+        """A wall with thickness and openings — see ``house`` for the
+        conventions. ``openings=[(offset, sill, width, height), ...]``."""
+        mesh = Mesh()
+        _wall_mesh(mesh, a, b, height, thickness, openings, z0, peak)
+        return _finish(mesh, color, name)
+
+    def house(width=6.0, depth=4.0, wall_height=3.0, thickness=0.2,
+              roof="gable", ridge_height=None, overhang=0.4, ridge="x",
+              doors=(), windows=(), origin=(0.0, 0.0), name="Casa",
+              wall_color=(0.90, 0.87, 0.80, 1.0),
+              roof_color=(0.55, 0.27, 0.20, 1.0),
+              door_color=(0.45, 0.28, 0.15, 1.0),
+              glass_color=(0.60, 0.80, 0.95, 1.0)):
+        """A whole house in one call: four walls with thickness, doors and
+        windows cut through them (with a door leaf and a glass pane), and
+        a roof — ``"gable"`` (two slopes, ridge along ``"x"`` or ``"y"``),
+        ``"hip"`` (four slopes) or ``"flat"``. Sides are ``"S"`` (y = y0,
+        the front), ``"E"``, ``"N"``, ``"W"``; an opening's ``offset`` runs
+        along the wall counter-clockwise from its first corner (S from
+        x0, E from y0, N from x1 back, W from y1 back). ``doors=[(side,
+        offset, width, height)]``, ``windows=[(side, offset, sill, width,
+        height)]``. Returns the groups: walls, floor, carpentry, roof."""
+        x0, y0 = float(origin[0]), float(origin[1])
+        x1, y1 = x0 + float(width), y0 + float(depth)
+        H, t = float(wall_height), float(thickness)
+        if ridge_height is None:
+            half = (depth if ridge == "x" else width) / 2.0
+            ridge_height = half * math.tan(math.radians(30.0))
+        rh = float(ridge_height)
+        lines = {"S": ((x0, y0), (x1, y0)), "E": ((x1, y0), (x1, y1)),
+                 "N": ((x1, y1), (x0, y1)), "W": ((x0, y1), (x0, y0))}
+        # E and W sit between S and N, so the corners are not doubled.
+        lines["E"] = ((x1, y0 + t), (x1, y1 - t))
+        lines["W"] = ((x0, y1 - t), (x0, y0 + t))
+        shift = {"S": 0.0, "N": 0.0, "E": -t, "W": -t}
+        ops: dict = {k: [] for k in lines}
+        leaves: list = []          # (side, offset, sill, w, h, kind)
+        for side, off, w, h in doors:
+            ops[side.upper()].append((off + shift[side.upper()], 0.0, w, h))
+            leaves.append((side.upper(), off + shift[side.upper()], 0.0, w, h, "door"))
+        for side, off, sill, w, h in windows:
+            ops[side.upper()].append((off + shift[side.upper()], sill, w, h))
+            leaves.append((side.upper(), off + shift[side.upper()], sill, w, h, "glass"))
+        gable_sides = ()
+        if roof == "gable":
+            gable_sides = ("E", "W") if ridge == "x" else ("S", "N")
+        walls_mesh = Mesh()
+        for side, (a, b) in lines.items():
+            peak = None
+            if side in gable_sides:
+                seg = math.hypot(b[0] - a[0], b[1] - a[1])
+                peak = (seg / 2.0, rh)
+            _wall_mesh(walls_mesh, a, b, H, t, ops[side], 0.0, peak)
+        out = [_finish(walls_mesh, wall_color, f"{name} · Paredes")]
+        # A floor slab just inside the walls (a hair short of them, so no
+        # two faces share a plane), or the house reads hollow from below.
+        floor = Mesh()
+        e = t + 0.01
+        _prism_mesh(floor, [QVector3D(x0 + e, y0 + e, 0.0), QVector3D(x1 - e, y0 + e, 0.0),
+                            QVector3D(x1 - e, y1 - e, 0.0), QVector3D(x0 + e, y1 - e, 0.0)],
+                    (0.0, 0.0, 0.1))
+        out.append(_finish(floor, (0.75, 0.72, 0.66, 1.0), f"{name} · Piso"))
+        # Carpentry: a door leaf and a glass pane in every opening.
+        carp = Mesh()
+        for side, off, sill, w, h, kind in leaves:
+            a, b = lines[side]
+            length = math.hypot(b[0] - a[0], b[1] - a[1])
+            ux, uy = (b[0] - a[0]) / length, (b[1] - a[1]) / length
+            nx, ny = -uy, ux
+            d = t * 0.5
+            s0, s1 = off, off + w
+            base = [QVector3D(a[0] + ux * s0 + nx * d, a[1] + uy * s0 + ny * d, sill),
+                    QVector3D(a[0] + ux * s1 + nx * d, a[1] + uy * s1 + ny * d, sill),
+                    QVector3D(a[0] + ux * s1 + nx * d, a[1] + uy * s1 + ny * d, sill + h),
+                    QVector3D(a[0] + ux * s0 + nx * d, a[1] + uy * s0 + ny * d, sill + h)]
+            if kind == "door":
+                _prism_mesh(carp, base, (nx * 0.04, ny * 0.04, 0.0))
+                for f in carp.faces:
+                    f.attrs.setdefault("color", tuple(door_color))
+            else:
+                f = carp.add_face(base)
+                f.attrs["color"] = tuple(glass_color)
+                f.attrs["opacity"] = 0.4
+        if carp.faces:
+            out.append(_finish(carp, None, f"{name} · Carpintería"))
+        # Roof.
+        roof_mesh = Mesh()
+        ov = float(overhang)
+        if roof == "flat":
+            _prism_mesh(roof_mesh, [QVector3D(x0 - ov, y0 - ov, H), QVector3D(x1 + ov, y0 - ov, H),
+                                    QVector3D(x1 + ov, y1 + ov, H), QVector3D(x0 - ov, y1 + ov, H)],
+                        (0.0, 0.0, 0.2))
+        elif roof == "hip":
+            L, W = x1 - x0, y1 - y0
+            cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            s = rh / (min(L, W) / 2.0)
+            ze = H - s * ov
+            b0, b1, b2, b3 = (QVector3D(x0 - ov, y0 - ov, ze), QVector3D(x1 + ov, y0 - ov, ze),
+                              QVector3D(x1 + ov, y1 + ov, ze), QVector3D(x0 - ov, y1 + ov, ze))
+            if L >= W:
+                r0, r1 = QVector3D(cx - (L - W) / 2.0, cy, H + rh), QVector3D(cx + (L - W) / 2.0, cy, H + rh)
+                faces = [[b0, b1, r1, r0], [b2, b3, r0, r1], [b1, b2, r1], [b3, b0, r0]]
+            else:
+                r0, r1 = QVector3D(cx, cy - (W - L) / 2.0, H + rh), QVector3D(cx, cy + (W - L) / 2.0, H + rh)
+                faces = [[b1, b2, r1, r0], [b3, b0, r0, r1], [b0, b1, r0], [b2, b3, r1]]
+            for f in faces:
+                roof_mesh.add_face(f)
+            roof_mesh.add_face([b3, b2, b1, b0])
+        else:                                   # gable: a bent slab
+            th = 0.15
+            if ridge == "x":
+                s = rh / ((y1 - y0) / 2.0)
+                ze, yc = H - s * ov, (y0 + y1) / 2.0
+                dz = th / math.cos(math.atan(s))
+                sec = [QVector3D(x0 - ov, y0 - ov, ze), QVector3D(x0 - ov, yc, H + rh),
+                       QVector3D(x0 - ov, y1 + ov, ze), QVector3D(x0 - ov, y1 + ov, ze - dz),
+                       QVector3D(x0 - ov, yc, H + rh - dz), QVector3D(x0 - ov, y0 - ov, ze - dz)]
+                _prism_mesh(roof_mesh, sec, (x1 - x0 + 2 * ov, 0.0, 0.0))
+            else:
+                s = rh / ((x1 - x0) / 2.0)
+                ze, xc = H - s * ov, (x0 + x1) / 2.0
+                dz = th / math.cos(math.atan(s))
+                sec = [QVector3D(x0 - ov, y0 - ov, ze), QVector3D(xc, y0 - ov, H + rh),
+                       QVector3D(x1 + ov, y0 - ov, ze), QVector3D(x1 + ov, y0 - ov, ze - dz),
+                       QVector3D(xc, y0 - ov, H + rh - dz), QVector3D(x0 - ov, y0 - ov, ze - dz)]
+                _prism_mesh(roof_mesh, sec, (0.0, y1 - y0 + 2 * ov, 0.0))
+        out.append(_finish(roof_mesh, roof_color, f"{name} · Techo"))
+        return out
+
+    def sheet(name=None, paper="A3", landscape=True):
+        """A new sheet of the composer (a page for printing, NOT a layer)
+        with one view frame filling it; the composer and the sheet tabs
+        pick it up on their own."""
+        from core.composition import Composicion
+        comps = scene.compositions
+        c = Composicion(name=name or f"Lámina {len(comps) + 1}",
+                        paper=paper, landscape=landscape)
+        c.frames.append(c.default_frame())
+        comps.append(c)
+        return c
+
+    return {"box": box, "revolve": revolve, "extrude": extrude,
+            "prism": prism, "wall": wall, "house": house, "sheet": sheet}
+
+
+def _tidy_groups(scene) -> None:
+    """The helpers already add their groups, yet models append them again
+    (qwen3.5 wrote ``groups.append(house(...))`` testing #461): a group
+    listed twice, or the LIST house() returns sitting in scene.groups,
+    where the next paint dies on ``'list' object has no attribute
+    'mesh'``. Flatten and drop repeats instead of failing the recipe."""
+    from core.group import Group
+    seen, tidy = set(), []
+
+    def add(item) -> None:
+        if isinstance(item, (list, tuple)):
+            for sub in item:
+                add(sub)
+        elif isinstance(item, Group) and id(item) not in seen:
+            seen.add(id(item))
+            tidy.append(item)
+
+    for g in scene.groups:
+        add(g)
+    if len(tidy) != len(scene.groups) or any(
+            a is not b for a, b in zip(tidy, scene.groups)):
+        scene.groups[:] = tidy
+
+
+def run_transactional(viewport, code: str, scope: dict) -> dict:
+    """Execute ``code`` exactly like the Python Console: one undoable step,
+    rolled back whole on error, no undo entry if nothing changed. Returns
+    {stdout, stderr, error, changed}."""
+    build_scope(viewport, scope)
+    history = viewport.history
+    out_buf, err_buf = io.StringIO(), io.StringIO()
+
+    def mutate(_scene) -> None:
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = out_buf, err_buf
+        try:
+            try:
+                compiled = compile(code, "<ai>", "eval")
+            except SyntaxError:
+                compiled = None
+            if compiled is None:
+                exec(compile(code, "<ai>", "exec"), scope)
+            else:
+                result = eval(compiled, scope)
+                if result is not None:
+                    scope["_"] = result
+                    print(repr(result))
+            _tidy_groups(_scene)
+            _check_scene_lists(_scene)
+        except Exception:
+            traceback.print_exc(file=err_buf)
+            raise
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+
+    cmd = SnapshotImport(mutate)
+    saved_redo = list(history.redo_stack)
+    history.execute(cmd)
+    error = history.last_error
+    changed = True
+    if error is None:
+        unchanged = not cmd.changed
+        if (unchanged and history.undo_stack
+                and history.undo_stack[-1] is cmd):
+            history.undo_stack.pop()
+            history.redo_stack[:] = saved_redo
+            changed = False
+    else:
+        changed = False
+    viewport.notify_scene_changed()
+    return {"stdout": out_buf.getvalue(), "stderr": err_buf.getvalue(),
+            "error": error, "changed": changed}
+
+
+# ---- Provider layer (mirrors IngePresupuestos ai_specs) ---------------------
+
+PROVIDERS = ("groq", "anthropic", "openai", "gemini", "openrouter",
+             "deepseek", "opencode", "ollama")
+
+#: OpenAI-compatible chat endpoints; Anthropic goes through its native API.
+_OPENAI_BASES = {
+    "groq": "https://api.groq.com/openai/v1",
+    "openai": "https://api.openai.com/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    # OpenCode GO — the flat-rate subscription catalog — is NOT Zen
+    # (pay-per-use): same host, different path. Go also asks each client
+    # for a stable session id (see _session_id) and a real User-Agent.
+    "opencode": "https://opencode.ai/zen/go/v1",
+}
+
+#: Providers ROTATE their catalogs: Groq retired llama-3.3-70b-versatile
+#: for free/dev tiers on 2026-06-17 (HTTP 404 model_not_found) and points
+#: to openai/gpt-oss-120b. list_models() exists so the UI never guesses.
+DEFAULT_MODELS = {
+    "groq": "openai/gpt-oss-120b",
+    "anthropic": "claude-sonnet-5",
+    "openai": "gpt-4o",
+    "gemini": "gemini-2.5-flash",
+    "openrouter": "anthropic/claude-sonnet-5",
+    "deepseek": "deepseek-chat",
+    # Go mixes wire formats per model: GPT ids only answer on
+    # /v1/responses, Claude ids on /messages — Kimi speaks the plain
+    # chat/completions this layer sends.
+    "opencode": "kimi-k2.6",
+    # A code model: llama3.2 (3B) wrote wall() for a cube and broke on
+    # plain Python in Rafael's review 6 (#461).
+    "ollama": "qwen2.5-coder:7b",
+}
+
+def small_local_model(provider: str, model: str) -> bool:
+    """A local model too small to write working recipes — under ~7B
+    parameters by its tag (``llama3.2`` is 3B, ``gemma2:2b``, ``phi3``…).
+    Only advice: nothing is refused."""
+    if provider != "ollama":
+        return False
+    name = model.lower()
+    size = re.search(r":(\d+(?:\.\d+)?)b\b", name)
+    if size:
+        return float(size.group(1)) < 7
+    return name.split(":")[0] in {"llama3.2", "phi3", "phi4-mini", "gemma3",
+                                  "tinyllama", "smollm2"}
+
+
+#: Providers whose default models take viewport screenshots.
+VISION = {"anthropic", "openai", "gemini", "openrouter"}
+
+#: Model-name tags that mark a vision-capable model on providers whose
+#: DEFAULT model is text-only: Groq serves Llama 4 Scout/Maverick
+#: (multimodal) on its free tier, Ollama runs llava/qwen-vl locally.
+#: The Go-catalog tags (kimi-k3, glm-5.3-flash, step-5, minimax-m3,
+#: mimo-v2, longcat-2.0, omen, hy3/hy4) were probed live against
+#: /zen/go/v1 on 2026-10-20 — e.g. glm-5.3 does NOT take images but
+#: glm-5.3-flash does, so the tags stay that specific on purpose.
+_VISION_TAGS = ("llama-4", "scout", "maverick", "llava", "vision",
+                "-vl", "vl-", "gemma3", "gemma-3", "pixtral",
+                "glm-5.3-flash", "kimi-k3", "step-5", "minimax-m3",
+                "mimo-v2", "longcat-2.0", "omen", "hy3", "hy4")
+
+
+def supports_vision(provider: str, model: str) -> bool:
+    """Whether this provider+model pair can look at images."""
+    if provider in VISION:
+        return True
+    m = (model or "").lower()
+    return any(t in m for t in _VISION_TAGS)
+
+
+_IMAGE_KEYS = ("image_b64", "image_mime", "image_png_b64")
+
+
+def slim_messages(messages: list, vision: bool = True) -> list:
+    """Request-time diet for a convo that is resent WHOLE every turn: keep
+    every user photo (``image_b64`` — the reference being modeled) but only
+    the LATEST viewport screenshot (``image_png_b64``). Older screenshots
+    are stale views of a model that has changed, and k rounds would
+    otherwise ship k-1 dead images per request — the free-tier killer.
+
+    ``vision=False`` strips EVERY image instead: a text-only model must
+    never receive image content — Groq answers HTTP 400 ("content must be
+    a string") and, since the convo keeps the photo, every retry fails the
+    same way (seen live). The photo stays stored, so switching to a vision
+    model brings it back. Returns copies; the stored convo is untouched."""
+    if not vision:
+        return [{k: v for k, v in m.items() if k not in _IMAGE_KEYS}
+                for m in messages]
+    last_shot = -1
+    for i, m in enumerate(messages):
+        if m.get("image_png_b64"):
+            last_shot = i
+    return [
+        ({k: v for k, v in m.items() if k != "image_png_b64"}
+         if m.get("image_png_b64") and i != last_shot else m)
+        for i, m in enumerate(messages)
+    ]
+
+
+def detect_provider(api_key: str) -> str:
+    """The IngePresupuestos rule: the key's prefix names the provider."""
+    if not api_key:
+        return "ollama"
+    if api_key.startswith("gsk_"):
+        return "groq"
+    if api_key.startswith("sk-ant-"):
+        return "anthropic"
+    if api_key.startswith("AIza"):
+        return "gemini"
+    if api_key.startswith("sk-or-"):
+        return "openrouter"
+    if api_key.startswith("oc_sk_"):
+        return "opencode"
+    if api_key.startswith("sk-"):
+        return "openai"
+    return "anthropic"
+
+
+def _message_image(m: dict) -> tuple[str | None, str]:
+    """(base64, mime) of a message's image. ``image_b64``+``image_mime`` is
+    the generic form (user photos ride as JPEG — a re-encoded PNG would be
+    ~10× the payload PER TURN, since the whole convo is resent every turn);
+    ``image_png_b64`` stays as the screenshot shorthand."""
+    if m.get("image_b64"):
+        return m["image_b64"], m.get("image_mime", "image/png")
+    shot = m.get("image_png_b64")
+    # The screenshot shorthand carries JPEG now (a quarter of the bytes
+    # of the PNG it used to be); the base64 header tells which.
+    mime = "image/jpeg" if shot and shot.startswith("/9j/") else "image/png"
+    return shot, mime
+
+
+#: OpenCode Go requires a stable session id in ``x-opencode-session`` on
+#: EVERY request (missing → HTTP 400 MissingSessionID); it routes and
+#: caches prompts by it. One id per app run is stable enough — callers
+#: with a real conversation can pass their own ``session_id``.
+_SESSION_ID: str | None = None
+
+
+def _session_id() -> str:
+    global _SESSION_ID
+    if _SESSION_ID is None:
+        import uuid
+        _SESSION_ID = uuid.uuid4().hex
+    return _SESSION_ID
+
+
+def build_request(provider: str, model: str, api_key: str,
+                  system: str, messages: list,
+                  ollama_url: str = "http://localhost:11434",
+                  max_tokens: int = 4096,
+                  session_id: str | None = None):
+    """(url, headers, payload-bytes) for one chat turn.
+
+    ``messages``: [{"role": "user"/"assistant", "text": str,
+    "image_png_b64" / "image_b64"+"image_mime": optional}] — images ride
+    only on user turns.
+    """
+    if provider == "anthropic":
+        content_msgs = []
+        for m in messages:
+            blocks = [{"type": "text", "text": m["text"]}]
+            img, mime = _message_image(m)
+            if img:
+                blocks.insert(0, {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mime,
+                               "data": img}})
+            content_msgs.append({"role": m["role"], "content": blocks})
+        payload = {"model": model, "max_tokens": max_tokens,
+                   "system": system, "messages": content_msgs}
+        return ("https://api.anthropic.com/v1/messages",
+                {"Content-Type": "application/json",
+                 "User-Agent": USER_AGENT,
+                 "x-api-key": api_key,
+                 "anthropic-version": "2023-06-01"},
+                json.dumps(payload).encode())
+
+    base = (_local_base(ollama_url) if provider == "ollama"
+            else _OPENAI_BASES[provider])
+    oai_msgs = [{"role": "system", "content": system}]
+    for m in messages:
+        img, mime = _message_image(m)
+        if img:
+            oai_msgs.append({"role": m["role"], "content": [
+                {"type": "image_url", "image_url": {
+                    "url": f"data:{mime};base64," + img}},
+                {"type": "text", "text": m["text"]},
+            ]})
+        else:
+            oai_msgs.append({"role": m["role"], "content": m["text"]})
+    headers = {"Content-Type": "application/json",
+               "User-Agent": USER_AGENT}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if provider == "opencode":
+        headers["x-opencode-session"] = session_id or _session_id()
+    # OpenAI's own API deprecated max_tokens and its newer models reject
+    # it with HTTP 400 («Use 'max_completion_tokens' instead», #517); the
+    # new name works for every OpenAI model. The other OpenAI-compatible
+    # services (Groq, Gemini, OpenRouter, DeepSeek, Ollama) keep the name
+    # they have always accepted.
+    limit = "max_completion_tokens" if provider == "openai" else "max_tokens"
+    payload = {"model": model, limit: max_tokens,
+               "messages": oai_msgs}
+    return (f"{base}/chat/completions", headers,
+            json.dumps(payload).encode())
+
+
+def parse_reply(provider: str, raw: bytes) -> str:
+    data = json.loads(raw)
+    if provider == "anthropic":
+        return "".join(b.get("text", "") for b in data.get("content", []))
+    choices = data.get("choices") or []
+    if not choices:
+        raise ValueError(str(data)[:400])
+    return choices[0].get("message", {}).get("content", "") or ""
+
+
+#: HTTP statuses worth another try: the provider is busy or rate-limited
+#: (Gemini's 503 «high demand», 429, the 5xx family, Anthropic's 529).
+RETRY_STATUSES = frozenset({429, 500, 502, 503, 504, 529})
+#: Seconds before retry n (1-based): 2, 4, 8, 16 — capped.
+RETRY_BACKOFF = (2.0, 4.0, 8.0, 16.0)
+
+
+def _urlopen(url: str, headers: dict, payload: bytes | None = None,
+             timeout: float = 180.0, retries: int = 0, on_retry=None,
+             sleep=time.sleep) -> bytes:
+    """One HTTP round trip with the readable error shaping every caller
+    wants (the raw body is the useful part of a provider error).
+
+    With ``retries``, a busy provider (:data:`RETRY_STATUSES`, or no
+    answer at all) is tried again after a growing pause; ``on_retry(n,
+    total, wait, reason)`` is told each time so a chat panel can say so.
+    Marco asked for a house and Gemini's 503 «high demand» cut it short
+    at the walls (2026-09-15): one spike must not end the recipe."""
+    from core.tls import https_context
+    context = https_context()            # a packaged Python's CA bundle (#198)
+    attempt = 0
+    while True:
+        req = urllib.request.Request(url, data=payload, headers=headers,
+                                     method="POST" if payload else "GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout,
+                                        context=context) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode()[:400]
+            except OSError:
+                pass
+            reason = f"HTTP {exc.code}: {detail or exc.reason}"
+            if exc.code not in RETRY_STATUSES or attempt >= retries:
+                if attempt:
+                    reason += f" (tras {attempt + 1} intentos)"
+                raise RuntimeError(reason)
+        except urllib.error.URLError as exc:
+            reason = f"sin conexión: {exc.reason}"
+            if attempt >= retries:
+                raise RuntimeError(reason)
+        wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+        attempt += 1
+        if on_retry is not None:
+            on_retry(attempt, retries, wait, reason)
+        sleep(wait)
+
+
+def chat(provider: str, model: str, api_key: str, system: str,
+         messages: list, ollama_url: str = "http://localhost:11434",
+         timeout: float = 180.0, max_tokens: int = 4096,
+         retries: int = 4, on_retry=None,
+         session_id: str | None = None) -> str:
+    """One blocking chat turn. Raises with a readable message on failure —
+    callers run this in a worker thread, never on the UI thread. A busy
+    provider is retried ``retries`` times (see :func:`_urlopen`)."""
+    url, headers, payload = build_request(
+        provider, model, api_key, system, messages, ollama_url, max_tokens,
+        session_id)
+    return parse_reply(provider, _urlopen(url, headers, payload, timeout,
+                                          retries=retries, on_retry=on_retry))
+
+
+#: Substrings of model ids that are not chat models (speech, safety,
+#: embeddings, image/video generation) — hidden from the model picker.
+_NON_CHAT = ("whisper", "tts", "embed", "guard", "moderation", "imagen",
+             "veo", "aqa", "audio", "transcribe", "image", "dall-e",
+             # Groq's agentic "compound" systems run their own tools and
+             # answer with prose about what they "did" — no recipe ever
+             # reaches IngeTrazo (Marco, 2026-09-15).
+             "compound")
+
+
+def list_models(provider: str, api_key: str,
+                ollama_url: str = "http://localhost:11434",
+                timeout: float = 20.0) -> list[str]:
+    """The chat-capable model ids the key can ACTUALLY use, sorted.
+
+    Every provider exposes a models endpoint (Anthropic native, the rest
+    OpenAI-compatible); offering the live list beats hardcoding names that
+    rot when catalogs rotate. Run it on a worker thread."""
+    if provider == "anthropic":
+        url = "https://api.anthropic.com/v1/models?limit=100"
+        headers = {"User-Agent": USER_AGENT, "x-api-key": api_key,
+                   "anthropic-version": "2023-06-01"}
+    else:
+        base = (_local_base(ollama_url) if provider == "ollama"
+                else _OPENAI_BASES[provider])
+        url = f"{base}/models"
+        headers = {"User-Agent": USER_AGENT}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        if provider == "opencode":
+            headers["x-opencode-session"] = _session_id()
+    data = json.loads(_urlopen(url, headers, timeout=timeout))
+    ids = [str(m.get("id", "")) for m in data.get("data", [])]
+    # Gemini's OpenAI-compat endpoint prefixes ids with "models/"; chat
+    # accepts the bare name (it's what DEFAULT_MODELS already uses).
+    ids = [i.removeprefix("models/") for i in ids]
+    return sorted(i for i in ids
+                  if i and not any(t in i.lower() for t in _NON_CHAT))
+
+
+#: UI metadata: (label, where to get the key). Mirrors IngePresupuestos.
+PROVIDER_INFO = {
+    # "gratis, con clave", not "gratis": Rafael read the bare word as "no
+    # key needed", pressed Test connection with the field empty and got a
+    # raw HTTP 401 (Revisión 3, 2026-09-20). The quota is free; the key is
+    # not optional.
+    "groq": ("Groq (gratis, con clave)", "https://console.groq.com/keys"),
+    "anthropic": ("Anthropic (Claude)",
+                  "https://console.anthropic.com/settings/keys"),
+    "openai": ("OpenAI", "https://platform.openai.com/api-keys"),
+    "gemini": ("Google Gemini (gratis, con clave)",
+               "https://aistudio.google.com/app/apikey"),
+    "openrouter": ("OpenRouter", "https://openrouter.ai/keys"),
+    "deepseek": ("DeepSeek", "https://platform.deepseek.com/api_keys"),
+    "opencode": ("OpenCode Go", "https://opencode.ai/console"),
+    "ollama": ("Local / OpenAI-compatible (Ollama, LM Studio…)",
+               "https://ollama.com/download"),
+}
+
+
+#: The environment variables each hosted provider's own tools read, first
+#: one wins (#998): a user who keeps ``ANTHROPIC_API_KEY`` in the
+#: environment should not have to paste it again. Google's SDKs accept
+#: both ``GEMINI_API_KEY`` and ``GOOGLE_API_KEY``.
+ENV_KEYS = {
+    "groq": ("GROQ_API_KEY",),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "openai": ("OPENAI_API_KEY",),
+    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "openrouter": ("OPENROUTER_API_KEY",),
+    "deepseek": ("DEEPSEEK_API_KEY",),
+    # The variable OpenCode's own client reads for its hosted models.
+    "opencode": ("OPENCODE_API_KEY",),
+}
+
+
+def env_key(provider: str, environ=None) -> tuple[str, str] | None:
+    """``(variable, key)`` for the first of ``provider``'s variables set
+    to something other than blanks, or None. Read only, never saved: the
+    environment stays the user's place for it."""
+    env = os.environ if environ is None else environ
+    for var in ENV_KEYS.get(provider, ()):
+        value = (env.get(var) or "").strip()
+        if value:
+            return var, value
+    return None
+
+
+def _local_base(url: str) -> str:
+    """The API root of the «Local / OpenAI-compatible» provider.
+
+    Ollama and LM Studio are given as ``http://host:port`` and serve under
+    ``/v1``; a hosted OpenAI-compatible service (OpenCode, vLLM, LiteLLM...)
+    is usually given with its version already, ``https://.../v1`` -- that
+    one is taken as it is, not turned into ``/v1/v1`` (#650)."""
+    base = (url or "").strip().rstrip("/")
+    return base if re.search(r"/v\d+[a-z]*$", base) else base + "/v1"
+
+
+def probar_conexion(provider: str, model: str, api_key: str,
+                    ollama_url: str = "http://localhost:11434"):
+    """One tiny round trip: (ok, message). Run it on a worker thread."""
+    try:
+        reply = chat(provider, model, api_key,
+                     "Responde únicamente: OK",
+                     [{"role": "user", "text": "ping"}],
+                     ollama_url=ollama_url, timeout=30.0)
+    except Exception as exc:  # noqa: BLE001 — the message IS the result
+        return False, str(exc)
+    return True, (reply or "").strip()[:80] or "OK"
+
+
+def extract_code(text: str) -> str | None:
+    """The first fenced ```python block of a reply (the agent's recipe)."""
+    marker = "```python"
+    start = text.find(marker)
+    if start < 0:
+        marker = "```py"
+        start = text.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    end = text.find("```", start)
+    if end < 0:
+        return None
+    code = text[start:end].strip("\n")
+    return code or None
+
+
+#: What an executed recipe's code collapses to in old turns. Spanish on
+#: purpose: it is read by the model inside a Spanish conversation.
+CODE_STUB = "[receta ya ejecutada — código omitido]"
+
+
+def compact_messages(messages: list, keep_last: int = 2) -> list:
+    """The other half of the convo diet: every turn resends every PAST
+    recipe verbatim (~500 tokens each), but an executed recipe's effect is
+    already in the document — its code is dead weight. Replace the fenced
+    block of all but the last ``keep_last`` assistant turns with CODE_STUB,
+    keeping the prose (intent) and the feedback turns (results, errors).
+    Recent turns stay whole so the model can still build on its own code.
+    Returns copies; the stored convo is untouched."""
+    coded = [i for i, m in enumerate(messages)
+             if m.get("role") == "assistant" and extract_code(m["text"])]
+    stub = set(coded[:-keep_last] if keep_last else coded)
+    out = []
+    for i, m in enumerate(messages):
+        if i in stub:
+            text = m["text"]
+            marker = "```python"
+            start = text.find(marker)
+            if start < 0:
+                marker = "```py"
+                start = text.find(marker)
+            end = text.find("```", start + len(marker))
+            tail = text[end + 3:] if end >= 0 else ""
+            m = {**m, "text": (text[:start] + CODE_STUB + tail).strip()}
+        out.append(m)
+    return out
+
+
+_THOUGHT_TAGS = ("thought", "thinking", "think")
+
+
+def strip_thoughts(text: str) -> str:
+    """Remove the <thought>/<thinking>/<think> blocks some models leak
+    into their visible text (Gemma, live). They are internal monologue:
+    resending them with the convo every turn is pure token burn. Handles
+    an unclosed opener (drop to the end) and a stray closer whose opener
+    fell in an earlier chunk (drop the prefix)."""
+    for tag in _THOUGHT_TAGS:
+        open_t, close_t = f"<{tag}>", f"</{tag}>"
+        while True:
+            s = text.find(open_t)
+            if s < 0:
+                break
+            e = text.find(close_t, s)
+            text = text[:s] + (text[e + len(close_t):] if e >= 0 else "")
+        e = text.find(close_t)
+        if e >= 0 and open_t not in text[:e]:
+            text = text[e + len(close_t):]
+    return text.strip()
+
+
+def truncated_code(text: str) -> bool:
+    """True when a reply opens a ```python fence and never closes it — the
+    signature of a reply cut by max_tokens. Callers must NOT treat such a
+    reply as "no code, we're done": half a recipe was on its way (seen live
+    with gemini-2.5-flash: the loop ended silently, nothing drawn)."""
+    for marker in ("```python", "```py"):
+        start = text.find(marker)
+        if start >= 0:
+            return text.find("```", start + len(marker)) < 0
+    return False

@@ -1,0 +1,384 @@
+{
+ "version": "0.5.5",
+ "compared_with": "v0.5.4",
+ "date": "2026-09-28",
+ "document": "plaza.igz",
+ "tests": {
+  "fast": "1 failed, 3187 passed, 2 skipped, 800 deselected, 225 warnings in 349.59s (0:05:49)",
+  "slow": "799 passed, 3190 deselected, 1 xfailed in 103.23s (0:01:43)"
+ },
+ "viewport": {
+  "head": [
+   {
+    "label": "0.5.5",
+    "commit": "d85f148",
+    "open_s": 3.72,
+    "first_paint_s": 0.04,
+    "root": {
+     "paint": {
+      "median_ms": 8.5,
+      "mean_ms": 10.69,
+      "max_ms": 24.62,
+      "n": 30
+     },
+     "orbit_frame": {
+      "median_ms": 8.23,
+      "mean_ms": 10.25,
+      "max_ms": 25.84,
+      "n": 40
+     },
+     "resync_vbos": {
+      "median_ms": 31.96,
+      "mean_ms": 36.06,
+      "max_ms": 45.04,
+      "n": 20
+     },
+     "chunks_rebuild+paint": {
+      "median_ms": 1062.77,
+      "mean_ms": 1062.77,
+      "max_ms": 1090.29,
+      "n": 2
+     },
+     "pick_index_cold": {
+      "median_ms": 55.05,
+      "mean_ms": 53.16,
+      "max_ms": 55.37,
+      "n": 3
+     },
+     "hover_select_x60": {
+      "median_ms": 347.84,
+      "mean_ms": 343.13,
+      "max_ms": 350.5,
+      "n": 3
+     },
+     "hover_line_x60": {
+      "median_ms": 1102.98,
+      "mean_ms": 1103.28,
+      "max_ms": 1106.65,
+      "n": 3
+     }
+    },
+    "container": {
+     "name": null,
+     "children": 0
+    },
+    "scene": {
+     "groups": 1035,
+     "faces_drawn": 48249,
+     "edges": 69586,
+     "dback": 173463
+    }
+   },
+   {
+    "label": "0.5.5",
+    "commit": "d85f148",
+    "open_s": 3.75,
+    "first_paint_s": 0.04,
+    "root": {
+     "paint": {
+      "median_ms": 8.28,
+      "mean_ms": 9.76,
+      "max_ms": 21.71,
+      "n": 30
+     },
+     "orbit_frame": {
+      "median_ms": 8.64,
+      "mean_ms": 10.49,
+      "max_ms": 23.94,
+      "n": 40
+     },
+     "resync_vbos": {
+      "median_ms": 32.18,
+      "mean_ms": 36.33,
+      "max_ms": 45.45,
+      "n": 20
+     },
+     "chunks_rebuild+paint": {
+      "median_ms": 1072.95,
+      "mean_ms": 1072.95,
+      "max_ms": 1079.91,
+      "n": 2
+     },
+     "pick_index_cold": {
+      "median_ms": 49.28,
+      "mean_ms": 48.44,
+      "max_ms": 55.42,
+      "n": 3
+     },
+     "hover_select_x60": {
+      "median_ms": 344.83,
+      "mean_ms": 348.79,
+      "max_ms": 357.46,
+      "n": 3
+     },
+     "hover_line_x60": {
+      "median_ms": 1129.46,
+      "mean_ms": 1132.17,
+      "max_ms": 1142.73,
+      "n": 3
+     }
+    },
+    "container": {
+     "name": null,
+     "children": 0
+    },
+    "scene": {
+     "groups": 1035,
+     "faces_drawn": 48249,
+     "edges": 69586,
+     "dback": 173463
+    }
+   }
+  ],
+  "prev": [
+   {
+    "label": "v0.5.4",
+    "commit": "bb62819",
+    "open_s": 3.75,
+    "first_paint_s": 0.04,
+    "root": {
+     "paint": {
+      "median_ms": 8.38,
+      "mean_ms": 10.61,
+      "max_ms": 24.69,
+      "n": 30
+     },
+     "orbit_frame": {
+      "median_ms": 7.85,
+      "mean_ms": 9.51,
+      "max_ms": 23.11,
+      "n": 40
+     },
+     "resync_vbos": {
+      "median_ms": 32.3,
+      "mean_ms": 36.21,
+      "max_ms": 45.71,
+      "n": 20
+     },
+     "chunks_rebuild+paint": {
+      "median_ms": 1044.75,
+      "mean_ms": 1044.75,
+      "max_ms": 1055.01,
+      "n": 2
+     },
+     "pick_index_cold": {
+      "median_ms": 47.95,
+      "mean_ms": 47.64,
+      "max_ms": 54.45,
+      "n": 3
+     },
+     "hover_select_x60": {
+      "median_ms": 344.55,
+      "mean_ms": 341.94,
+      "max_ms": 346.1,
+      "n": 3
+     },
+     "hover_line_x60": {
+      "median_ms": 1124.23,
+      "mean_ms": 1116.96,
+      "max_ms": 1126.84,
+      "n": 3
+     }
+    },
+    "container": {
+     "name": null,
+     "children": 0
+    },
+    "scene": {
+     "groups": 1035,
+     "faces_drawn": 48249,
+     "edges": 69586,
+     "dback": 173463
+    }
+   },
+   {
+    "label": "v0.5.4",
+    "commit": "bb62819",
+    "open_s": 3.76,
+    "first_paint_s": 0.04,
+    "root": {
+     "paint": {
+      "median_ms": 8.45,
+      "mean_ms": 9.88,
+      "max_ms": 22.01,
+      "n": 30
+     },
+     "orbit_frame": {
+      "median_ms": 8.12,
+      "mean_ms": 9.86,
+      "max_ms": 21.2,
+      "n": 40
+     },
+     "resync_vbos": {
+      "median_ms": 35.04,
+      "mean_ms": 38.33,
+      "max_ms": 49.47,
+      "n": 20
+     },
+     "chunks_rebuild+paint": {
+      "median_ms": 1107.0,
+      "mean_ms": 1107.0,
+      "max_ms": 1110.1,
+      "n": 2
+     },
+     "pick_index_cold": {
+      "median_ms": 49.72,
+      "mean_ms": 49.13,
+      "max_ms": 55.21,
+      "n": 3
+     },
+     "hover_select_x60": {
+      "median_ms": 345.08,
+      "mean_ms": 352.21,
+      "max_ms": 375.38,
+      "n": 3
+     },
+     "hover_line_x60": {
+      "median_ms": 1111.51,
+      "mean_ms": 1113.97,
+      "max_ms": 1122.18,
+      "n": 3
+     }
+    },
+    "container": {
+     "name": null,
+     "children": 0
+    },
+    "scene": {
+     "groups": 1035,
+     "faces_drawn": 48249,
+     "edges": 69586,
+     "dback": 173463
+    }
+   }
+  ]
+ },
+ "startup_memory": {
+  "head": {
+   "commit": "d85f148",
+   "startup_s": 0.69,
+   "rss_empty_mb": 280.8,
+   "open_s": [
+    3.74,
+    4.3,
+    4.27,
+    4.39,
+    4.48,
+    4.52
+   ],
+   "rss_after_open_mb": [
+    613.9,
+    848.1,
+    869.0,
+    875.1,
+    875.2,
+    884.0
+   ],
+   "live_after_open": [
+    {
+     "Face": 71402,
+     "Mesh": 892,
+     "QOpenGLVertexArrayObject": 32,
+     "QProgressDialog": 1
+    },
+    {
+     "Face": 71402,
+     "Mesh": 892,
+     "QOpenGLVertexArrayObject": 32,
+     "QProgressDialog": 1
+    },
+    {
+     "Face": 71402,
+     "Mesh": 892,
+     "QOpenGLVertexArrayObject": 32,
+     "QProgressDialog": 1
+    },
+    {
+     "Face": 71402,
+     "Mesh": 892,
+     "QOpenGLVertexArrayObject": 32,
+     "QProgressDialog": 1
+    },
+    {
+     "Face": 71402,
+     "Mesh": 892,
+     "QOpenGLVertexArrayObject": 32,
+     "QProgressDialog": 1
+    },
+    {
+     "Face": 71402,
+     "Mesh": 892,
+     "QOpenGLVertexArrayObject": 32,
+     "QProgressDialog": 1
+    }
+   ],
+   "leaked_objects": {},
+   "rss_growth_last3_mb": 4.4
+  },
+  "prev": {
+   "commit": "bb62819",
+   "startup_s": 0.67,
+   "rss_empty_mb": 280.5,
+   "open_s": [
+    3.72,
+    4.25,
+    4.27,
+    4.4,
+    4.48,
+    4.53
+   ],
+   "rss_after_open_mb": [
+    611.1,
+    847.1,
+    870.8,
+    876.6,
+    879.7,
+    879.7
+   ],
+   "live_after_open": [
+    {
+     "Face": 71402,
+     "Mesh": 892,
+     "QOpenGLVertexArrayObject": 32,
+     "QProgressDialog": 1
+    },
+    {
+     "Face": 71402,
+     "Mesh": 892,
+     "QOpenGLVertexArrayObject": 32,
+     "QProgressDialog": 1
+    },
+    {
+     "Face": 71402,
+     "Mesh": 892,
+     "QOpenGLVertexArrayObject": 32,
+     "QProgressDialog": 1
+    },
+    {
+     "Face": 71402,
+     "Mesh": 892,
+     "QOpenGLVertexArrayObject": 32,
+     "QProgressDialog": 1
+    },
+    {
+     "Face": 71402,
+     "Mesh": 892,
+     "QOpenGLVertexArrayObject": 32,
+     "QProgressDialog": 1
+    },
+    {
+     "Face": 71402,
+     "Mesh": 892,
+     "QOpenGLVertexArrayObject": 32,
+     "QProgressDialog": 1
+    }
+   ],
+   "leaked_objects": {},
+   "rss_growth_last3_mb": 1.6
+  }
+ },
+ "notes": [
+  "fast suite: the single failure (tests/test_ndof.py::test_the_linux_driver_reads_a_spacenavd_socket) passes alone (15/15 in test_ndof.py); order/environment dependent (spacenavd socket), unrelated to 0.5.5's changes",
+  "not a gate, pre-existing: drawing one rectangle on a flat grid takes 1.55 s (v0.5.4) vs 1.59 s (0.5.5) with 400 faces, 12.82 s vs 12.89 s with 1600 faces"
+ ]
+}

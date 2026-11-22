@@ -1,0 +1,494 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Marco Sumari Tellez and IngeTrazo contributors.
+"""SKP import seam — IngeTrazo's own reader, behind one seam.
+
+IngeTrazo aims to open **any** ``.skp`` (old → recent). This module is the
+single seam between IngeTrazo and *how* an ``.skp`` is read, so the parser can
+evolve independently of the app. The backend is **OpenSKP**
+(https://github.com/iamahsanmehmood/openskp, MIT) or a maintained fork: pure
+Python, offline, no Wine, no proprietary code. (Until 2026-09-28 a second
+path ran a proprietary SDK through the former external converter for files
+the reader could not open; it has been removed.)
+
+**Parse then apply.** A backend *parses* a file into a plain **payload** (world-
+space face loops, no ``Scene`` touched). The heavy parse runs outside the undo
+history; :func:`apply_payload` then adds the geometry cheaply inside a command.
+When no backend can produce geometry, :func:`parse_skp` raises
+:class:`NeedsConverter` before any mutation and the UI says the file could
+not be read -- so a failed parse never leaves a half-applied edit.
+
+Nothing here imports a parser at module load — a missing OpenSKP is just an
+unavailable backend.
+"""
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+
+class NeedsConverter(Exception):
+    """No backend can read this ``.skp``; the caller reports it. (The name is
+    historical: it once meant "use the external converter".) Carries the
+    path and detected format."""
+
+    def __init__(self, path, fmt: str, reason: str = "") -> None:
+        msg = f"No pure SKP backend for {path} (format={fmt})"
+        super().__init__(f"{msg}: {reason}" if reason else msg)
+        self.path = Path(path)
+        self.format = fmt
+        self.reason = reason
+
+
+def detect_format(path) -> str:
+    """Best-effort container detection from the file's first bytes, no parser
+    involved:
+
+    * ``"skp"``     — a ``.skp`` document (UTF-16 ``Sketch…`` model marker, or
+      a ``PK`` ZIP-wrapped container). Covers legacy MFC and 2021+ files alike —
+      both begin with the same marker, so the *era* is not observable from the
+      magic bytes (OpenSKP handles the range, so we don't need to tell them
+      apart here).
+    * ``"unknown"`` — not recognisably a ``.skp`` file / unreadable.
+    """
+    try:
+        head = Path(path).read_bytes()[:64]
+    except OSError:
+        return "unknown"
+    if head[:4] == b"PK\x03\x04":
+        return "skp"
+    if b"S\x00k\x00e\x00t\x00c\x00h" in head:   # UTF-16LE "Sketch"
+        return "skp"
+    return "unknown"
+
+
+class _OpenSkpBackend:
+    """Pure-Python OpenSKP backend. Parses via :mod:`formats.skp_openskp`, which
+    imports ``openskp`` lazily. ``available()`` is True only when the package is
+    importable; ``supports`` covers any recognised ``.skp`` file (OpenSKP reads
+    a broad version range). A parse that yields no geometry returns ``None`` from
+    :meth:`parse`, so the seam falls back to the converter."""
+
+    name = "openskp"
+
+    def available(self) -> bool:
+        try:
+            import openskp  # noqa: F401
+        except Exception as exc:  # noqa: BLE001 — optional dependency
+            # NEVER silent: a broken editable install (it happened when the
+            # repo moved and ~/openskp died) otherwise degrades every .skp
+            # to the Wine converter and reads as "slow / does not open".
+            import sys
+            print(f"IngeTrazo: openskp backend unavailable ({exc!r}); "
+                  f".skp imports fall back to the external converter",
+                  file=sys.stderr)
+            return False
+        return True
+
+    def supports(self, fmt: str) -> bool:
+        return fmt == "skp"
+
+    def parse(self, path, progress=None):
+        from formats import skp_openskp
+        return skp_openskp.parse(path, progress=progress)
+
+
+#: Ordered list of pure-Python backends. Extend/replace as coverage grows.
+_BACKENDS: list = [_OpenSkpBackend()]
+
+
+def backends_status() -> list[tuple[str, bool]]:
+    """``(name, available)`` for each pure backend — for diagnostics / an
+    About-style report of what can be opened without the converter."""
+    return [(b.name, b.available()) for b in _BACKENDS]
+
+
+def can_handle(path) -> bool:
+    """True when a pure backend is available and recognises ``path``. Note this
+    does NOT guarantee a non-empty parse — the actual geometry check happens in
+    :func:`parse_skp`, which raises :class:`NeedsConverter` on an empty result."""
+    fmt = detect_format(path)
+    return any(b.available() and b.supports(fmt) for b in _BACKENDS)
+
+
+def parse_skp(path, progress=None) -> dict:
+    """Parse ``path`` with the first pure backend that produces geometry, and
+    return its payload. Raises :class:`NeedsConverter` when no pure backend can
+    read the file (unrecognised format, parser error, or an empty parse) — the
+    caller reports the file as unreadable. Touches no ``Scene``."""
+    path = Path(path)
+    fmt = detect_format(path)
+    error = None
+    for backend in _BACKENDS:
+        if not (backend.available() and backend.supports(fmt)):
+            continue
+        try:
+            payload = backend.parse(path, progress=progress)
+        except Exception as exc:  # noqa: BLE001 — a parser that chokes → try next / fall back
+            # The user only hears "could not read"; the reader's own error
+            # goes to the error log, or a failed import is undiagnosable.
+            logging.getLogger(__name__).warning(
+                "SKP backend %s could not read %s", backend.name, path,
+                exc_info=True)
+            error = exc
+            payload = None
+        # Protos count as geometry: a file whose whole content is
+        # components placed once yields no plain groups at all, and
+        # reading that as "empty parse" reported it as unreadable.
+        if payload and (payload.get("groups") or payload.get("protos")
+                        or payload.get("empty")):
+            return payload
+    raise NeedsConverter(path, fmt, str(error or "")) from error
+
+
+def apply_payload(scene, payload, progress=None) -> str:
+    """Add a parsed payload's geometry to ``scene`` as reference groups (an
+    isolated ``Mesh`` per group, like the big-DAE import). Runs the same
+    clean-up the DAE reference import does — coplanar fusion (merges the raw
+    ``.skp`` polygons and drops double-sided duplicates) and smooth-edge
+    softening — so a ``.skp`` opened through the pure backend looks identical
+    to one that came through the converter. Cheap relative to the parse; the
+    caller wraps it in a command for undo. Returns the backend name.
+
+    ``progress(frac, text)``, when given, is called now and then (at most
+    every 0.15 s) while the scene is built: on a 946 000-face file this
+    stage ran for minutes without returning to the event loop, and Windows
+    marked the window "Not Responding" (#787). It is only called while no
+    half-built group is in the scene — inside a mesh not yet added, or
+    between whole groups."""
+    import gc
+    from PySide6.QtGui import QVector3D
+    from core.group import Group
+    from core.mesh import Mesh
+    from formats.dae import _add_fused
+    from formats.fuse import fuse_coplanar_loops, soften_smooth_edges
+
+    # Mass object construction ahead (vertices/edges/faces per group): the
+    # generational GC re-scans the ever-growing heap throughout and can cost
+    # more than the build itself on many-group files. Collection is merely
+    # deferred — import cycles are still reclaimed at re-enable.
+    _gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        return _apply_payload_inner(scene, payload, progress)
+    finally:
+        if _gc_was_enabled:
+            gc.enable()
+
+
+def _apply_payload_inner(scene, payload, progress=None) -> str:
+    import time
+    from PySide6.QtGui import QVector3D
+    from core.group import Group
+    from core.mesh import Mesh
+    from formats.dae import _add_fused
+    from formats.fuse import fuse_coplanar_loops, soften_smooth_edges
+
+    groups = payload.get("groups", []) or []
+    protos = payload.get("protos", []) or []
+    n_parts = max(1, len(groups) + 2 * len(protos))
+    done = [0, 0.0]               # parts built, time of the last report
+
+    def _tick(step=0):
+        """Report progress through this stage (0.75 → 0.96 of the bar),
+        throttled so the event loop is pumped without slowing the build."""
+        done[0] += step
+        if progress is None:
+            return
+        now = time.monotonic()
+        if now - done[1] < 0.15:
+            return
+        done[1] = now
+        progress(0.75 + 0.21 * min(1.0, done[0] / n_parts),
+                 "Building geometry…")
+
+    def _q(p):
+        # Payload corners are plain [x, y, z] lists from the openskp
+        # adapter, or QVector3D from the image-quad path — normalize for
+        # the QVector3D-based fuse/add_face clean-up below.
+        return p if hasattr(p, "x") else QVector3D(p[0], p[1], p[2])
+
+    def _add_lines(mesh, loose_edges):
+        """The file's loose edges (lines on no face), welded to the faces'
+        corners where they meet them."""
+        for a, b in loose_edges or ():
+            try:
+                mesh.add_edge(_q(a), _q(b))
+            except ValueError:      # endpoints weld to one vertex
+                continue
+
+    def _build_mesh(faces, soft_edges=None, loose_edges=None):
+        mesh = _build_faces(faces, soft_edges)
+        _add_lines(mesh, loose_edges)
+        return mesh
+
+    def _build_faces(faces, soft_edges=None):
+        mesh = Mesh()
+        if soft_edges is not None:
+            # The backend carried the file's ORIGINAL polygons plus the
+            # file's own per-edge display flags — add everything as-is and
+            # soften exactly the flagged edges. No coplanar fusion: the .skp
+            # format keeps coplanar same-material faces separate with their
+            # edges visible (glass mullions, beam/column lines), so fusing them
+            # dissolved real user lines. Built in one vectorized bulk pass —
+            # the per-face add_face welding dominated big imports.
+            import numpy as np
+            from core.topology import _maximal_holes
+            flat: list = []
+            ring_sizes: list = []
+            ring_counts: list = []
+            attrs_list: list = []
+            for outer, holes, attrs in faces:
+                if holes and len(holes) > 1:
+                    try:
+                        holes = _maximal_holes(
+                            [[QVector3D(*p) for p in h] for h in holes])
+                        holes = [[p.toTuple() for p in h] for h in holes]
+                    except Exception:  # noqa: BLE001 — degenerate hole ring
+                        continue       # add_face would have raised: skip face
+                rings = [outer] + [h for h in (holes or [])]
+                ring_counts.append(len(rings))
+                for r in rings:
+                    ring_sizes.append(len(r))
+                    if r and hasattr(r[0], "x"):   # QVector3D payload corners
+                        flat.extend(p.toTuple() for p in r)
+                    else:
+                        flat.extend(r)
+                attrs_list.append(attrs)
+            if ring_counts:
+                if len(flat) >= 1024:          # corners; bulk wins above ~700
+                    mesh.add_faces_bulk(
+                        np.array(flat, dtype=np.float64).reshape(-1, 3),
+                        ring_sizes, ring_counts, attrs_list)
+                else:
+                    # Small group: the bulk pass's fixed NumPy cost loses to
+                    # the plain per-face walk (a file with a thousand small
+                    # groups pays that fixed cost a thousand times).
+                    corners = [QVector3D(p[0], p[1], p[2]) for p in flat]
+                    ci = 0
+                    ri = 0
+                    for fi, nr in enumerate(ring_counts):
+                        rings = []
+                        for k in range(nr):
+                            n = ring_sizes[ri + k]
+                            rings.append(corners[ci:ci + n])
+                            ci += n
+                        ri += nr
+                        try:
+                            face = mesh.add_face(rings[0], rings[1:] or None)
+                        except Exception:  # noqa: BLE001 — degenerate
+                            continue
+                        if attrs_list[fi]:
+                            face.attrs.update(attrs_list[fi])
+            if soft_edges:
+                # Soften through the WELD itself: resolve each flagged
+                # segment's endpoints to their shared vertices and mark that
+                # edge — the weld tolerance is the matching tolerance, so
+                # float noise between the payload's segment coordinates and
+                # the stored vertex positions can never drop a flag (the old
+                # rounded-cell comparison could).
+                for k, (a, b) in enumerate(soft_edges):
+                    if not k & 4095:
+                        _tick()     # one group can carry 1.7 M flags
+                    va = mesh.vertex_at(QVector3D(a[0], a[1], a[2]))
+                    vb = mesh.vertex_at(QVector3D(b[0], b[1], b[2]))
+                    if va is None or vb is None or va is vb:
+                        continue
+                    e = mesh.find_edge(va, vb)
+                    if e is not None:
+                        e.soft = True
+            return mesh
+        # Legacy payloads without edge flags: the DAE-style clean-up.
+        # Fusion works on plain loops; faces with holes (window rings) keep
+        # their explicit topology and are added directly.
+        raw = [([_q(p) for p in outer], attrs)
+               for outer, holes, attrs in faces if not holes]
+        for item in fuse_coplanar_loops(raw):
+            _add_fused(mesh, [item])
+        for outer, holes, attrs in faces:
+            if not holes:
+                continue
+            try:
+                face = mesh.add_face([_q(p) for p in outer],
+                                     [[_q(p) for p in h] for h in holes])
+            except Exception:  # noqa: BLE001 — skip a degenerate polygon
+                continue
+            if attrs:
+                face.attrs.update(attrs)
+        soften_smooth_edges(mesh)
+        return mesh
+
+    # The file's named materials join the scene registry (core.materials).
+    # register() dedups: an identical re-import merges silently; a name
+    # collision with a DIFFERENT recipe lands as "name (2)" and the faces
+    # about to be built are remapped to the final name (their attrs dicts
+    # are shared per material, so each is rewritten once, by identity).
+    if payload.get("materials"):
+        from core.materials import Material, register
+        if not hasattr(scene, "materials") or scene.materials is None:
+            scene.materials = {}
+        remap: dict = {}
+        for raw in payload["materials"]:
+            mat = Material.from_dict(raw)
+            if not mat.name:
+                continue
+            final = register(scene.materials, mat)
+            if final != mat.name:
+                remap[mat.name] = final
+        if remap:
+            seen: set = set()
+            containers = list(payload.get("groups", []) or []) + \
+                list(payload.get("protos", []) or [])
+            for group in containers:
+                for _outer, _holes, attrs in group.get("faces", []) or []:
+                    if attrs and id(attrs) not in seen:
+                        seen.add(id(attrs))
+                        if attrs.get("mat") in remap:
+                            attrs["mat"] = remap[attrs["mat"]]
+
+    # The file's layers (.skp tags) join the scene's layer list, keeping
+    # their visibility — layers already present are left untouched (a re-import
+    # must not flip what the user toggled).
+    if payload.get("layers"):
+        from core.layers import Layer
+        known = {ly.name for ly in scene.layers}
+        for raw in payload["layers"]:
+            if raw.get("name") and raw["name"] not in known:
+                scene.layers.append(Layer(raw["name"],
+                                          visible=raw.get("visible", True)))
+                known.add(raw["name"])
+
+    # The file's saved scenes become saved views (camera + hidden layers);
+    # a view whose name already exists is left alone (re-import).
+    if payload.get("scenes"):
+        from core.saved_views import from_lookat
+        existing = {v.name for v in scene.saved_views}
+        for raw in payload["scenes"]:
+            if raw.get("name") in existing:
+                continue
+            scene.saved_views.append(from_lookat(
+                raw["name"], raw["eye"], raw["target"],
+                raw.get("up") or (0.0, 0.0, 1.0),
+                fov_deg=raw.get("fov", 45.0),
+                perspective=not raw.get("parallel", False),
+                ortho_height=raw.get("ortho_height") or None,
+                hidden_layers=raw.get("hidden_layers")))
+            existing.add(raw["name"])
+
+    # Linear dimensions (.skp dimension entities): world endpoints + an
+    # offset distance. IngeTrazo's Dimension carries the offset as a VECTOR
+    # from the a–b segment to the dimension line, so turn the .skp scalar
+    # into the in-plane perpendicular direction × distance.
+    if payload.get("dimensions"):
+        from PySide6.QtGui import QVector3D
+        from core.dimension import Dimension
+        for raw in payload["dimensions"]:
+            a = QVector3D(*raw["a"])
+            b = QVector3D(*raw["b"])
+            seg = b - a
+            if seg.length() < 1e-9:
+                continue
+            n = QVector3D(*raw["normal"]) if raw.get("normal") \
+                else QVector3D(0.0, 0.0, 1.0)
+            perp = QVector3D.crossProduct(n, seg)
+            if perp.length() < 1e-9:               # normal ∥ segment: fall back
+                perp = QVector3D.crossProduct(QVector3D(0.0, 0.0, 1.0), seg)
+            if perp.length() < 1e-9:
+                perp = QVector3D.crossProduct(QVector3D(1.0, 0.0, 0.0), seg)
+            perp.normalize()
+            scene.dimensions.append(
+                Dimension(a, b, perp * float(raw.get("offset", 0.0))))
+
+    # Leader texts (.skp text entities): the anchor is the pointed-at
+    # spot and the label floats at its world "label" position (leader line
+    # joins them) — screen texts carry no label position and float at the
+    # anchor itself.
+    if payload.get("texts"):
+        from PySide6.QtGui import QVector3D
+        from core.textlabel import TextLabel
+        for raw in payload["texts"]:
+            if raw.get("hidden"):
+                continue
+            anchor = QVector3D(*raw["anchor"])
+            label = QVector3D(*raw["label"]) if raw.get("label") else anchor
+            scene.text_labels.append(TextLabel(
+                anchor, label - anchor, raw["text"]))
+
+    for gp in groups:
+        _tick(1)
+        mesh = _build_mesh(gp["faces"], gp.get("soft_edges"),
+                           gp.get("loose_edges"))
+        if mesh.faces or mesh.edges:        # a group of lines is one too
+            g = Group(mesh, name=gp.get("name"))
+            if gp.get("layer"):
+                g.layer = gp["layer"]
+            axes = gp.get("axes")
+            if isinstance(axes, list) and len(axes) == 16:
+                # The .skp instance's transformation, kept as the
+                # group's own axes (issue #44) — its mesh stays in world
+                # coordinates. Column-major, as QMatrix4x4.data() wrote it.
+                from PySide6.QtGui import QMatrix4x4
+                m = QMatrix4x4(*[axes[c * 4 + r] for r in range(4)
+                                 for c in range(4)])
+                if not m.isIdentity():
+                    g.axes = m
+            if gp.get("billboard"):
+                # Image-entity cutout (photo person/animal/tree): the real
+                # geometry turns toward the camera each frame, like the DAE
+                # face-me import.
+                g.billboard = "mesh"
+            scene.groups.append(g)
+    # Shared components: ONE prototype mesh (local coordinates), one Group per
+    # placement with only a local->world matrix (Components v1 instances). A
+    # prototype may PLACE other prototypes — the sharing a component already
+    # has inside itself — and those become the instance's ``children``, one
+    # object to the user however deep the tree.
+    proto_meshes = []
+    for pr in protos:
+        _tick(1)
+        proto_meshes.append(_build_mesh(pr["faces"], pr.get("soft_edges"),
+                                        pr.get("loose_edges")))
+
+    def _place(idx, xf, layer=None, depth=0, name=None):
+        pr = protos[idx]
+        # The placement's own name (what the user called the group or
+        # copy), else the definition's.
+        g = Group(proto_meshes[idx], name=name or pr.get("name"))
+        g.xform = xf
+        # A .skp GROUP stays a group: only a component definition is one.
+        g.component = bool(pr.get("component", True))
+        if layer:
+            g.layer = layer
+        if depth < 32:      # a malformed file must not spin
+            g.adopt(_place(kid["proto"], kid["xform"], kid.get("layer"),
+                           depth + 1, kid.get("name"))
+                    for kid in pr.get("children", []) or [])
+        return g
+
+    for idx, pr in enumerate(protos):
+        if not proto_meshes[idx].faces and not proto_meshes[idx].edges \
+                and not (pr.get("children") or []):
+            continue
+        _tick(1)
+        layers = pr.get("instance_layers") or []
+        names = pr.get("instance_names") or []
+        for i, xf in enumerate(pr.get("instances", []) or []):
+            g = _place(idx, xf, layers[i] if i < len(layers) else None,
+                       name=names[i] if i < len(names) else None)
+            scene.groups.append(g)
+    back = payload.get("back_color")
+    if back and getattr(scene, "back_face_color", None) is None:
+        # Adopt the file's style back-face colour so unpainted faces seen
+        # from behind read like they did for the author.
+        scene.back_face_color = tuple(back)
+    for dim in scene.dimensions:        # groups are in: hold their vertices
+        if hasattr(dim, "bind"):
+            dim.bind(scene)
+    scene.version += 1
+    return payload.get("backend", "?")
+
+
+def load_skp(scene, path, progress=None) -> str:
+    """Convenience: :func:`parse_skp` then :func:`apply_payload` into ``scene``.
+    Returns the backend name; raises :class:`NeedsConverter` if none applies.
+    (The UI splits these two so the heavy parse runs outside the undo history.)"""
+    return apply_payload(scene, parse_skp(path, progress=progress))

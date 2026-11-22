@@ -1,0 +1,39 @@
+# IngeTrazo runtime + dev dependencies.
+#
+# Deliberately minimal: the engine runs on PySide6 alone (Qt's bundled OpenGL
+# for rendering, QtGui's QMatrix4x4/QVector3D for math, the stdlib `array` for
+# vertex packing). NumPy joined in the georef DEM work (Track G, G2) for
+# heightfield decode/sampling. No native mesh/BIM libraries yet — those are
+# added only when the feature that needs them actually lands.
+
+# --- Runtime ---
+# <6.12: 6.12.0 came out on 08-10-2026 and 0.5.8 was tested on 6.11; a new
+# Qt minor is adopted after it is tried, not on a release day.
+PySide6>=6.7,<6.12
+numpy>=1.26        # DEM heightfield decode + sampling (georef Track G, G2)
+# .skp import AND export (pure Python, VFF 2021+ AND classic MFC 2013-2020,
+# plus the legacy-format writer behind the .skp export, currently off). Our fork's
+# feat-write-annotations = upstream main + dimension/leader-text write+read
+# (upstream PR #203); return to @main when that PR merges.
+openskp @ git+https://github.com/iamahsanmehmood/openskp@291700bc213655a00461838de71e5f206311e619#subdirectory=packages/python
+# DXF import (D1; DWG arrives via the LibreDWG dwg2dxf satellite in D3).
+# Pure Python, MIT — the same parser IngeCAD reads its documents with, so
+# the two projects share one set of format scars.
+ezdxf>=1.4.4
+# Solid booleans (Tools ▸ Outer Shell / Solid Tools, core/solids.py).
+# Apache-2.0, the kernel of OpenSCAD and Blender's booleans; native wheels
+# for Linux x86_64/aarch64, Windows and macOS, cp310–cp314.
+manifold3d>=3.5.3
+# Python's HTTPS on Windows verifies through the system verifier (core/tls.py),
+# which fetches a root certificate the fresh installation lacks. MIT, pure Python.
+truststore>=0.10.5; sys_platform == "win32"
+
+# --- Development ---
+pytest>=8.0
+
+# --- Planned (NOT yet required; do not install on Python 3.14 — no wheels) ---
+# ifcopenshell   # IFC import/export (BIM bridge with IngePresupuestos)
+# pyassimp       # COLLADA/glTF import
+# Note: georef tiles + DEM need NO extra pip — QNetworkAccessManager/QImage (Qt)
+# fetch tiles, NumPy decodes the DEM. pyproj/mercantile/rasterio intentionally
+# avoided (UTM ported by hand, slippy math + Terrain-RGB decoded in-project).

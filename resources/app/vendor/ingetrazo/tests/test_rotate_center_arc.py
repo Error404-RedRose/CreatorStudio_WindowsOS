@@ -1,0 +1,592 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Marco Sumari Tellez and IngeTrazo contributors.
+"""Rotate tool (Q) and Center Arc tool (O): scripted clicks on stub viewports."""
+from __future__ import annotations
+
+import math
+
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QVector3D
+
+from core.edits import build_add_edges
+from core.history import AddFaceCommand, History, MakeGroupCommand
+from core.scene import Scene
+from tools.base import ToolContext
+from tools.arc import CenterArcTool
+from tools.rotate import RotateTool
+
+
+class _Vp:
+    def __init__(self, scene):
+        self.scene = scene
+        self.history = History(scene)
+        self.messages = []
+
+    def update(self):
+        pass
+
+    def set_hover(self, *_):
+        pass
+
+    def flash_status(self, text, msec=2500):
+        self.messages.append(text)
+
+    def pick_group(self, x, y):
+        return None
+
+    def pick_edge(self, x, y):
+        return None
+
+    def pick_face(self, x, y):
+        return None
+
+
+def _click(vp, tool, x, y, z=0.0):
+    tool.on_click(ToolContext(viewport=vp, world=QVector3D(x, y, z),
+                              screen=QPointF(0, 0),
+                              modifiers=Qt.NoModifier, snap=None))
+
+
+def _hover(vp, tool, x, y, z=0.0):
+    tool.on_hover(ToolContext(viewport=vp, world=QVector3D(x, y, z),
+                              screen=QPointF(0, 0),
+                              modifiers=Qt.NoModifier, snap=None))
+
+
+def _rect(scene, hist, x0, y0, x1, y1):
+    pts = [QVector3D(x0, y0, 0), QVector3D(x1, y0, 0),
+           QVector3D(x1, y1, 0), QVector3D(x0, y1, 0)]
+    hist.execute(build_add_edges(
+        scene, [(pts[i], pts[(i + 1) % 4]) for i in range(4)],
+        detect_faces=False, extra=[AddFaceCommand(list(pts))]))
+
+
+def _keys(mesh):
+    return sorted((round(v.position.x(), 3), round(v.position.y(), 3),
+                   round(v.position.z(), 3)) for v in mesh.vertices)
+
+
+def test_rotate_selection_90_degrees_and_undo():
+    scene = Scene()
+    vp = _Vp(scene)
+    _rect(scene, vp.history, 2, 0, 6, 2)          # 4x2 slab east of origin
+    scene.selection.update(scene.mesh.faces)
+    scene.selection.update(scene.mesh.edges)
+    before = _keys(scene.mesh)
+
+    t = RotateTool()
+    t.on_activate(vp)
+    _click(vp, t, 0, 0)                            # centre at the origin
+    _click(vp, t, 1, 0)                            # reference arm = +X
+    _hover(vp, t, 0, 1)                            # live preview toward +Y
+    _click(vp, t, 0, 1)                            # commit at +90°
+
+    got = _keys(scene.mesh)
+    # (2,0) → (0,2); (6,2) → (-2,6): the rect turned into the +Y quadrant.
+    assert (0.0, 2.0, 0.0) in got
+    assert (-2.0, 6.0, 0.0) in got
+    assert len(scene.mesh.faces) == 1
+    assert vp.history.undo()
+    assert _keys(scene.mesh) == before             # exact restore
+    assert vp.history.redo()
+    assert _keys(scene.mesh) == got
+
+
+def test_rotate_typed_angle_via_vcb():
+    scene = Scene()
+    vp = _Vp(scene)
+    _rect(scene, vp.history, 2, 0, 6, 2)
+    scene.selection.update(scene.mesh.faces)
+    scene.selection.update(scene.mesh.edges)
+    t = RotateTool()
+    t.on_activate(vp)
+    _click(vp, t, 0, 0)
+    _click(vp, t, 1, 0)
+    _hover(vp, t, 1, 1)                            # dragging counter-clockwise
+    assert t.on_value(vp, 90.0) is True
+    assert (0.0, 2.0, 0.0) in _keys(scene.mesh)
+
+
+def test_rotate_group_as_unit():
+    scene = Scene()
+    vp = _Vp(scene)
+    _rect(scene, vp.history, 2, 0, 6, 2)
+    vp.history.execute(MakeGroupCommand(list(scene.mesh.faces),
+                                        list(scene.mesh.edges)))
+    group = scene.groups[0]
+    scene.selection.clear()
+    scene.selection.add(group)
+    t = RotateTool()
+    t.on_activate(vp)
+    _click(vp, t, 0, 0)
+    _click(vp, t, 1, 0)
+    _hover(vp, t, 0, 1)
+    _click(vp, t, 0, 1)                            # +90°
+    gk = sorted((round(v.position.x(), 3), round(v.position.y(), 3))
+                for v in group.mesh.vertices)
+    assert (0.0, 2.0) in gk and (-2.0, 6.0) in gk
+    assert len(scene.mesh.edges) == 0              # loose mesh untouched
+    vp.history.undo()
+    assert (2.0, 0.0) in sorted((round(v.position.x(), 3),
+                                 round(v.position.y(), 3))
+                                for v in group.mesh.vertices)
+
+
+def test_rotate_with_nothing_flashes_hint():
+    scene = Scene()
+    vp = _Vp(scene)
+    t = RotateTool()
+    t.on_activate(vp)
+    _click(vp, t, 0, 0)
+    assert t.start_point is None                   # did not lock a centre
+    assert vp.messages
+
+
+def test_center_arc_draws_tagged_curve_quarter():
+    scene = Scene()
+    vp = _Vp(scene)
+    t = CenterArcTool()
+    t.on_activate(vp)
+    _click(vp, t, 0, 0)                            # centre
+    _click(vp, t, 3, 0)                            # radius 3, 0° arm = +X
+    _hover(vp, t, 0, 3)
+    _click(vp, t, 0, 3)                            # sweep +90°
+    assert len(scene.mesh.edges) == 6              # 15° pitch → 6 segments
+    ids = {e.curve for e in scene.mesh.edges}
+    assert len(ids) == 1 and None not in ids       # one selectable contour
+    ends = {(round(v.position.x(), 3), round(v.position.y(), 3))
+            for v in scene.mesh.vertices}
+    assert (3.0, 0.0) in ends and (0.0, 3.0) in ends
+
+
+def test_center_arc_typed_angle_and_circle_weld():
+    # The 15° pitch matches the 24-side circle: a concentric centre arc lands
+    # on the same lattice and welds instead of duplicating near-vertices.
+    from tools.circle import CircleTool
+
+    scene = Scene()
+    vp = _Vp(scene)
+    c = CircleTool()
+    c.work_plane = None
+    _click(vp, c, 0, 0)
+    _click(vp, c, 3, 0)
+    verts_before = len(scene.mesh.vertices)
+    t = CenterArcTool()
+    t.on_activate(vp)
+    _click(vp, t, 0, 0)
+    _click(vp, t, 3, 0)
+    _hover(vp, t, 1, 1)                            # counter-clockwise side
+    assert t.on_value(vp, 90.0) is True
+    assert len(scene.mesh.vertices) == verts_before   # welded, no duplicates
+
+
+def test_scale_selection_doubles_about_anchor():
+    # Grip-box flow: the far corner grip doubles the selection
+    # about the OPPOSITE corner, which stays put.
+    from tools.scale import ScaleTool
+
+    scene = Scene()
+    vp = _Vp(scene)
+    _rect(scene, vp.history, 2, 0, 6, 2)
+    scene.selection.update(scene.mesh.faces)
+    scene.selection.update(scene.mesh.edges)
+    before = _keys(scene.mesh)
+    t = ScaleTool()
+    t.on_activate(vp)
+    grip = next(g for g in t._grips if g.params == (1.0, 1.0, 0.5))
+    t._grab(vp, grip, (0.0, 0.0))
+    t._commit(vp, (2.0, 2.0, 1.0))
+    got = _keys(scene.mesh)
+    assert (2.0, 0.0, 0.0) in got                  # the anchor corner held
+    assert (10.0, 4.0, 0.0) in got                 # the grabbed corner ×2
+    assert vp.history.undo()
+    assert _keys(scene.mesh) == before
+    assert vp.history.redo()
+    assert _keys(scene.mesh) == got
+
+
+def test_scale_typed_factor_and_mirror():
+    from tools.scale import ScaleTool
+
+    scene = Scene()
+    vp = _Vp(scene)
+    _rect(scene, vp.history, 2, 0, 6, 2)
+    scene.selection.update(scene.mesh.faces)
+    scene.selection.update(scene.mesh.edges)
+    t = ScaleTool()
+    t.on_activate(vp)
+    grip = next(g for g in t._grips if g.params == (1.0, 0.5, 0.5))
+    t._grab(vp, grip, (0.0, 0.0))                  # red-axis face grip
+    assert t.on_value(vp, -1.0) is True            # mirror through the anchor
+    got = _keys(scene.mesh)
+    assert (2.0, 0.0, 0.0) in got                  # the anchor side held
+    assert (-2.0, 2.0, 0.0) in got                 # x=6 mirrored across x=2
+    assert len(scene.mesh.faces) == 1              # still one clean face
+
+
+def test_scale_group_as_unit():
+    from tools.scale import ScaleTool
+
+    scene = Scene()
+    vp = _Vp(scene)
+    _rect(scene, vp.history, 2, 0, 6, 2)
+    vp.history.execute(MakeGroupCommand(list(scene.mesh.faces),
+                                        list(scene.mesh.edges)))
+    group = scene.groups[0]
+    scene.selection.clear()
+    scene.selection.add(group)
+    t = ScaleTool()
+    t.on_activate(vp)
+    grip = next(g for g in t._grips if g.params == (1.0, 1.0, 0.5))
+    t._grab(vp, grip, (0.0, 0.0))                  # anchor = corner (2, 0)
+    t._commit(vp, (1.5, 1.5, 1.0))                 # ×1.5 about (2,0)
+    gk = sorted((round(v.position.x(), 3), round(v.position.y(), 3))
+                for v in group.mesh.vertices)
+    assert (2.0, 0.0) in gk and (8.0, 3.0) in gk   # corner fixed, far corner ×1.5
+    vp.history.undo()
+    assert (6.0, 2.0) in sorted((round(v.position.x(), 3),
+                                 round(v.position.y(), 3))
+                                for v in group.mesh.vertices)
+
+
+def test_select_all_then_rotate_whole_model_is_rigid():
+    # Rotating a whole model must be rigid. A window box-select that misses a
+    # protruding piece leaves it behind and the boundary warps (sigue.igz
+    # report) — Select All (Ctrl+A) covers every vertex, so nothing folds.
+    from core.history import RotateVerticesCommand
+    from core.topology import _key
+
+    scene = Scene()
+    vp = _Vp(scene)
+    _rect(scene, vp.history, 0, 0, 4, 4)
+    _rect(scene, vp.history, 6, 0, 9, 2)           # second separate slab
+    # Select All semantics: every edge + face
+    scene.selection.clear()
+    scene.selection.update(scene.mesh.edges)
+    scene.selection.update(scene.mesh.faces)
+    positions = []
+    seen = set()
+    for ent in scene.selection:
+        pts = ([ent.a, ent.b] if hasattr(ent, "a") else list(ent.vertices))
+        for p in pts:
+            k = _key(p)
+            if k not in seen:
+                seen.add(k)
+                positions.append(QVector3D(p))
+    f0 = len(scene.mesh.faces)
+    vp.history.execute(RotateVerticesCommand(
+        positions, QVector3D(0, 0, 0), QVector3D(0, 0, 1), 37.0))
+    assert len(scene.mesh.faces) == f0             # rigid: nothing folded
+    # distances preserved (rigidity spot check)
+    d = min((v.position - QVector3D(0, 0, 0)).length()
+            for v in scene.mesh.vertices)
+    assert d < 1e-5                                # corner stayed on centre
+
+
+class _VpPick(_Vp):
+    def __init__(self, scene):
+        super().__init__(scene)
+        self._edge = None
+        self._face = None
+
+    def pick_edge(self, x, y):
+        return self._edge
+
+    def pick_face(self, x, y):
+        return self._face
+
+    def pick_dimension(self, x, y):
+        return None
+
+    def pick_geopath(self, x, y):
+        return None
+
+    def set_hover(self, *_):
+        pass
+
+
+def _cube(scene, vp):
+    from tools.pushpull import PushPullTool
+    _rect(scene, vp.history, 0, 0, 4, 4)
+    pp = PushPullTool()
+    pp.hovered_face = scene.mesh.faces[0]
+    pp._hover_group = None
+    pp.on_click(ToolContext(viewport=vp, world=QVector3D(0, 0, 0),
+                            screen=QPointF(0, 0),
+                            modifiers=Qt.NoModifier, snap=None))
+    pp.extrusion = 3.0
+    pp._commit(vp)
+
+
+def test_double_click_face_selects_face_plus_edges():
+    from tools.select import SelectTool
+
+    scene = Scene()
+    vp = _VpPick(scene)
+    vp.set_suppressed_faces = lambda *_: None
+    _cube(scene, vp)
+    top = next(f for f in scene.mesh.faces
+               if all(abs(v.position.z() - 3) < 1e-6 for v in f.loop))
+    vp._face = top
+    t = SelectTool()
+    t.on_double_click(ToolContext(viewport=vp, world=QVector3D(),
+                                  screen=QPointF(0, 0),
+                                  modifiers=Qt.NoModifier, snap=None))
+    sel = scene.selection
+    assert top in sel
+    from core.mesh import Edge
+    assert sum(1 for s in sel if isinstance(s, Edge)) == 4   # its 4 edges
+
+
+def test_triple_click_selects_whole_connected_solid():
+    from core.mesh import Edge, Face
+    from tools.select import SelectTool
+
+    scene = Scene()
+    vp = _VpPick(scene)
+    vp.set_suppressed_faces = lambda *_: None
+    _cube(scene, vp)
+    _rect(scene, vp.history, 10, 10, 12, 12)     # separate slab, NOT connected
+    top = next(f for f in scene.mesh.faces
+               if all(abs(v.position.z() - 3) < 1e-6 for v in f.loop))
+    vp._face = top
+    t = SelectTool()
+    t.on_triple_click(ToolContext(viewport=vp, world=QVector3D(),
+                                  screen=QPointF(0, 0),
+                                  modifiers=Qt.NoModifier, snap=None))
+    sel = scene.selection
+    faces = [s for s in sel if isinstance(s, Face)]
+    edges = [s for s in sel if isinstance(s, Edge)]
+    assert len(faces) == 6 and len(edges) == 12  # the whole cube
+    far = next(f for f in scene.mesh.faces
+               if f.loop[0].position.x() >= 10)
+    assert far not in sel                        # disconnected slab untouched
+
+
+# ---- Classic protractor behaviour on Rotate ---------------------------------
+
+def test_ctrl_copy_rotates_a_group_copy():
+    # Ctrl = copy mode: the original group stays put, a rotated copy appears,
+    # all as ONE undo step.
+    from core.group import Group
+    from core.mesh import Mesh
+    scene = Scene()
+    vp = _Vp(scene)
+    m = Mesh()
+    m.add_face([QVector3D(2, 0, 0), QVector3D(4, 0, 0),
+                QVector3D(4, 1, 0), QVector3D(2, 1, 0)])
+    g = Group(m, name="Losa")
+    scene.groups.append(g)
+    scene.selection.add(g)
+    before = _keys(g.mesh)
+
+    t = RotateTool()
+    t.on_activate(vp)
+    assert t.on_key(vp, Qt.Key_Control, Qt.NoModifier) is True
+    _click(vp, t, 0, 0)
+    _click(vp, t, 1, 0)
+    _hover(vp, t, 0, 1)
+    _click(vp, t, 0, 1)                            # commit +90° as a COPY
+
+    assert len(scene.groups) == 2
+    assert _keys(g.mesh) == before                 # original untouched
+    copy = next(k for k in scene.groups if k is not g)
+    assert (0.0, 2.0, 0.0) in _keys(copy.mesh)     # (2,0) rotated to (0,2)
+    assert vp.history.undo()
+    assert scene.groups == [g]                     # one step removes the copy
+    assert t._copy is False                        # the modifier arms ONE op
+
+
+def test_ctrl_copy_of_instance_shares_prototype():
+    from PySide6.QtGui import QMatrix4x4
+    from core.group import Group
+    from core.mesh import Mesh
+    scene = Scene()
+    vp = _Vp(scene)
+    proto = Mesh()
+    proto.add_face([QVector3D(0, 0, 0), QVector3D(1, 0, 0),
+                    QVector3D(1, 1, 0), QVector3D(0, 1, 0)])
+    inst = Group(proto, name="Poste")
+    inst.xform = QMatrix4x4()
+    scene.groups.append(inst)
+    scene.selection.add(inst)
+
+    t = RotateTool()
+    t.on_activate(vp)
+    t.on_key(vp, Qt.Key_Control, Qt.NoModifier)
+    _click(vp, t, 0, 0)
+    _click(vp, t, 1, 0)
+    _hover(vp, t, 0, 1)
+    _click(vp, t, 0, 1)
+    copy = next(k for k in scene.groups if k is not inst)
+    assert copy.mesh is proto                      # sibling instance
+    assert copy.xform is not None
+
+
+def test_ctrl_copy_duplicates_loose_faces_rotated():
+    scene = Scene()
+    vp = _Vp(scene)
+    _rect(scene, vp.history, 2, 0, 6, 2)
+    scene.selection.update(scene.mesh.faces)
+    scene.selection.update(scene.mesh.edges)
+
+    t = RotateTool()
+    t.on_activate(vp)
+    t.on_key(vp, Qt.Key_Control, Qt.NoModifier)
+    _click(vp, t, 0, 0)
+    _click(vp, t, 1, 0)
+    _hover(vp, t, 0, 1)
+    _click(vp, t, 0, 1)                            # copy at +90°
+
+    assert len(scene.mesh.faces) == 2              # original + rotated copy
+    got = _keys(scene.mesh)
+    assert (2.0, 0.0, 0.0) in got                  # original still there
+    assert (0.0, 2.0, 0.0) in got                  # copy landed rotated
+
+
+def test_hot_retype_redoes_the_rotation():
+    scene = Scene()
+    vp = _Vp(scene)
+    _rect(scene, vp.history, 2, 0, 6, 2)
+    scene.selection.update(scene.mesh.faces)
+    scene.selection.update(scene.mesh.edges)
+
+    t = RotateTool()
+    t.on_activate(vp)
+    _click(vp, t, 0, 0)
+    _click(vp, t, 1, 0)
+    _hover(vp, t, 0, 1)
+    _click(vp, t, 0, 1)                            # +90°, tool resets
+    depth = len(vp.history.undo_stack)
+
+    assert t.on_value(vp, 180.0) is True           # retype: REDO at 180°
+    assert (-2.0, 0.0, 0.0) in _keys(scene.mesh)   # (2,0) → (-2,0)
+    assert len(vp.history.undo_stack) == depth     # replaced, not stacked
+    assert t.on_value(vp, -90.0) is True           # negative flips the side
+    assert (0.0, -2.0, 0.0) in _keys(scene.mesh)   # (2,0) → (0,-2)
+    _click(vp, t, 9, 9)                            # a click closes the window
+    t.on_cancel(vp)
+    assert t.on_value(vp, 15.0) is False
+
+
+def test_drag_from_centre_sets_custom_axis():
+    class _VpScreen(_Vp):
+        def _world_to_pixel(self, v):
+            return (v.x() * 100.0, v.y() * 100.0)
+
+    scene = Scene()
+    vp = _VpScreen(scene)
+    _rect(scene, vp.history, 2, 0, 6, 2)
+    scene.selection.update(scene.mesh.faces)
+    scene.selection.update(scene.mesh.edges)
+
+    t = RotateTool()
+    t.on_activate(vp)
+    _click(vp, t, 0, 0)                            # press the centre...
+    _hover(vp, t, 3, 0)                            # ...drag along +X...
+    t.on_release(vp)                               # ...release: axis = +X
+    assert t._custom_axis is not None
+    assert abs(t._axis().x() - 1.0) < 1e-9         # fold axis along the drag
+
+    # A plain click (release at the press point) keeps the inferred plane.
+    t2 = RotateTool()
+    t2.on_activate(vp)
+    _click(vp, t2, 0, 0)
+    _hover(vp, t2, 0.01, 0)                        # 1 px: not a drag
+    t2.on_release(vp)
+    assert t2._custom_axis is None
+
+
+def test_rotate_mixed_selection_groups_and_loose():
+    # A whole drawing: two groups + loose geometry, all selected — everything
+    # must turn together as ONE undo step (only the first group used to).
+    from core.group import Group
+    from core.mesh import Mesh
+    scene = Scene()
+    vp = _Vp(scene)
+    _rect(scene, vp.history, 2, 0, 6, 2)           # loose slab
+    def grp(x0):
+        m = Mesh()
+        m.add_face([QVector3D(x0, 0, 0), QVector3D(x0 + 1, 0, 0),
+                    QVector3D(x0 + 1, 1, 0), QVector3D(x0, 1, 0)])
+        g = Group(m)
+        scene.groups.append(g)
+        return g
+    g1, g2 = grp(10), grp(20)
+    scene.selection.update(scene.mesh.faces)
+    scene.selection.update(scene.mesh.edges)
+    scene.selection.update([g1, g2])
+
+    t = RotateTool()
+    t.on_activate(vp)
+    _click(vp, t, 0, 0)
+    _click(vp, t, 1, 0)
+    _hover(vp, t, 0, 1)
+    _click(vp, t, 0, 1)                            # +90° for EVERYTHING
+
+    assert (0.0, 2.0, 0.0) in _keys(scene.mesh)    # loose (2,0) → (0,2)
+    assert (0.0, 10.0, 0.0) in _keys(g1.mesh)      # group 1 (10,0) → (0,10)
+    assert (0.0, 20.0, 0.0) in _keys(g2.mesh)      # group 2 (20,0) → (0,20)
+    assert vp.history.undo()                       # ONE step restores all
+    assert (2.0, 0.0, 0.0) in _keys(scene.mesh)
+    assert (10.0, 0.0, 0.0) in _keys(g1.mesh)
+    assert (20.0, 0.0, 0.0) in _keys(g2.mesh)
+
+
+def test_move_mixed_selection_groups_and_loose():
+    from PySide6.QtCore import QPointF
+    from core.group import Group
+    from core.mesh import Mesh
+    from tools.move import MoveTool
+    scene = Scene()
+    vp = _Vp(scene)
+    _rect(scene, vp.history, 0, 0, 2, 1)
+    m = Mesh()
+    m.add_face([QVector3D(5, 0, 0), QVector3D(6, 0, 0),
+                QVector3D(6, 1, 0), QVector3D(5, 1, 0)])
+    g = Group(m)
+    scene.groups.append(g)
+    scene.selection.update(scene.mesh.faces)
+    scene.selection.update(scene.mesh.edges)
+    scene.selection.add(g)
+
+    t = MoveTool()
+    t.on_activate(vp)
+    _click(vp, t, 0, 0)                            # grab
+    _hover(vp, t, 0, 3)
+    _click(vp, t, 0, 3)                            # +3 in Y for everything
+
+    assert (0.0, 3.0, 0.0) in _keys(scene.mesh)
+    assert (5.0, 3.0, 0.0) in _keys(g.mesh)
+    assert vp.history.undo()
+    assert (0.0, 0.0, 0.0) in _keys(scene.mesh)
+    assert (5.0, 0.0, 0.0) in _keys(g.mesh)
+
+
+def test_scale_mixed_selection_groups_and_loose():
+    from core.group import Group
+    from core.mesh import Mesh
+    from tools.scale import ScaleTool
+    scene = Scene()
+    vp = _Vp(scene)
+    _rect(scene, vp.history, 1, 0, 2, 1)
+    m = Mesh()
+    m.add_face([QVector3D(4, 0, 0), QVector3D(5, 0, 0),
+                QVector3D(5, 1, 0), QVector3D(4, 1, 0)])
+    g = Group(m)
+    scene.groups.append(g)
+    scene.selection.update(scene.mesh.faces)
+    scene.selection.update(scene.mesh.edges)
+    scene.selection.add(g)
+
+    t = ScaleTool()
+    t.on_activate(vp)
+    grip = next(gr for gr in t._grips if gr.params == (1.0, 0.5, 0.5))
+    t._grab(vp, grip, (0.0, 0.0))                  # anchor = x=1 side
+    t._commit(vp, (2.0, 1.0, 1.0))                 # ×2 along red
+
+    assert (3.0, 0.0, 0.0) in _keys(scene.mesh)    # loose (2,0) → (3,0)
+    assert (9.0, 0.0, 0.0) in _keys(g.mesh)        # group (5,0) → (9,0)
+    assert vp.history.undo()
+    assert (2.0, 0.0, 0.0) in _keys(scene.mesh)
+    assert (5.0, 0.0, 0.0) in _keys(g.mesh)

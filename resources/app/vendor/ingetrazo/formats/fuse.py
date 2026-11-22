@@ -1,0 +1,429 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Marco Sumari Tellez and IngeTrazo contributors.
+"""Fast coplanar fusion for imported triangle soups.
+
+A downloaded library building arrives as ~17k triangles; a good importer
+merges the coplanar ones back into clean facade-sized faces (and that is what
+keeps the same model fluid). The engine's generic coplanar merge is O(F²) and
+melts at that scale, so imports get this dedicated O(F) pass instead:
+
+- bucket loops by (plane, material) with rounded keys,
+- union-find the loops of a bucket into connected regions via shared edges,
+- a region's boundary is the edges used exactly once — trace them into
+  closed loops; the largest is the outer contour, the rest are holes.
+
+Anything irregular (non-manifold edge use, boundary vertex of degree ≠ 2,
+open walks) bails out to the original loops for that region — the pass only
+ever merges what it can prove clean.
+"""
+from __future__ import annotations
+
+import math
+
+from PySide6.QtGui import QVector3D
+
+
+def _key(p: QVector3D):
+    return (round(p.x(), 4), round(p.y(), 4), round(p.z(), 4))
+
+
+def _newell(pts) -> QVector3D:
+    n = QVector3D(0.0, 0.0, 0.0)
+    m = len(pts)
+    for i in range(m):
+        a, b = pts[i], pts[(i + 1) % m]
+        n += QVector3D((a.y() - b.y()) * (a.z() + b.z()),
+                       (a.z() - b.z()) * (a.x() + b.x()),
+                       (a.x() - b.x()) * (a.y() + b.y()))
+    return n
+
+
+def _freeze_attr(value):
+    if isinstance(value, dict):
+        return tuple(sorted((key, _freeze_attr(item))
+                            for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_attr(item) for item in value)
+    if isinstance(value, set):
+        return tuple(sorted((_freeze_attr(item) for item in value), key=repr))
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
+def _attrs_sig(attrs):
+    if not attrs:
+        return (None, None, ())
+    c = attrs.get("color")
+    t = attrs.get("texture")
+    tsig = None
+    if t:
+        uvw = t.get("uvw")
+        # The fitted world→UV map is exact per polygon; rounding merges the
+        # float noise between triangles of the SAME original textured face
+        # while keeping differently-mapped faces apart.
+        tsig = (t.get("path"), t.get("sw"), t.get("sh"), t.get("rot", 0),
+                None if not uvw else tuple(round(x, 4) for x in uvw))
+    extras = tuple(sorted(
+        (key, _freeze_attr(value)) for key, value in attrs.items()
+        if key not in ("color", "texture")))
+    return (None if c is None else tuple(c), tsig, extras)
+
+
+def _sig_rank(sig) -> int:
+    """Preference between coincident duplicate copies (a two-sided
+    export): a textured copy beats a colour-only copy beats a bare one."""
+    if sig is None:
+        return 0
+    return 2 if sig[1] is not None else 1
+
+
+def _uvw_close(ua, ub) -> bool:
+    return all(abs(x - y) <= 0.02 + 0.01 * max(abs(x), abs(y))
+               for x, y in zip(ua, ub))
+
+
+def _sig_compatible(a, b) -> bool:
+    """Whether two faces may fuse. Exact signature equality, or — for two
+    textured faces with the SAME image — world→UV maps within tolerance:
+    exported UV text is quantised (~6 digits) and the per-triangle affine
+    fit amplifies that, so triangles of one continuous surface land ~1e-3
+    apart and used to stay unmerged (the 'dirty triangulation' report).
+    Genuinely different mappings (a neighbouring tile mapped from its own
+    origin) differ by a large fraction of a tile and stay separate."""
+    if a == b:
+        return True
+    if not a or not b or a[0] != b[0] or a[2] != b[2]:
+        return False
+    ta, tb = a[1], b[1]
+    if not ta or not tb or ta[0] != tb[0]:
+        return False
+    ua, ub = ta[4], tb[4]
+    return bool(ua and ub and _uvw_close(ua, ub))
+
+
+def fuse_coplanar_loops(loops, cos_tol: float = 0.99999,
+                        principal_planes: bool = False):
+    """``loops``: list of ``(pts, attrs_dict_or_None)`` polygons (triangles or
+    n-gons). Returns a list of ``(outer_pts, holes, attrs, originals)`` —
+    coplanar same-material connected regions merged into one polygon (holes
+    included), everything else passed through unchanged. ``originals`` holds
+    the source loops of the region so a caller whose ``add_face`` rejects the
+    fused polygon can fall back to them (no geometry is ever lost).
+
+    Regions grow by *pairwise* edge tests — two faces merge when they share a
+    welded edge, the same material, and near-identical normals — so there is
+    no global plane quantisation to split a facade at a rounding cliff. The
+    drift guard compares each union against the region's root normal, so a
+    faceted curve (real dihedral steps) never chain-merges into a non-planar
+    blob."""
+    faces: list = []
+    # Coincident duplicates (a two-sided export writes every
+    # triangle twice, front + reversed back): keep ONE copy — they z-fight
+    # in the render (the mottled front/back patchwork) and their 4-faces
+    # edges block every merge. The copy carrying a material wins.
+    seen_tris: dict = {}
+    for pts, attrs in loops:
+        if len(pts) < 3:
+            continue
+        n = _newell(pts)
+        ln = n.length()
+        if ln < 1e-10:
+            continue                      # degenerate sliver
+        entry = (pts, attrs, n / ln, _attrs_sig(attrs))
+        if len(pts) == 3:
+            tkey = frozenset(_key(p) for p in pts)
+            prev = seen_tris.get(tkey)
+            if prev is None:
+                seen_tris[tkey] = len(faces)
+                faces.append(entry)
+            elif _sig_rank(entry[3]) > _sig_rank(faces[prev][3]):
+                faces[prev] = entry   # textured > coloured > bare copy
+            continue
+        faces.append(entry)
+
+    parent = list(range(len(faces)))
+    root_n = [f[2] for f in faces]
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    edge_map: dict = {}
+    for i, (pts, _a, _n, _s) in enumerate(faces):
+        m = len(pts)
+        for k in range(m):
+            e = frozenset((_key(pts[k]), _key(pts[(k + 1) % m])))
+            if len(e) == 2:
+                edge_map.setdefault(e, []).append(i)
+
+    def on_principal_plane(normal):
+        return max(abs(normal.x()), abs(normal.y()),
+                   abs(normal.z())) >= 1.0 - 1e-7
+
+    root_sig = [f[3] for f in faces]
+    for idxs in edge_map.values():
+        if len(idxs) != 2:
+            continue                      # boundary or non-manifold junction
+        i, j = idxs
+        if principal_planes and not (
+                on_principal_plane(faces[i][2])
+                and on_principal_plane(faces[j][2])):
+            continue
+        if not _sig_compatible(faces[i][3], faces[j][3]):
+            continue                      # different material / UV mapping
+        if abs(QVector3D.dotProduct(faces[i][2], faces[j][2])) < cos_tol:
+            continue                      # a real crease
+        ri, rj = find(i), find(j)
+        if ri == rj:
+            continue
+        if abs(QVector3D.dotProduct(root_n[ri], root_n[rj])) < cos_tol:
+            continue                      # drift guard: stay planar
+        if not _sig_compatible(root_sig[ri], root_sig[rj]):
+            continue                      # drift guard: UV maps stay close
+        parent[rj] = ri
+
+    regions: dict = {}
+    for i in range(len(faces)):
+        regions.setdefault(find(i), []).append(faces[i][:3])
+
+    out: list = []
+    for region in regions.values():
+        fused = _trace_region(region)
+        if fused is not None:
+            out.append(fused)
+        else:
+            out.extend((pts, [], attrs, [pts]) for pts, attrs, _n in region)
+    return out
+
+
+def simplify_mesh(mesh, max_angle_degrees: float = 0.0,
+                  principal_planes: bool = False) -> int:
+    """Merge connected near-coplanar faces in-place and return faces removed.
+
+    A small nonzero angle tolerance allows gently curved triangulated patches
+    (such as rounded corners) to merge in locally planar regions. It can alter
+    the represented surface slightly, so callers should expose this tradeoff.
+    Faces with holes are kept intact.
+    """
+    if (not math.isfinite(max_angle_degrees)
+            or not 0.0 <= max_angle_degrees <= 5.0):
+        raise ValueError("Simplification angle must be between 0 and 5 degrees")
+    if not mesh.faces:
+        return 0
+
+    from core.mesh import Mesh, edge_flags, stamp_edge_flags
+
+    original_count = len(mesh.faces)
+    loops = []
+    holed_faces = []
+    for face in mesh.faces:
+        if face.holes or face.interior:
+            holed_faces.append(face)
+        else:
+            loops.append((face.vertices, face.attrs or None))
+
+    tolerance = max(math.radians(max_angle_degrees), 0.00045)
+    cos_tol = math.cos(tolerance)
+    fused = fuse_coplanar_loops(
+        loops, cos_tol=cos_tol, principal_planes=principal_planes)
+    simplified = Mesh()
+    for outer, holes, attrs, originals in fused:
+        try:
+            face = simplified.add_face(outer, holes or None)
+            if attrs:
+                face.attrs.update(attrs)
+        except Exception:  # noqa: BLE001 — preserve irregular source regions
+            for points in originals:
+                try:
+                    face = simplified.add_face(points)
+                    if attrs:
+                        face.attrs.update(attrs)
+                except Exception:  # noqa: BLE001
+                    continue
+    for face in holed_faces:
+        rebuilt = simplified.add_face(face.vertices, face.holes)
+        rebuilt.attrs.update(face.attrs)
+        rebuilt.interior = face.interior
+
+    def edge_key(edge):
+        return frozenset((_key(edge.a), _key(edge.b)))
+
+    original_flags = {edge_key(edge): edge_flags(edge) for edge in mesh.edges}
+    for edge in simplified.edges:
+        flags = original_flags.get(edge_key(edge))
+        if flags is not None:
+            stamp_edge_flags(edge, flags)
+
+    while True:
+        collapsed = False
+        for vertex in list(simplified.vertices):
+            if simplified.collapsible_vertex(vertex):
+                simplified.collapse_vertex(vertex)
+                collapsed = True
+                break
+        if not collapsed:
+            break
+
+    soften_smooth_edges(simplified)
+    mesh.restore_state(simplified.capture_state())
+    return max(original_count - len(mesh.faces), 0)
+
+
+def _trace_region(loops):
+    """One connected coplanar region → ``(outer, holes, attrs)`` or ``None``
+    when its boundary isn't cleanly traceable."""
+    if len(loops) == 1:
+        pts, attrs, _n = loops[0]
+        return (pts, [], attrs, [pts])
+    # Boundary edges appear exactly once across the region's loops.
+    count: dict = {}
+    pos: dict = {}
+    for pts, _a, _n in loops:
+        m = len(pts)
+        for k in range(m):
+            ka, kb = _key(pts[k]), _key(pts[(k + 1) % m])
+            if ka == kb:
+                continue
+            e = frozenset((ka, kb))
+            count[e] = count.get(e, 0) + 1
+            pos.setdefault(ka, pts[k])
+            pos.setdefault(kb, pts[(k + 1) % m])
+    boundary = [e for e, c in count.items() if c == 1]
+    if not boundary or any(c > 2 for c in count.values()):
+        return None                       # non-manifold inside the plane
+    adj: dict = {}
+    for e in boundary:
+        a, b = tuple(e)
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+    if any(len(v) != 2 for v in adj.values()):
+        return None                       # touching contours — keep triangles
+    # Walk the boundary into closed loops.
+    unvisited = set(boundary)
+    traced: list = []
+    while unvisited:
+        e0 = next(iter(unvisited))
+        start, cur = tuple(e0)
+        unvisited.discard(e0)
+        walk = [start, cur]
+        while True:
+            a, b = adj[cur]
+            nxt = b if a == walk[-2] else a
+            edge = frozenset((cur, nxt))
+            if edge not in unvisited:
+                break
+            unvisited.discard(edge)
+            if nxt == start:
+                break
+            walk.append(nxt)
+            cur = nxt
+        if walk[-1] == start:
+            walk.pop()
+        if len(walk) < 3:
+            return None
+        traced.append([QVector3D(pos[k]) for k in walk])
+    # Largest loop is the outer contour; orient it with the region's normal,
+    # holes against it (the triangulator's convention for nested loops).
+    n_ref = loops[0][2]
+    areas = [(_newell(lp), lp) for lp in traced]
+    areas.sort(key=lambda t: t[0].length(), reverse=True)
+    outer_n, outer = areas[0]
+    if QVector3D.dotProduct(outer_n, n_ref) < 0:
+        outer = list(reversed(outer))
+    holes = []
+    for hn, lp in areas[1:]:
+        if QVector3D.dotProduct(hn, n_ref) > 0:
+            lp = list(reversed(lp))
+        holes.append(lp)
+    return (outer, holes, loops[0][1], [pts for pts, _a, _n in loops])
+
+
+def _smooth_sig(attrs):
+    """Material identity for the smoothing pass: colour + texture IMAGE only.
+    Two faces of one curved surface carry different per-face UV maps (a
+    tree's photo foliage, a textured column), and comparing the full mapping
+    kept every seam hard — the whole surface read as dirty wireframe."""
+    if not attrs:
+        return None
+    c = attrs.get("color")
+    t = attrs.get("texture")
+    return (None if c is None else tuple(c),
+            None if not t else t.get("path"))
+
+
+#: Where the import parks the smoothing group a face came in with. Private
+#: to the import — :func:`drop_smoothing_groups` clears it before the model
+#: is anyone's to edit or save.
+SMOOTH_KEY = "_s"
+
+
+def soften_by_smoothing_group(mesh, crease_cos: float = 0.17) -> None:
+    """Soften the edges the FILE itself calls smooth.
+
+    An OBJ groups its faces with ``s`` statements: everything inside one
+    group is one continuous surface, and the modeller who wrote it said so.
+    Guessing from the angle instead leaves a car bonnet or a face covered in
+    the lines of its own triangulation — the dihedral there is real, the
+    surface is still meant to read as one piece.
+
+    Two guards stay: a material boundary keeps its line (the black trim
+    around a window is not the window), and so does a genuine crease — above
+    ``crease_cos`` apart the two faces are a corner, not a curve, whatever
+    group they were filed under.
+
+    A face with no area has no direction either, and asking it for one reads
+    as a right angle: a figure's eyelashes and hair cards are full of them,
+    and they alone drew three thousand lines across one model's face. Where
+    the normal means nothing, the file's word is all there is — take it.
+    """
+    for e in mesh.edges:
+        if e.soft or len(e.faces) != 2:
+            continue
+        f0, f1 = e.faces
+        if f0 is f1 or not f0.attrs or not f1.attrs:
+            continue
+        g = f0.attrs.get(SMOOTH_KEY)
+        if not g or g != f1.attrs.get(SMOOTH_KEY):
+            continue
+        if _smooth_sig(f0.attrs) != _smooth_sig(f1.attrs):
+            continue
+        n0, n1 = f0.normal(), f1.normal()
+        if n0.length() < 1e-9 or n1.length() < 1e-9 or \
+                abs(QVector3D.dotProduct(n0, n1)) > crease_cos:
+            e.soft = True
+
+
+def drop_smoothing_groups(mesh) -> None:
+    """Forget the file's smoothing groups once they have been used."""
+    for f in mesh.faces:
+        if f.attrs:
+            f.attrs.pop(SMOOTH_KEY, None)
+
+
+def soften_smooth_edges(mesh, cos_threshold: float = 0.85) -> None:
+    """Mark edges between two same-material faces meeting at a shallow
+    dihedral as soft (hidden in the render) — the classic import smoothing.
+    Curved facades read smooth, plane-bucket seams disappear, while real
+    corners (90° walls) and material boundaries stay visible."""
+    normals = {}
+    for e in mesh.edges:
+        if len(e.faces) != 2:
+            continue
+        f0, f1 = e.faces
+        if f0 is f1:
+            continue
+        if _smooth_sig(f0.attrs) != _smooth_sig(f1.attrs):
+            continue                      # material boundary: keep the line
+        n0 = normals.get(id(f0))
+        if n0 is None:
+            n0 = normals[id(f0)] = f0.normal()
+        n1 = normals.get(id(f1))
+        if n1 is None:
+            n1 = normals[id(f1)] = f1.normal()
+        if abs(QVector3D.dotProduct(n0, n1)) > cos_threshold:
+            e.soft = True

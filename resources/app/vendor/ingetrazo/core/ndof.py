@@ -1,0 +1,230 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Marco Sumari Tellez and IngeTrazo contributors.
+"""3D mouse (3Dconnexion SpaceMouse) navigation — issue #108.
+
+A 3D mouse is a cap that can be pushed, pulled, lifted, tilted and twisted:
+six axes at once. This module is the device-free half: it turns one reading
+of the six axes into a camera move. The drivers that deliver the readings
+live in ``views/ndof_input.py`` (spacenavd on Linux, Raw Input on Windows).
+
+The mapping is FreeCAD's default, «object mode»: you hold the
+MODEL. Move the cap right and the model goes right; lift it and the model
+rises; push it away and the model goes away (zoom out); tilt it forward and
+the model tips its top toward you; twist it and the model turns on its
+vertical axis. The camera has no roll, so rolling the cap does nothing.
+
+Every backend normalises its device's raw numbers into :class:`NdofSample`
+first, in ONE frame — the user's — so the mapping here never cares which
+driver spoke:
+
+* ``right``   cap pushed right          (+) / left  (−)
+* ``up``      cap lifted                (+) / pressed down (−)
+* ``forward`` cap pushed away from you  (+) / pulled toward you (−)
+* ``tilt``    cap tipped away from you  (+) (its top goes forward)
+* ``spin``    cap twisted anticlockwise seen from above (+)
+* ``roll``    cap tipped to the right   (+)
+
+each in [−1, 1] at full deflection.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+
+#: What the devices report at full deflection. spacenavd and the HID
+#: reports of every current 3Dconnexion model sit around ±350; a little
+#: headroom keeps a hard push from clipping below full speed.
+FULL_SCALE = 350.0
+
+#: Full-deflection speeds, at sensitivity 1.
+ORBIT_RAD_PER_S = 2.0          # about 115°/s
+PAN_VIEWS_PER_S = 1.0          # one viewport height per second
+ZOOM_STEPS_PER_S = 8.0         # eight wheel notches per second
+
+#: Readings older than this (a device that stopped reporting, a machine
+#: that stalled) move the camera as if only this much time had passed.
+MAX_DT = 0.1
+
+
+@dataclass
+class NdofSample:
+    right: float = 0.0
+    up: float = 0.0
+    forward: float = 0.0
+    tilt: float = 0.0
+    spin: float = 0.0
+    roll: float = 0.0
+
+    @classmethod
+    def from_raw(cls, right, up, forward, tilt, spin, roll,
+                 full_scale: float = FULL_SCALE) -> "NdofSample":
+        def n(v):
+            return max(-1.0, min(1.0, float(v) / full_scale))
+        return cls(n(right), n(up), n(forward), n(tilt), n(spin), n(roll))
+
+    def is_idle(self) -> bool:
+        return not any((self.right, self.up, self.forward,
+                        self.tilt, self.spin, self.roll))
+
+
+AXES = ("right", "up", "forward", "tilt", "spin", "roll")
+ACTIONS = ("pan_x", "pan_y", "zoom", "orbit_x", "orbit_y", "disabled")
+DEFAULT_MAPPING = dict(zip(AXES, ("pan_x", "pan_y", "zoom",
+                                  "orbit_y", "orbit_x", "disabled")))
+# Based on the user's tested FreeCAD-style configuration; true camera roll
+# is not supported by OrbitCamera yet.
+FREECAD_MAPPING = dict(zip(AXES, ("pan_x", "zoom", "pan_y",
+                                  "orbit_y", "disabled", "orbit_x")))
+FREECAD_INVERSION = {axis: axis in ("up", "tilt") for axis in AXES}
+
+
+
+def default_axis_mapping():
+    return DEFAULT_MAPPING.copy()
+
+
+def default_axis_inversion():
+    return {axis: False for axis in AXES}
+
+
+def default_axis_sensitivity():
+    return {axis: 1.0 for axis in AXES}
+
+
+def effective_axis_mapping(settings):
+    """Use the original mapping unless the user selected Custom."""
+    return (settings.axis_mapping if settings.mapping_preset == "custom"
+            else FREECAD_MAPPING if settings.mapping_preset == "freecad"
+            else DEFAULT_MAPPING)
+
+
+def mapped_movements(sample, settings):
+    """Five camera actions from six physical axes; sum duplicate assignments."""
+    outputs = {action: 0.0 for action in ACTIONS if action != "disabled"}
+    mapping = effective_axis_mapping(settings)
+    for axis in AXES:
+        action = mapping.get(axis, DEFAULT_MAPPING[axis])
+        if action not in outputs:
+            continue
+        value = shape(getattr(sample, axis), settings.deadzone)
+        if settings.mapping_preset in ("custom", "freecad"):
+            inversion = (settings.axis_inversion if settings.mapping_preset == "custom"
+                         else FREECAD_INVERSION)
+            if inversion.get(axis, False):
+                value = -value
+            value *= (settings.axis_sensitivity.get(axis, 1.0)
+                      if settings.mapping_preset == "custom" else 1.0)
+        else:
+            legacy = {
+                "right": settings.invert_pan != settings.invert_pan_x,
+                "up": settings.invert_pan != settings.invert_pan_y,
+                "forward": settings.invert_zoom,
+                "tilt": settings.invert_rotate != settings.invert_tilt,
+                "spin": settings.invert_rotate != settings.invert_spin,
+                "roll": False,
+            }
+            if legacy[axis]:
+                value = -value
+        outputs[action] += value
+    return {key: max(-1.0, min(1.0, value))
+            for key, value in outputs.items()}
+
+
+@dataclass
+class NdofSettings:
+    enabled: bool = True
+    sensitivity: float = 1.0       # 0.25 … 4
+    deadzone: float = 0.05         # a cap at rest never reads exactly zero
+    invert_pan: bool = False       # both pan axes (the first settings)
+    invert_zoom: bool = False
+    invert_rotate: bool = False    # both orbit axes (the first settings)
+    #: One box per axis (issue #108, a user with a SpaceMouse: «a checkbox
+    #: for each axis for panning and rotation»). Each flips on top of the
+    #: pair switch above, which older settings may still carry.
+    invert_pan_x: bool = False     # right / left
+    invert_pan_y: bool = False     # up / down
+    invert_tilt: bool = False      # orbit up / down (cap tipped)
+    invert_spin: bool = False      # orbit around (cap twisted)
+    #: Only translations (pan + zoom) — for plan drawing, where an accidental
+    #: twist that tips the view out of Top is the last thing wanted.
+    lock_rotation: bool = False
+    mapping_preset: str = "original"
+    axis_mapping: dict = field(default_factory=default_axis_mapping)
+    axis_inversion: dict = field(default_factory=default_axis_inversion)
+    axis_sensitivity: dict = field(default_factory=default_axis_sensitivity)
+
+
+def shape(v: float, deadzone: float) -> float:
+    """Dead zone, then a gentle curve: fine control near the centre, full
+    speed at the stop — the same feel the 3Dconnexion driver gives."""
+    a = abs(v)
+    if a <= deadzone:
+        return 0.0
+    t = (a - deadzone) / (1.0 - deadzone)
+    return math.copysign(t * t * 0.6 + t * 0.4, v)
+
+
+def apply_ndof(camera, sample: NdofSample, dt: float, viewport_h: int,
+               settings: NdofSettings | None = None) -> bool:
+    """Move *camera* (an :class:`core.camera.OrbitCamera`) by one reading
+    held for *dt* seconds. Returns True when the camera changed."""
+    st = settings or NdofSettings()
+    if not st.enabled:
+        return False
+    dt = max(0.0, min(dt, MAX_DT))
+    if dt == 0.0:
+        return False
+    k = st.sensitivity * dt
+    h = max(int(viewport_h), 1)
+    movements = mapped_movements(sample, st)
+    right, up, forward = (movements["pan_x"], movements["pan_y"],
+                          movements["zoom"])
+    spin, tilt = movements["orbit_x"], movements["orbit_y"]
+    if st.lock_rotation:
+        spin = tilt = 0.0
+    moved = False
+    if right or up:
+        # camera.pan GRABS the model like a mouse drag: +dx carries it right,
+        # +dy (screen down) carries it down — so lifting the cap is −dy.
+        px = PAN_VIEWS_PER_S * h * k
+        camera.pan(right * px, -up * px, h)
+        moved = True
+    if forward:
+        # Pushing the model away = zooming out (negative wheel steps).
+        camera.zoom(-forward * ZOOM_STEPS_PER_S * k)
+        moved = True
+    if tilt or spin:
+        # camera.orbit takes pixels at π radians per viewport height and,
+        # like a drag, grabs the model: +dx swings it right (a twist
+        # anticlockwise from above brings its near side to the right),
+        # +dy tips its top toward you (a cap tipped away).
+        px = ORBIT_RAD_PER_S * k * h / math.pi
+        camera.orbit(spin * px, tilt * px, h)
+        moved = True
+    return moved
+
+
+# ---- Device frames → the user's frame ----------------------------------------
+# Both conversions are ONE place each, so a sign found wrong on a real device
+# is a one-character fix with a test beside it.
+
+def from_spacenavd(x, y, z, rx, ry, rz) -> NdofSample:
+    """spacenavd's frame: right-handed, Y up, Z toward the user — so +rx
+    brings the cap's top toward the user, +ry turns it anticlockwise seen
+    from above and +rz tips it to the left."""
+    return NdofSample.from_raw(right=x, up=y, forward=-z,
+                               tilt=-rx, spin=ry, roll=-rz)
+
+
+def from_hid(x, y, z, rx, ry, rz) -> NdofSample:
+    """The raw USB HID frame every 3Dconnexion device reports (what Windows
+    Raw Input hands over): X right, Y AWAY from the user, Z down.
+
+    Not guessed: FreeCAD turns both drivers into one frame, (−x, y, z, −rx,
+    ry, rz) from the HID report and (−x, −z, −y, −rx, −rz, −ry) from
+    spacenavd, so HID y = −spacenavd z, z = −y, ry = −rz, rz = −ry. Through
+    that, this is :func:`from_spacenavd`, which a SpaceMouse owner checked
+    axis by axis on Linux (#108). The first version had Y toward the user:
+    on Windows the zoom ran backwards (a reviewer's video, 12-10)."""
+    return NdofSample.from_raw(right=x, up=-z, forward=y,
+                               tilt=-rx, spin=-rz, roll=ry)

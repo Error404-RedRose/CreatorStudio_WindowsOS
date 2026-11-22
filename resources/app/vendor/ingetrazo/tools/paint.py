@@ -1,0 +1,554 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Marco Sumari Tellez and IngeTrazo contributors.
+"""Paint (bucket) tool: assign a material colour to a face.
+
+Behavior (the classic Paint Bucket, ``B``):
+- Left click on a face: paint it with the tool's current colour. The colour
+  lives in the face's ``attrs["color"]`` (the generic per-region attrs from
+  A.3), so it survives push/pull and the plane rebuild.
+- If the clicked face is part of the current face selection, the whole
+  selection is painted in one undoable step (paint many at once).
+- **Alt** switches to the eyedropper, the usual modern way: a tap
+  TOGGLES it and it stays until one face is sampled (then back to the
+  bucket) or Alt is tapped again; holding Alt and clicking samples too. The
+  sample takes the face's material into the current one: image, applied size, rotation, translucency and the material
+  identity all travel, so the next click reproduces that material on another
+  face. A face carrying an explicit world→UV map (an imported texture, or one
+  positioned by hand) hands that map on only to faces on the SAME plane, where
+  it keeps the pattern lined up; a face on another plane gets the material with
+  its OWN planar projection at the same applied size. Copying the map across
+  planes is what is usually called a *projected* texture, and doing it by default
+  degenerates: on a wall perpendicular to the sampled floor the ``v`` axis
+  lands along the wall's normal and the image smears into stripes.
+- Works on loose geometry and group faces alike (``pick_face_any``).
+- **Paints the side you click.** A face has a front and a back, and
+  the classic behaviour paints exactly the side under the cursor: the front of a wall
+  takes the brick, its back keeps the style's default blue-grey. IngeTrazo
+  used to show every paint on both sides («si a una cara le aplico un
+  color o textura también se aplica a su revés, lo cual no debería» —
+  Marco, 2026-09-11). The back's own material lives in ``attrs["back"]``
+  (``SetFaceBackCommand``); a translucent front — glass, water, a raschel
+  mesh, a leaf cutout — reads on both sides anyway, and
+  that rule lives in ``core.materials.back_is_default``.
+
+The current colour is class-level (shared across activations) and is set from
+the toolbar swatch (a ``QColorDialog``); the tool only applies it.
+
+Every paint also puts the material at the head of ``PaintTool.recent``, the
+last few materials actually painted with; the tray shows them as a row of
+swatches so texturing does not mean digging through the library each time.
+"""
+from __future__ import annotations
+
+from PySide6.QtCore import Qt
+
+from core.i18n import tr
+from core.mesh import Face
+from core.history import (
+    CompoundCommand,
+    SetFaceBackCommand,
+    SetFaceColorCommand,
+    SetFaceMaterialTagCommand,
+    SetFaceOpacityCommand,
+    SetFaceTextureCommand,
+    SetGroupMaterialCommand,
+)
+from tools.base import Tool, ToolContext
+
+# The default cream the viewport paints unpainted faces with — sampling an
+# unpainted face yields this, and it is what "no colour" reads as.
+DEFAULT_FACE_COLOR = (0.96, 0.95, 0.925)
+
+
+#: How many materials the «Recent» row keeps.
+RECENT_MAX = 6
+
+
+def recent_key(entry: dict) -> tuple:
+    """What makes two recent entries THE SAME material: its name when it
+    has one, else the image with its size and turn (or the colour)."""
+    if entry.get("mat"):
+        return ("m", entry["mat"])
+    tex = entry.get("texture")
+    if tex:
+        tint = tex.get("tint")
+        return ("t", tex.get("path"), tex.get("sw"), tex.get("sh"),
+                tex.get("rot", 0.0), tuple(tint) if tint else None,
+                entry.get("opacity"))
+    col = entry.get("color") or ()
+    return ("c", tuple(round(float(c), 4) for c in col),
+            entry.get("opacity"))
+
+
+def push_recent(entries: list, entry: dict, cap: int = RECENT_MAX) -> list:
+    """``entries`` with ``entry`` moved (or added) to the front, without
+    duplicates and at most ``cap`` long."""
+    key = recent_key(entry)
+    rest = [e for e in entries if recent_key(e) != key]
+    return [entry] + rest[:max(cap - 1, 0)]
+
+
+def rename_recent(entries: list, old: str, stamp: dict) -> list:
+    """``entries`` with every one named *old* now wearing *stamp* (the
+    new material's face attrs): a material renamed or recoloured in the
+    model is not offered back under its old name and colour."""
+    out = []
+    for e in entries:
+        if e.get("mat") == old:
+            e = {k: v for k, v in e.items()
+                 if k not in ("mat", "color", "texture", "opacity")}
+            e.update({k: (list(v) if isinstance(v, tuple) else v)
+                      for k, v in stamp.items()})
+        out.append(e)
+    return out
+
+
+def _face_plane(face) -> tuple:
+    """``(unit normal, offset)`` of the face's plane."""
+    from PySide6.QtGui import QVector3D
+    n = face.normal()
+    p = face.vertices[0] if face.vertices else QVector3D()
+    return (n, QVector3D.dotProduct(n, p))
+
+
+def _same_plane(face, plane, tol: float = 1e-4) -> bool:
+    from PySide6.QtGui import QVector3D
+    n, d = plane
+    fn = face.normal()
+    if abs(abs(QVector3D.dotProduct(fn, n)) - 1.0) > 1e-3:
+        return False
+    p = face.vertices[0] if face.vertices else QVector3D()
+    return abs(QVector3D.dotProduct(n, p) - d) <= tol
+
+
+def _surface_commands(mesh, faces, seed, tex, plane) -> list | None:
+    """The commands that paint a curved SURFACE (faces joined by soft
+    edges) with ``tex`` running continuously from ``seed`` — see
+    ``core.texture.continuous_maps``. ``None`` when ``faces`` is not such
+    a surface (a single face, or a plain selection), so the caller falls
+    back to the per-face rule."""
+    if mesh is None or seed is None or len(faces) < 2:
+        return None
+    from core.texture import continuous_maps
+    look = tex
+    if tex.get("uvw") and (plane is None or not _same_plane(seed, plane)):
+        from core.texture import flattened_texture
+        look = flattened_texture(tex, plane[0] if plane else None)
+    maps = continuous_maps(mesh, faces, seed, look)
+    if len(maps) < 2:
+        return None
+    cmds = [SetFaceTextureCommand([f], maps[id(f)]) for f in faces if id(f) in maps]
+    rest = [f for f in faces if id(f) not in maps]
+    if rest:
+        cmds.extend(_texture_commands(rest, tex, plane))
+    return cmds
+
+
+def _texture_commands(faces, tex, plane) -> list:
+    """Apply ``tex`` the way the classic eyedropper does.
+
+    An explicit ``uvw`` is where the image sits IN THE WORLD; it only means
+    the same thing on the plane it was fitted for. Faces on that plane keep
+    it, so a pattern continues across a seam; every other face takes the
+    material without it and projects the image on its own plane with the
+    LOOK the sample had — its tile size and turn, read off the map
+    (``core.texture.flattened_texture``) — so a texture scaled and rotated
+    with the pins carries to the next wall (Marco, 2026-09-15)."""
+    if not tex.get("uvw") or plane is None:
+        return [SetFaceTextureCommand(faces, tex)]
+    same = [f for f in faces if _same_plane(f, plane)]
+    other = [f for f in faces if not _same_plane(f, plane)]
+    cmds = []
+    if same:
+        cmds.append(SetFaceTextureCommand(same, tex))
+    if other:
+        from core.texture import flattened_texture
+        cmds.append(SetFaceTextureCommand(other, flattened_texture(tex, plane[0])))
+    return cmds
+
+
+def clicked_back_side(viewport, face, group, x: float, y: float) -> bool:
+    """Whether the cursor at ``(x, y)`` sees the BACK of ``face``: the
+    pick ray runs along the face's world normal instead of against it.
+    ``group`` is what ``pick_face_any`` returned beside the face (its
+    transform places the normal). A viewport without a ray (the stubs in
+    tests) reads as the front."""
+    from PySide6.QtGui import QVector3D
+    ray = getattr(viewport, "_pixel_to_ray", None)
+    if ray is None:
+        return False
+    origin, direction = ray(x, y)
+    if origin is None or direction is None:
+        return False
+    from core.snap import face_plane_world
+    _p, normal = face_plane_world(face, getattr(group, "xform", None))
+    return QVector3D.dotProduct(normal, direction) > 0.0
+
+
+class PaintTool(Tool):
+    name = "Paint"
+    shortcut = "B"
+    description = "Click faces to paint them with the chosen material."
+    uses_snap = False  # picks a face to paint; no snap markers
+
+    # Shared current paint colour (RGB, 0..1), set from the toolbar swatch.
+    current_color: tuple[float, float, float] = (0.80, 0.45, 0.30)
+    # Shared current texture ({"path","sw","sh"}) or None. When set, the click
+    # applies a texture instead of a colour — chosen from the toolbar.
+    current_texture: dict | None = None
+    # Shared current material IDENTITY (core.materials.Material) or None.
+    # Set by the tray when the active swatch has a name; painting then
+    # stamps attrs["mat"] alongside the colour/texture (and registers the
+    # material in the scene on first use). None = anonymous paint, which
+    # CLEARS any previous identity — a red face is no longer "Concreto
+    # visto", so the per-material takeoff never lies.
+    current_material = None
+    # Shared translucency (glass): None = opaque paint, which also CLEARS
+    # any previous opacity on the painted faces.
+    current_opacity: float | None = None
+    # Armed by the toolbar's eyedropper button: the NEXT click samples
+    # instead of painting, then disarms. The pipette sits
+    # beside the material — Alt works for people who know it, the button is
+    # how you find it.
+    sample_armed: bool = False
+    # Plane the current texture's explicit ``uvw`` belongs to, as
+    # ``(normal, offset)`` — set when the eyedropper samples a face that
+    # carries one. Only faces on that plane inherit the map; see the module
+    # docstring. ``None`` = the texture has no map of its own to hand on.
+    current_texture_plane: tuple | None = None
+    # The «Default» material (no material): the eyedropper picks it
+    # up from an unpainted side, the tray offers it, and painting with it
+    # REMOVES the paint (@pacaeiro, #47 point 2). While it is set the
+    # colour/texture fields above are ignored.
+    current_is_default: bool = False
+    # The last materials painted with, newest first, as material dicts
+    # (``_current_as_material``). The tray loads them from the settings,
+    # shows them and saves them back (``recent_materials_changed``).
+    recent: list[dict] = []
+
+    def on_activate(self, viewport) -> None:
+        pass
+
+    def on_deactivate(self, viewport) -> None:
+        viewport.set_hover(None)
+
+    @staticmethod
+    def _sampling(ctx: ToolContext) -> bool:
+        """Whether a click now samples (the eyedropper) instead of painting:
+        Alt held, or tapped (a toggle), or the toolbar's pipette armed."""
+        return (bool(ctx.modifiers & Qt.AltModifier)
+                or bool(getattr(ctx.viewport, "_alt_down", False))
+                or PaintTool.sample_armed)
+
+    @staticmethod
+    def _container_under(vp, group, x: float, y: float):
+        """The group or component a click at ``(x, y)`` paints as a whole —
+        a face inside a container reached from OUTSIDE it — or ``None``
+        when the click paints the face. The hover and the click both ask
+        here, so the marking always shows what the click will paint."""
+        if group is None:
+            return None
+        pick_obj = getattr(vp, "pick_group", None)
+        return pick_obj(x, y) if pick_obj is not None else None
+
+    @staticmethod
+    def _every_face_painted(obj) -> bool:
+        """Whether every face of the group or component — nested
+        placements included — carries its own material, so painting it as
+        a whole shows no change."""
+        from core.group import iter_placements
+        from core.materials import has_own_material
+        seen = False
+        for g, _m in iter_placements(obj):
+            for f in g.mesh.faces:
+                seen = True
+                if not has_own_material(f.attrs):
+                    return False
+        return seen
+
+    def on_hover(self, ctx: ToolContext) -> None:
+        vp = ctx.viewport
+        x, y = ctx.screen.x(), ctx.screen.y()
+        # A closed group or component is painted whole, so no face of it is
+        # marked: a marked face promised a paint the click does not do. The
+        # eyedropper samples one face and marks that face.
+        if not self._sampling(ctx):
+            _face, group = vp.pick_face_any(x, y)
+            if self._container_under(vp, group, x, y) is not None:
+                vp.set_hover(None)
+                return
+        # A face inside a component is marked through the placement it was
+        # reached through, or the marking is drawn where the part WOULD be
+        # unplaced and assembled, not where the placed, exploded part is.
+        pick = getattr(vp, "pick_face_placement", None)
+        if pick is not None:
+            face, placement = pick(ctx.screen.x(), ctx.screen.y())
+            vp.set_hover(face, placement)
+            return
+        face, _group = vp.pick_face_any(ctx.screen.x(), ctx.screen.y())
+        vp.set_hover(face)
+
+    def on_click(self, ctx: ToolContext) -> None:
+        vp = ctx.viewport
+        face, group = vp.pick_face_any(ctx.screen.x(), ctx.screen.y())
+        if self._sampling(ctx) and self._sample_image(ctx, face):
+            return
+        if face is None:
+            return
+        back_side = clicked_back_side(vp, face, group,
+                                      ctx.screen.x(), ctx.screen.y())
+
+        # The pointer is the promise: whenever it shows the eyedropper — Alt
+        # held, or tapped (a toggle) — the click samples.
+        if self._sampling(ctx):
+            # Eyedropper: adopt the face's material (texture if it has one, else
+            # colour) as the current paint material — identity included, so
+            # sampling "Concreto visto" paints "Concreto visto". The side
+            # under the cursor is what gets sampled: a back painted on its
+            # own gives its own material, a two-sided face its front, a
+            # default back the default paint. A default face inside a
+            # painted container wears the container's paint (issue #47).
+            from core.group import effective_material
+            from core.materials import effective_attrs
+            src = effective_attrs(face.attrs, effective_material(group))
+            if back_side:
+                back = face.attrs.get("back")
+                if isinstance(back, dict):
+                    src = back
+                elif back is not True:
+                    src = {}
+            from core.materials import has_own_material
+            PaintTool.current_is_default = not has_own_material(src)
+            tex = src.get("texture")
+            if tex is not None:
+                PaintTool.current_texture = dict(tex)
+                PaintTool.current_texture_plane = (
+                    _face_plane(face) if tex.get("uvw") else None)
+            else:
+                PaintTool.current_texture = None
+                PaintTool.current_texture_plane = None
+                sampled = src.get("color")
+                PaintTool.current_color = (tuple(sampled) if sampled is not None
+                                           else DEFAULT_FACE_COLOR)
+            PaintTool.current_opacity = src.get("opacity")
+            name = src.get("mat")
+            PaintTool.current_material = (
+                vp.scene.materials.get(name) if name else None)
+            win = vp.window() if hasattr(vp, "window") else None
+            if PaintTool.sample_armed:
+                PaintTool.sample_armed = False
+                if hasattr(win, "release_eyedropper"):
+                    win.release_eyedropper()
+            # The tray's «Activo» swatch shows what the next click paints —
+            # it stayed on the old paint after a sample (issue #47,
+            # @pacaeiro: «the Active Material in Materials List is not
+            # updated»).
+            # The swatch lives on the dock's Materials panel, not on the
+            # dock itself.
+            panel = getattr(getattr(win, "tray", None), "materials", None)
+            if hasattr(panel, "sync_from_paint"):
+                panel.sync_from_paint()
+            vp.update()
+            # Optional, like the other viewport niceties this package uses:
+            # the tool has to work against a bare viewport too.
+            flash = getattr(vp, "flash_status", None)
+            if callable(flash):
+                flash(tr("Material sampled — click a face to paint it"))
+            return
+
+        # A face inside a container clicked from OUTSIDE it paints the
+        # container — the group or component instance as a whole
+        # (issue #47, @pacaeiro: «it's painting the picked face, instead of
+        # the whole group or component»). Its default faces take the paint;
+        # faces painted themselves keep their own.
+        obj = self._container_under(vp, group, ctx.screen.x(), ctx.screen.y())
+        if obj is not None:
+            mat = PaintTool.current_material
+            vp.history.execute(CompoundCommand([
+                SetFaceMaterialTagCommand(
+                    [], mat.name if mat is not None else None, mat),
+                SetGroupMaterialCommand(
+                    obj, None if PaintTool.current_is_default
+                    else self._current_as_material()),
+            ]))
+            flash = getattr(vp, "flash_status", None)
+            if callable(flash):
+                name = getattr(obj, "name", "") or tr("Group")
+                if self._every_face_painted(obj):
+                    # Nothing on screen changes: say why, and how (#807,
+                    # components from a .skp whose faces carry their own
+                    # material — the SketchUp rule, as in #408).
+                    flash(tr("{name}: every face has its own material, so "
+                             "nothing changed — open it and paint the "
+                             "faces", name=name), 10000)
+                else:
+                    flash(tr("{name} painted as a whole; a face that "
+                             "already had its own material keeps it",
+                             name=name))
+            self._remember_current(vp)
+            vp.update()
+            return
+
+        # Paint the clicked face — or, if it is part of the current face
+        # selection, the whole selection. A face on a curved surface (cylinder
+        # side) paints the whole surface.
+        sel_faces = [e for e in vp.scene.selection if isinstance(e, Face)]
+        faces = (sel_faces if face in sel_faces
+                 else vp.scene.mesh.surface_of(face))
+        mat = PaintTool.current_material
+        if PaintTool.current_is_default:
+            # «No material»: the clicked side goes back to the default —
+            # nothing written, so a container's paint can dress it again.
+            if back_side:
+                cmd = SetFaceBackCommand(faces, None)
+            else:
+                cmd = CompoundCommand([
+                    SetFaceColorCommand(faces, None),
+                    SetFaceTextureCommand(faces, None),
+                    SetFaceOpacityCommand(faces, None),
+                    SetFaceMaterialTagCommand(faces, None, None),
+                ])
+            vp.history.execute(cmd)
+            vp.update()
+            return
+        if back_side:
+            # The back gets its own material and nothing else changes:
+            # the front keeps what it had. The material still registers
+            # itself in the scene (an empty tag stamp does only that).
+            vp.history.execute(CompoundCommand([
+                SetFaceMaterialTagCommand(
+                    [], mat.name if mat is not None else None, mat),
+                SetFaceBackCommand(faces, [self._back_material_for(f)
+                                           for f in faces]),
+            ]))
+            self._remember_current(vp)
+            vp.update()
+            return
+        tag = SetFaceMaterialTagCommand(
+            faces, mat.name if mat is not None else None, mat)
+        opacity = SetFaceOpacityCommand(faces, PaintTool.current_opacity)
+        if PaintTool.current_texture is not None:
+            # A curved surface gets the image wrapped around it from the
+            # clicked face — the surface under the click, or the
+            # part of the selection joined to it by soft edges (clicking a
+            # surface with Select selects it whole, and Marco painted it
+            # that way: every facet came out planar again, 2026-09-15);
+            # anything else, face by face.
+            cmds = _surface_commands(vp.scene.mesh, faces, face,
+                                     PaintTool.current_texture,
+                                     PaintTool.current_texture_plane)
+            if cmds is None:
+                cmds = _texture_commands(faces, PaintTool.current_texture,
+                                         PaintTool.current_texture_plane)
+            vp.history.execute(CompoundCommand(cmds + [opacity, tag]))
+        else:
+            # Painting a solid colour clears any texture on those faces, in one
+            # undoable step.
+            vp.history.execute(CompoundCommand([
+                SetFaceColorCommand(faces, PaintTool.current_color),
+                SetFaceTextureCommand(faces, None),
+                opacity,
+                tag,
+            ]))
+        self._remember_current(vp)
+        vp.update()
+
+    @staticmethod
+    def _sample_image(ctx: ToolContext, face) -> bool:
+        """The eyedropper over a reference image (#687: «el gotero no da la
+        opción de seleccionarla»): its picture becomes the current paint,
+        mapped where the image sits — a face drawn over the image on its
+        plane takes the picture exactly under it, any other face projects
+        it at the image's real size. An image behind the face under the
+        cursor does not count. True when an image was sampled."""
+        vp = ctx.viewport
+        x, y = ctx.screen.x(), ctx.screen.y()
+        if face is not None:
+            image = (vp.image_in_front_of(face, x, y)
+                     if hasattr(vp, "image_in_front_of") else None)
+        else:
+            image = (vp.image_plane_at(x, y)
+                     if hasattr(vp, "image_plane_at") else None)
+        if image is None:
+            return False
+        from PySide6.QtGui import QVector3D
+        tex = image.texture()
+        n = image.normal()
+        PaintTool.current_is_default = False
+        PaintTool.current_texture = tex
+        PaintTool.current_texture_plane = (
+            (n, QVector3D.dotProduct(n, image.origin)) if tex.get("uvw")
+            else None)
+        opacity = float(getattr(image, "opacity", 1.0))
+        PaintTool.current_opacity = opacity if opacity < 1.0 else None
+        PaintTool.current_material = None
+        win = vp.window() if hasattr(vp, "window") else None
+        if PaintTool.sample_armed:
+            PaintTool.sample_armed = False
+            if hasattr(win, "release_eyedropper"):
+                win.release_eyedropper()
+        panel = getattr(getattr(win, "tray", None), "materials", None)
+        if hasattr(panel, "sync_from_paint"):
+            panel.sync_from_paint()
+        vp.update()
+        flash = getattr(vp, "flash_status", None)
+        if callable(flash):
+            flash(tr("Material sampled — click a face to paint it"))
+        return True
+
+    @classmethod
+    def _remember_current(cls, vp=None) -> None:
+        """Put the material just painted at the head of ``recent`` and let
+        the tray know. The «Default» material is not one: painting with it
+        takes paint off."""
+        if cls.current_is_default:
+            return
+        before = cls.recent
+        cls.recent = push_recent(cls.recent, cls._current_as_material())
+        if cls.recent == before:
+            return
+        win = vp.window() if hasattr(vp, "window") else None
+        panel = getattr(getattr(win, "tray", None), "materials", None)
+        if hasattr(panel, "recent_materials_changed"):
+            panel.recent_materials_changed()
+
+    @classmethod
+    def _current_as_material(cls) -> dict:
+        """The current paint as a container material (the keys a face's
+        attrs use). A positioned texture travels without its map: a
+        container has no plane of its own, each face projects it."""
+        paint: dict = {}
+        if cls.current_texture is not None:
+            tex = dict(cls.current_texture)
+            tex.pop("uvw", None)
+            paint["texture"] = tex
+        else:
+            paint["color"] = list(cls.current_color)
+        if cls.current_opacity is not None:
+            paint["opacity"] = float(cls.current_opacity)
+        if cls.current_material is not None:
+            paint["mat"] = cls.current_material.name
+        return paint
+
+    @classmethod
+    def _back_material_for(cls, face) -> dict:
+        """The current paint as a back-side material dict for ``face`` —
+        the same keys the front uses, with the eyedropper's plane rule for
+        a positioned texture (see ``_texture_commands``)."""
+        back: dict = {}
+        if cls.current_texture is not None:
+            tex = dict(cls.current_texture)
+            if tex.get("uvw") and (cls.current_texture_plane is None
+                                   or not _same_plane(
+                                       face, cls.current_texture_plane)):
+                from core.texture import flattened_texture
+                plane = cls.current_texture_plane
+                tex = flattened_texture(tex, plane[0] if plane else None)
+            back["texture"] = tex
+        else:
+            back["color"] = list(cls.current_color)
+        if cls.current_opacity is not None:
+            back["opacity"] = float(cls.current_opacity)
+        if cls.current_material is not None:
+            back["mat"] = cls.current_material.name
+        return back

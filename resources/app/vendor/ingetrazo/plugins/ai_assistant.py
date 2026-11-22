@@ -1,0 +1,1166 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Marco Sumari Tellez and IngeTrazo contributors.
+"""Asistente IA — model with AI from INSIDE IngeTrazo, in the side tray's
+«AI» tab (Ctrl+Shift+A brings it forward, even when hidden).
+
+The user types what they want; the model answers in the user's language and acts by
+emitting ONE ```python recipe per turn, which runs through the shared
+transactional executor (core.ai): one undo step per action, whole-rollback
+on error, the hermeticity guard validating every solid. After each action
+the assistant receives the result — and, for vision-capable providers, a
+live viewport screenshot, so it SEES what it built and iterates.
+
+Providers follow the IngePresupuestos convention the user already knows:
+paste ONE API key and the provider is detected by its prefix (gsk_ → Groq,
+sk-ant- → Anthropic, AIza → Gemini, sk-or- → OpenRouter, oc_sk_ → OpenCode
+Go, sk- → OpenAI), or
+leave it empty for a local Ollama. A provider picked by name with the field
+empty uses its usual variable (``ANTHROPIC_API_KEY``…, ``core.ai.ENV_KEYS``)
+without saving it (#998). Model name and Ollama URL are editable;
+everything persists in QSettings. Network calls run on a worker thread —
+the recipes always execute on the Qt main thread.
+"""
+from __future__ import annotations
+
+import base64
+import html
+import threading
+import uuid
+
+from PySide6.QtCore import (QBuffer, QEvent, QIODevice, QSettings, Qt,
+                            QUrl, Signal)
+from PySide6.QtGui import (QImage, QImageReader, QPalette, QPixmap,
+                           QTextDocument)
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QSplitter,
+    QTextBrowser,
+    QStyle,
+    QVBoxLayout,
+    QWidget,
+)
+
+from core import ai, ai_recipes
+from core.i18n import tr
+from views.filedialogs import file_dialogs
+from views.fold_section import FoldSection, WrapLabel, narrow, wrapping_form
+from views.theme import accent_color, style as theme_style
+
+MAX_ROUNDS = 12
+
+#: Blocks in a row that raised before control goes back to the user. A
+#: small local model (llama3.2 in Rafael's review 6, #461) fed its own
+#: TypeError back for all 12 rounds — «toda la tarde» on a busy machine.
+#: MAX_ROUNDS stays the cap for multi-step work that keeps succeeding.
+MAX_FAILED_ROUNDS = 3
+
+#: Reply budget per turn. 4096 was not enough for chatty coders (gemini
+#: 2.5 flash got cut mid-```python and the loop ended with nothing drawn);
+#: every provider we speak accepts 8192 output tokens.
+MAX_TOKENS = 8192
+
+#: Gemini 2.5 models bill their hidden "thinking" against the SAME
+#: max_tokens — flash kept getting cut even at 8192 (seen live modeling a
+#: fountain). Both 2.5 flash and pro accept 16384.
+TOKENS_BY_PROVIDER = {"gemini": 16384}
+
+#: The language a reply falls back to when the user's own cannot be told
+#: (a bare «ok»), by interface language.
+_LANGUAGE_NAMES = {
+    "es": "español", "en": "English", "de": "Deutsch", "fr": "français",
+    "id": "Bahasa Indonesia", "it": "italiano", "pl": "polski",
+    "pt-BR": "português do Brasil", "ru": "русский", "zh-CN": "简体中文",
+    "zh-TW": "繁體中文", "vi": "Tiếng Việt", "lo": "ລາວ", "th": "ไทย", "ja": "日本語", "ko": "한국어",
+    "ar": "العربية", "bg": "български",
+}
+
+
+def system_prompt(lang: str | None = None) -> str:
+    """The system prompt with the reply language: the one the user writes
+    in, falling back to the interface's. The prompt said «Conversas en
+    español», so it answered an English user in Spanish even after being
+    told not to (#790)."""
+    if lang is None:
+        from core.i18n import current_language
+        lang = current_language()
+    name = _LANGUAGE_NAMES.get(lang, "English")
+    return SYSTEM_PROMPT + (
+        "\n\nIDIOMA: responde SIEMPRE en el idioma en que escribe el "
+        f"usuario; si no se puede saber, en {name}. Vale también después "
+        "de recibir resultados o capturas: este prompt y los resultados "
+        "están en español, pero la conversación no.")
+
+
+#: The assistant's own voice and its one-block-per-reply contract; the
+#: modelling reference itself is shared with the MCP door (core.ai_recipes),
+#: so a new helper is taught once and both doors learn it.
+SYSTEM_PROMPT = "\n".join((
+    "Eres el asistente de modelado de IngeTrazo. " + ai_recipes.UNITS
+    + " Conversas breve y claro.",
+    """
+Para ACTUAR sobre el modelo incluye EXACTAMENTE UN bloque ```python por \
+respuesta. Tras cada bloque recibirás su resultado (stdout/errores y, si \
+está disponible, una captura del viewport) — revísalo e itera. Cuando el \
+pedido esté terminado, responde SIN bloque de código con un resumen corto. \
+SIN bloque no se ejecuta nada: nunca describas como hecho lo que no has \
+ejecutado.""".strip(),
+    ai_recipes.SCOPE,
+    ai_recipes.RECIPES,
+    ai_recipes.HOW_IT_RUNS.format(unit="bloque"),
+    """El código de tus recetas viejas se resume como "[receta ya \
+ejecutada]"; su efecto sigue en el modelo.
+
+Si el usuario adjunta una FOTO de un objeto (una fuente, un mueble, una \
+fachada): identifica sus partes y proporciones y recréalo por partes, cada \
+una como grupo con nombre. Una foto NO trae medidas: usa las que el usuario \
+dé y declara como supuesto toda dimensión que estimes de la imagen. Para \
+piezas torneadas (platos, columnas, jarrones) usa revolve(). Compara tus \
+capturas contra la foto e itera hasta que la silueta calce.""",
+))
+
+
+_BUILD_WORDS = ("dibuj", "crea", "haz", "hac", "modela", "constru", "añad",
+                "agreg", "pon", "gener", "diseñ", "levant", "arma", "traza",
+                "draw", "build", "make", "create", "add")
+
+
+def _asks_to_build(prompt: str) -> bool:
+    """Whether the user's message asks for something to be modelled (so a
+    reply without code is a model that did not do its job)."""
+    low = (prompt or "").lower()
+    return any(w in low for w in _BUILD_WORDS)
+
+
+#: Extensions the Photo button, drops and pastes accept as images.
+_IMG_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+
+
+def _drop_image(mime) -> str | None:
+    """The local image file in a drag or a paste, or None. A clipboard
+    bitmap (a screenshot) is not a url — callers check ``hasImage`` too."""
+    for url in mime.urls():
+        if url.isLocalFile() and url.toLocalFile().lower().endswith(_IMG_EXT):
+            return url.toLocalFile()
+    return None
+
+
+class PromptEdit(QPlainTextEdit):
+    """The prompt: several lines, Enter sends, Shift+Enter breaks a line.
+    ``text``/``setText`` as the one-line field it replaces had. An image
+    dragged in (or pasted from the clipboard) becomes a photo attachment,
+    not text."""
+    submitted = Signal()
+    #: A dropped image path (str) or a pasted bitmap (QImage).
+    imageDropped = Signal(object)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setTabChangesFocus(True)
+        line = self.fontMetrics().lineSpacing()
+        self.setMinimumHeight(2 * line + 12)
+
+    def keyPressEvent(self, ev) -> None:
+        if (ev.key() in (Qt.Key_Return, Qt.Key_Enter)
+                and not ev.modifiers() & (Qt.ShiftModifier
+                                          | Qt.ControlModifier)):
+            self.submitted.emit()
+            return
+        super().keyPressEvent(ev)
+
+    def text(self) -> str:
+        return self.toPlainText()
+
+    def setText(self, text: str) -> None:
+        self.setPlainText(text)
+
+    def dragEnterEvent(self, ev) -> None:
+        if _drop_image(ev.mimeData()):
+            ev.acceptProposedAction()
+            return
+        super().dragEnterEvent(ev)
+
+    def dragMoveEvent(self, ev) -> None:
+        if _drop_image(ev.mimeData()):
+            ev.acceptProposedAction()
+            return
+        super().dragMoveEvent(ev)
+
+    def dropEvent(self, ev) -> None:
+        path = _drop_image(ev.mimeData())
+        if path:
+            self.imageDropped.emit(path)
+            ev.acceptProposedAction()
+            return
+        super().dropEvent(ev)
+
+    def insertFromMimeData(self, source) -> None:
+        """Ctrl+V: an image (file or bitmap) attaches instead of pasting
+        its path as text."""
+        path = _drop_image(source)
+        if path:
+            self.imageDropped.emit(path)
+            return
+        if source.hasImage():
+            self.imageDropped.emit(source.imageData())
+            return
+        super().insertFromMimeData(source)
+
+
+class AsistentePanel(QWidget):
+    """The assistant as the «AI» tab of the side tray: the connection
+    settings fold away, the chat takes the rest of the height."""
+    _reply = Signal(object)     # object, not dict: queued dicts get COPIED
+
+    @property
+    def _viewport(self):
+        """The viewport of the project in front (projects in tabs, #1066):
+        the one handed in at setup may be a tab in the back, or closed."""
+        return self._live_viewport()
+
+    def __init__(self, viewport, parent=None) -> None:
+        super().__init__(parent)
+        from views.documents import live_viewport
+        self._live_viewport = live_viewport(viewport)
+        self._scope: dict = {"__name__": "__ai__"}
+        self._convo: list[dict] = []
+        #: OpenCode Go asks for a stable session id per conversation
+        #: (x-opencode-session); this panel's convo lives as long as it does.
+        self._session = uuid.uuid4().hex
+        #: Turn generation: bumped on every send and on Stop, so a reply
+        #: from an abandoned turn is discarded instead of landing late.
+        self._gen = 0
+        #: Sent photos, kept so a chat thumbnail can be clicked open again
+        #: (they live in the convo but only scaled JPEGs — enough to view).
+        self._fotos: list[tuple[QImage, str]] = []
+        self._busy = False
+        self._round = 0
+        self._failed = 0
+        self._nudged = False
+        self._local_warm = False    # a local server answered once already
+        self._last_prompt = ""
+        self._foto: tuple[str, str, str] | None = None  # (b64, mime, name)
+        self._reply.connect(self._on_reply, Qt.QueuedConnection)
+        self._build_ui()
+        self._load_settings()
+
+    # ---- UI -----------------------------------------------------------------
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 0)
+
+        conn = FoldSection(tr("AI Assistant — connection"),
+                           "ia/open_connection")
+        self._connection = conn
+        form = wrapping_form(conn.body)
+        self._provider = QComboBox()
+        self._provider.addItem(tr("Auto (by key prefix)"), "auto")
+        for prov in ai.PROVIDERS:
+            self._provider.addItem(ai.PROVIDER_INFO[prov][0], prov)
+        self._provider.currentIndexChanged.connect(self._on_provider_changed)
+        form.addRow(tr("Provider:"), self._provider)
+
+        self._key = QLineEdit()
+        self._key.setEchoMode(QLineEdit.Password)
+        self._key.setPlaceholderText(tr("empty = local AI (Ollama, LM Studio)"))
+        self._key.textChanged.connect(self._on_key_changed)
+        self._key.editingFinished.connect(self._save_settings)
+        form.addRow(tr("API key:"), self._key)
+
+        # The provider's key page, and above it, when the field is empty
+        # and the provider's variable is set, where the key comes from
+        # (#998) — one label, not a row more: the AI tab is the tallest of
+        # the tray, and a taller one grows a short window.
+        self._key_link = WrapLabel("")
+        self._key_link.setOpenExternalLinks(True)
+        form.addRow(self._key_link)
+
+        self._model = QComboBox()
+        self._model.setEditable(True)
+        self._model.setInsertPolicy(QComboBox.NoInsert)
+        self._model.lineEdit().setPlaceholderText(
+            tr("model (default per provider)"))
+        self._model.lineEdit().editingFinished.connect(self._save_settings)
+        # The combo lives in the bottom bar (added below), not folded
+        # inside the connection box — the model is switched too often to
+        # hide it away.
+
+        buttons = QHBoxLayout()
+        self._modelos = QPushButton(tr("Models"))
+        self._modelos.setToolTip(
+            tr("List the models your key can use"))
+        self._modelos.clicked.connect(self._on_modelos)
+        buttons.addWidget(self._modelos)
+        self._probar = QPushButton(tr("Test connection"))
+        self._probar.clicked.connect(self._on_probar)
+        buttons.addWidget(self._probar)
+        form.addRow(buttons)
+
+        self._ollama = QLineEdit("http://localhost:11434")
+        self._ollama.setToolTip(tr("Local AI server — Ollama: http://localhost:11434, LM Studio: http://localhost:1234 (key left empty)"))
+        self._ollama.editingFinished.connect(self._save_settings)
+        self._ollama_label = QLabel(tr("Server:"))
+        form.addRow(self._ollama_label, self._ollama)
+
+        self._shots = QCheckBox(tr("Send viewport screenshots to the model"))
+        self._shots.setChecked(True)
+        self._shots.toggled.connect(lambda _on: self._save_settings())
+        form.addRow(self._shots)
+        narrow(self._provider, self._model, self._key, self._ollama,
+               self._shots, self._modelos, self._probar)
+        layout.addWidget(conn)
+
+        # QTextBrowser (a read-only QTextEdit): emits anchorClicked so a
+        # sent photo's thumbnail opens full-size — QTextEdit alone swallows
+        # link clicks for itself.
+        self._chat = QTextBrowser()
+        self._chat.setOpenLinks(False)
+        self._chat.anchorClicked.connect(self._on_chat_link)
+        # A photo dropped on the chat attaches the same as one dropped on
+        # the prompt.
+        self._chat.installEventFilter(self)
+        # Inherit the application font. Asking fontconfig for the system
+        # FixedFont can crash inside the Flatpak sandbox (#279); naming
+        # another face would keep that lookup.
+        self._chat.setMinimumHeight(80)
+
+        # The prompt under the chat, with a handle between them to give it
+        # more room (Marco: «ese espacio es muy pequeño para un prompt»).
+        bottom = QWidget()
+        bl = QVBoxLayout(bottom)
+        bl.setContentsMargins(0, 0, 0, 0)
+        chip_row = QHBoxLayout()
+        # Attachment preview: the thumbnail alone carries the frame, and
+        # its × sits as a small circle on the top-right corner — the way
+        # chat apps draw it. A row-wide chip looked like a stray box.
+        self._foto_frame = QWidget()
+        self._foto_frame.setVisible(False)
+        self._foto_chip = QLabel(self._foto_frame)
+        self._foto_chip.move(0, 10)            # room for the circle above
+        self._foto_quitar = QPushButton("×", self._foto_frame)
+        self._foto_quitar.setFixedSize(18, 18)  # Latin-1: every font has it (#658)
+        self._foto_quitar.setToolTip(tr("Remove the photo"))
+        self._foto_quitar.clicked.connect(self._clear_foto)
+        chip_row.addWidget(self._foto_frame)
+        chip_row.addStretch(1)
+        bl.addLayout(chip_row)
+
+        self._input = PromptEdit()
+        self._input.setPlaceholderText(
+            tr("e.g. draw a 6×4 m house with a gable roof")
+            + "\n" + tr("Enter sends · Shift+Enter: new line · drag an "
+                        "image in or paste it"))
+        self._input.submitted.connect(self._on_send)
+        self._input.imageDropped.connect(self._on_drop_image)
+        bl.addWidget(self._input, 1)
+
+        # Working indicator: a one-line status plus an indeterminate bar,
+        # shown while a turn is in flight.
+        stat = QHBoxLayout()
+        self._status = QLabel("")
+        self._status.setVisible(False)
+        stat.addWidget(self._status)
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 0)                 # indeterminate
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(6)
+        self._bar.setVisible(False)
+        stat.addWidget(self._bar, 1)
+        bl.addLayout(stat)
+
+        split = QSplitter(Qt.Vertical)
+        split.setChildrenCollapsible(False)
+        split.addWidget(self._chat)
+        split.addWidget(bottom)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 1)
+        line = self._input.fontMetrics().lineSpacing()
+        split.setSizes([400, 6 * line + 16])
+        layout.addWidget(split, 1)
+
+        row3 = QHBoxLayout()
+        self._adjuntar = QPushButton(tr("Photo…"))
+        self._adjuntar.setToolTip(tr(
+            "Attach a photo — the model recreates what it shows "
+            "(give it the real measurements)"))
+        self._adjuntar.clicked.connect(self._on_foto)
+        row3.addWidget(self._adjuntar)
+        self._model.setToolTip(tr(
+            "Model — «Models» in the connection box lists what your key "
+            "can use"))
+        row3.addWidget(self._model, 1)
+        self._send = QPushButton(
+            self.style().standardIcon(QStyle.SP_ArrowForward), tr("Send"))
+        self._send.clicked.connect(self._on_send_clicked)
+        row3.addWidget(self._send)
+        layout.addLayout(row3)
+        self._clear_foto()
+        self._style_widgets()
+
+    def _style_widgets(self) -> None:
+        """Chrome polish — real stylesheets on the widgets (the chat's
+        rich text supports no CSS worth the name). theme_style re-applies
+        on every theme/accent change, so nothing hardcodes a shade."""
+        # Note: templates go through str.format — CSS braces double up,
+        # only {accent_rgb}/{muted} stay single.
+        theme_style(self._input,
+                    "QPlainTextEdit{{border:1px solid "
+                    "rgba({accent_rgb},0.4); border-radius:8px; "
+                    "padding:6px;}}")
+        theme_style(self._send,
+                    "QPushButton{{background:rgb({accent_rgb}); color:#fff;"
+                    " border:none; border-radius:6px; padding:5px 16px;"
+                    " font-weight:600;}}"
+                    "QPushButton:pressed{{background:rgba({accent_rgb},"
+                    "0.7);}}")
+        theme_style(self._bar,
+                    "QProgressBar{{border:none; background:"
+                    "rgba({accent_rgb},0.18); border-radius:3px;}}"
+                    "QProgressBar::chunk{{background:rgb({accent_rgb});"
+                    " border-radius:3px;}}")
+        theme_style(self._status, "color:{muted}; font-style:italic;")
+        theme_style(self._foto_chip,
+                    "QLabel{{border:1px solid rgba({accent_rgb},0.45);"
+                    " border-radius:6px;}}")
+        theme_style(self._foto_quitar,
+                    "QPushButton{{background:rgb({accent_rgb}); color:#fff;"
+                    " border:none; border-radius:9px; font-weight:700;}}"
+                    "QPushButton:pressed{{background:rgba({accent_rgb},"
+                    "0.7);}}")
+        theme_style(self._model,
+                    "QComboBox{{border:1px solid rgba({accent_rgb},0.4);"
+                    " border-radius:6px; padding:3px 8px;}}")
+
+    def focus_input(self) -> None:
+        self._input.setFocus(Qt.ShortcutFocusReason)
+
+    def _chat_colors(self) -> dict:
+        """Text and bubble colors that read on the CURRENT theme —
+        hardcoded light-theme grays vanish on a dark chat background
+        (user report). The user's bubble takes the configured accent."""
+        dark = self.palette().color(QPalette.ColorRole.Base).lightness() < 128
+        accent = accent_color()
+        on_accent = "#1a202c" if accent.lightness() > 160 else "#ffffff"
+        if dark:
+            return {"user": "#7ab7ff", "ai": "#e8eaed", "muted": "#9aa5b1",
+                    "ok": "#7ce0a3", "err": "#ff8f8f",
+                    "user_bg": accent.name(), "user_fg": on_accent,
+                    "ai_bg": "#30363b", "ai_fg": "#e8eaed",
+                    "stripe": accent.name()}
+        return {"user": "#2b6cb0", "ai": "#1a202c", "muted": "#718096",
+                "ok": "#2f855a", "err": "#c53030",
+                "user_bg": accent.name(), "user_fg": on_accent,
+                "ai_bg": "#e4e8ec", "ai_fg": "#1a202c",
+                "stripe": accent.name()}
+
+    def _append(self, text: str, role: str) -> None:
+        c = self._chat_colors()
+        if role in ("user", "ai"):
+            # Speech bubbles: the user on the right in the accent colour,
+            # the IA on the left with a thin accent edge — who's talking
+            # reads at a glance. Qt rich text has no border-radius, so a
+            # stripe cell is the polish a rounded corner can't do.
+            side = "right" if role == "user" else "left"
+            bg = c["user_bg"] if role == "user" else c["ai_bg"]
+            fg = c["user_fg"] if role == "user" else c["ai_fg"]
+            body = _esc(text).replace("\n", "<br>")
+            stripe = (f'<td width="3" bgcolor="{c["stripe"]}"></td>'
+                      if role == "ai" else "")
+            self._chat.append(
+                f'<table align="{side}" width="78%" border="0" '
+                f'cellspacing="0" cellpadding="8"><tr>{stripe}'
+                f'<td bgcolor="{bg}"><font color="{fg}">{body}</font></td>'
+                f'</tr></table>')
+        else:
+            body = _esc(text)
+            if role == "muted":
+                body = f"<i>{body}</i>"      # system chatter reads smaller
+            self._chat.append(
+                f'<pre style="color:{c[role]}; white-space:pre-wrap; '
+                f'margin:2px">{body}</pre>')
+        self._chat.verticalScrollBar().setValue(
+            self._chat.verticalScrollBar().maximum())
+
+    def _append_foto(self, b64: str, mime: str, name: str) -> None:
+        """A sent photo as its own right-side bubble: the thumbnail the
+        model received (the scaled JPEG), clickable to reopen it. The image
+        rides as a QTextDocument resource — ``data:`` URLs are not read."""
+        img = QImage.fromData(base64.b64decode(b64))
+        if img.isNull():
+            self._append(f"[📷 {name}]", "user")
+            return
+        idx = len(self._fotos)
+        self._fotos.append((img, name))
+        self._chat.document().addResource(
+            QTextDocument.ImageResource, QUrl(f"foto:{idx}"), img)
+        c = self._chat_colors()
+        self._chat.append(
+            f'<table align="right" border="0" cellspacing="0" '
+            f'cellpadding="7"><tr><td bgcolor="{c["user_bg"]}">'
+            f'<a href="foto:{idx}"><img src="foto:{idx}" width="180"></a>'
+            f'<br><font size="-1" color="{c["user_fg"]}">{_esc(name)}</font>'
+            f'</td></tr></table>')
+        self._chat.verticalScrollBar().setValue(
+            self._chat.verticalScrollBar().maximum())
+
+    def _on_chat_link(self, url: QUrl) -> None:
+        """A clicked chat thumbnail opens the sent photo full-size."""
+        s = url.toString()
+        if not s.startswith("foto:"):
+            return
+        try:
+            img, name = self._fotos[int(s[5:])]
+        except (ValueError, IndexError):
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(name)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel()
+        screen = self.screen()
+        if screen is not None:
+            avail = screen.availableSize()
+            img = img.scaled(int(avail.width() * 0.85),
+                             int(avail.height() * 0.85),
+                             Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        lbl.setPixmap(QPixmap.fromImage(img))
+        lay.addWidget(lbl)
+        dlg.exec()
+
+    # ---- Settings -----------------------------------------------------------
+    def _settings(self) -> QSettings:
+        return QSettings()
+
+    def _load_settings(self) -> None:
+        self._loading = True
+        try:
+            self._read_settings()
+        finally:
+            self._loading = False
+
+    def _read_settings(self) -> None:
+        st = self._settings()
+        self._key.setText(str(st.value("ia/api_key", "") or ""))
+        self._model.setEditText(str(st.value("ia/modelo", "") or ""))
+        self._ollama.setText(str(st.value("ia/ollama_url",
+                                          "http://localhost:11434") or ""))
+        self._shots.setChecked(str(st.value("ia/capturas", "1")) != "0")
+        stored = str(st.value("ia/proveedor", "auto") or "auto")
+        idx = self._provider.findData(stored)
+        if idx >= 0:
+            self._provider.setCurrentIndex(idx)
+        self._on_key_changed()
+
+    def _save_settings(self) -> None:
+        if getattr(self, "_loading", False):
+            return
+        st = self._settings()
+        st.setValue("ia/api_key", self._key.text())
+        st.setValue("ia/modelo", self._model.currentText().strip())
+        st.setValue("ia/ollama_url", self._ollama.text().strip())
+        st.setValue("ia/capturas", "1" if self._shots.isChecked() else "0")
+        st.setValue("ia/proveedor", self._provider.currentData())
+        self._stash_credentials(st, self._provider.currentData())
+
+    def _stash_credentials(self, st: QSettings, slot) -> None:
+        """Remember the current key/model under the provider they belong
+        to (detected by prefix when the combo is on Auto). Empty fields
+        never clobber a stored value."""
+        key = self._key.text().strip()
+        provider = (slot if slot not in (None, "auto")
+                    else ai.detect_provider(key))
+        if provider == "ollama":
+            return
+        if key:
+            st.setValue(f"ia/claves/{provider}", self._key.text())
+        model = self._model.currentText().strip()
+        if model:
+            st.setValue(f"ia/modelos/{provider}", model)
+
+    def _on_provider_changed(self) -> None:
+        """EACH provider keeps its own key and model: pasting the Gemini
+        key must not erase the Groq one (user report) — running out of
+        tokens on one plan and switching has to be two clicks."""
+        st = self._settings()
+        self._stash_credentials(st, getattr(self, "_prov_slot", None))
+        cur = self._provider.currentData()
+        self._prov_slot = cur
+        if cur and cur != "auto":
+            self._key.setText(str(st.value(f"ia/claves/{cur}", "") or ""))
+            self._model.clear()      # the fetched model list is per provider
+            self._model.setEditText(
+                str(st.value(f"ia/modelos/{cur}", "") or ""))
+        self._on_key_changed()
+
+    def _effective_provider(self) -> str:
+        chosen = self._provider.currentData()
+        if chosen and chosen != "auto":
+            return chosen
+        return ai.detect_provider(self._key.text().strip())
+
+    def _on_key_changed(self) -> None:
+        provider = self._effective_provider()
+        label, url = ai.PROVIDER_INFO[provider]
+        if provider == "ollama":
+            link = tr(
+                "Local models — install from <a href='{url}'>{url}</a>",
+                url=url)
+        else:
+            link = tr(
+                "{name} — get your key at <a href='{url}'>{url}</a>",
+                name=label, url=url)
+        note = env_key_note(self._provider.currentData(),
+                            self._key.text().strip())
+        self._key_link.setText(
+            f"{html.escape(note)}<br>{link}" if note else link)
+        self._model.lineEdit().setPlaceholderText(
+            ai.DEFAULT_MODELS[provider])
+        self._ollama.setVisible(provider == "ollama")
+        self._ollama_label.setVisible(provider == "ollama")
+        self._key.setPlaceholderText(
+            key_placeholder(self._provider.currentData()))
+
+    def _env_key(self) -> tuple[str, str] | None:
+        """``(variable, key)`` the environment lends when the field is
+        empty (#998). Only for a provider picked by name: on Auto an empty
+        field means the local server, and an ``OPENAI_API_KEY`` exported
+        for some other program must not send the chat to the cloud."""
+        if self._key.text().strip():
+            return None
+        return ai.env_key(self._effective_provider())
+
+    def _config(self) -> tuple[str, str, str, str]:
+        key = self._key.text().strip()
+        if not key:
+            env = self._env_key()
+            key = env[1] if env else ""
+        provider = self._effective_provider()
+        model = (self._model.currentText().strip()
+                 or ai.DEFAULT_MODELS[provider])
+        return provider, model, key, self._ollama.text().strip()
+
+    def _on_modelos(self) -> None:
+        if self._busy:
+            return
+        self._save_settings()
+        provider, _model, key, ollama = self._config()
+        self._append(tr("Fetching the model list from {name}…",
+                        name=ai.PROVIDER_INFO[provider][0]), "muted")
+        self._modelos.setEnabled(False)
+
+        def worker() -> None:
+            try:
+                models = ai.list_models(provider, key, ollama)
+                self._reply.emit({"modelos": True, "ok": True,
+                                  "models": models})
+            except Exception as exc:  # noqa: BLE001 — shown in the chat
+                self._reply.emit({"modelos": True, "ok": False,
+                                  "msg": str(exc)})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _missing_key_hint(self, provider: str, key: str) -> str | None:
+        """The plain-words message for a hosted provider with no key, or
+        None when there is nothing to say. Rafael picked «Groq (gratis)»,
+        left the key empty and Test connection answered with Groq's raw
+        ``HTTP 401 {"error":{"message":"Invalid API Key"…`` (Revisión 3,
+        2026-09-20). A missing key is known BEFORE any network round trip,
+        and the fix is one sentence, not a JSON blob."""
+        if key or provider == "ollama":
+            return None
+        label, url = ai.PROVIDER_INFO[provider]
+        hint = tr(
+            "{name} needs an API key — the quota is free, the key is not "
+            "optional. Create one at {url} (the link under the key field "
+            "opens it) and paste it in the \"API key\" field — it is saved "
+            "in your user profile, never in the document.", name=label,
+            url=url)
+        env_vars = ai.ENV_KEYS.get(provider)
+        if env_vars:
+            hint += tr(" Or define {var} in the environment and restart "
+                       "IngeTrazo.", var=env_vars[0])
+        return hint
+
+    @staticmethod
+    def _bad_key_hint(provider: str, err: str) -> str | None:
+        """A rejected key (HTTP 401/403, or the providers' own wording),
+        translated into what to check."""
+        low = (err or "").lower()
+        if not ("401" in low or "403" in low or "invalid api key" in low
+                or "invalid_api_key" in low or "incorrect api key" in low
+                or "invalid x-api-key" in low or "api key not valid" in low
+                or "authentication" in low):
+            return None
+        label, url = ai.PROVIDER_INFO.get(provider, ("", ""))
+        prefixes = {"groq": "gsk_", "anthropic": "sk-ant-", "gemini": "AIza",
+                    "openrouter": "sk-or-", "opencode": "oc_sk_",
+                    "openai": "sk-"}
+        pre = prefixes.get(provider)
+        tail = (tr(" A {name} key starts with «{prefix}».", name=label,
+                   prefix=pre) if pre else "")
+        return tr(
+            "{name} rejected the key. Check it was pasted whole, with no "
+            "spaces, and that it belongs to this provider — or create a new "
+            "one at {url}.", name=label, url=url) + tail
+
+    def _on_probar(self) -> None:
+        if self._busy:
+            return
+        self._save_settings()
+        provider, model, key, ollama = self._config()
+        hint = self._missing_key_hint(provider, key)
+        if hint is not None:
+            self._append(hint, "err")
+            return
+        self._append(tr("Testing {name} ({model})…",
+                        name=ai.PROVIDER_INFO[provider][0], model=model),
+                     "muted")
+        self._probar.setEnabled(False)
+        self._warn_local_load(provider, model)
+
+        def worker() -> None:
+            ok, msg = ai.probar_conexion(provider, model, key, ollama)
+            self._reply.emit({"probar": True, "ok": ok, "msg": msg})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---- Photo attachment ---------------------------------------------------
+    #: Longest edge a photo is scaled down to before upload. Enough detail
+    #: to read shapes; the convo is resent EVERY turn, so size compounds.
+    FOTO_MAX_EDGE = 1280
+
+    def _on_foto(self) -> None:
+        path, _f = file_dialogs.getOpenFileName(
+            self, tr("Attach a photo"), "",
+            tr("Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)"
+               ";;All files (*)"))
+        if path:
+            self._attach_photo(path)
+
+    def _attach_photo(self, path: str) -> None:
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)      # phone photos carry EXIF rotation
+        image = reader.read()
+        if image.isNull():
+            self._append(tr("Could not read the image."), "err")
+            return
+        # Path(...).name, not a split on "/": a native Windows path
+        # (drag-and-drop, a pasted path) put its whole "C:\..." in the chip.
+        from pathlib import Path
+        self._attach_image(image, Path(path).name)
+
+    def _attach_image(self, image, name: str) -> None:
+        """Attach a QImage (from a file, a drag&drop or a pasted clipboard
+        bitmap) and show its thumbnail chip above the prompt."""
+        self._foto = (*self._encode_image(image), name)
+        # Square 80×80 chip, centre-cropped like a phone-gallery
+        # thumbnail — scaling by height left landscape shots too wide.
+        thumb = QPixmap.fromImage(image).scaled(
+            80, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        if thumb.width() > 80 or thumb.height() > 80:
+            thumb = thumb.copy((thumb.width() - 80) // 2,
+                               (thumb.height() - 80) // 2, 80, 80)
+        self._foto_chip.setPixmap(thumb)
+        self._foto_chip.setFixedSize(thumb.size())
+        self._foto_chip.setToolTip(name)
+        # Frame = thumb + a ledge for the circle: it overlaps the corner
+        # by 8 px instead of floating off in the margin.
+        self._foto_frame.setFixedSize(thumb.width() + 10,
+                                      thumb.height() + 10)
+        self._foto_quitar.move(thumb.width() - 8, 0)
+        self._foto_frame.setVisible(True)
+        self._append(tr(
+            "Photo attached: {name} — it goes with your next message. "
+            "Include the real measurements: a photo has none.", name=name),
+            "muted")
+
+    def _on_drop_image(self, payload) -> None:
+        """imageDropped: a str path (dragged file) or a bitmap (pasted
+        clipboard image)."""
+        if isinstance(payload, QPixmap):
+            payload = payload.toImage()
+        if isinstance(payload, QImage):
+            self._attach_image(payload, tr("pasted image"))
+        else:
+            self._attach_photo(str(payload))
+
+    def _encode_photo(self, path: str) -> tuple[str, str] | None:
+        """(base64, mime) of the photo at ``path``, or None when it is not
+        a readable image."""
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)      # phone photos carry EXIF rotation
+        image = reader.read()
+        if image.isNull():
+            return None
+        return self._encode_image(image)
+
+    def _encode_image(self, image) -> tuple[str, str]:
+        """(base64, mime) of ``image``, EXIF-rotated already, scaled down
+        to FOTO_MAX_EDGE, re-encoded as JPEG (a photo as PNG is ~10× the
+        bytes, and the payload rides on every later turn)."""
+        if max(image.width(), image.height()) > self.FOTO_MAX_EDGE:
+            if image.width() >= image.height():
+                image = image.scaledToWidth(
+                    self.FOTO_MAX_EDGE, Qt.SmoothTransformation)
+            else:
+                image = image.scaledToHeight(
+                    self.FOTO_MAX_EDGE, Qt.SmoothTransformation)
+        buf = QBuffer()
+        buf.open(QIODevice.WriteOnly)
+        image.save(buf, "JPEG", 85)
+        return base64.b64encode(bytes(buf.data())).decode(), "image/jpeg"
+
+    def _clear_foto(self) -> None:
+        self._foto = None
+        self._foto_chip.clear()
+        self._foto_frame.setVisible(False)
+
+    def eventFilter(self, obj, ev) -> bool:
+        # A photo dropped on the chat attaches — the input is a small
+        # target, the chat is the big one.
+        if obj is self._chat and ev.type() in (
+                QEvent.DragEnter, QEvent.DragMove, QEvent.Drop):
+            path = _drop_image(ev.mimeData())
+            if path:
+                if ev.type() == QEvent.Drop:
+                    self._attach_photo(path)
+                ev.acceptProposedAction()
+                return True
+        return super().eventFilter(obj, ev)
+
+    # ---- Chat loop ----------------------------------------------------------
+    def _on_send(self) -> None:
+        if self._busy:
+            return
+        prompt = self._input.text().strip()
+        if not prompt:
+            return
+        provider, _model, key, _ollama = self._config()
+        hint = self._missing_key_hint(provider, key)
+        if hint is not None:
+            self._append(hint, "err")     # the prompt stays in the box
+            return
+        self._input.clear()
+        self._save_settings()
+        self._append(prompt, "user")
+        message: dict = {"role": "user", "text": prompt}
+        if self._foto is not None:
+            b64, mime, name = self._foto
+            message["image_b64"] = b64
+            message["image_mime"] = mime
+            self._append_foto(b64, mime, name)
+            provider, model = self._config()[:2]
+            if not ai.supports_vision(provider, model):
+                self._append(tr(
+                    "Heads-up: {model} has no vision, so the photo will "
+                    "NOT be sent — it is kept, and flows again when you "
+                    "switch to a vision model (Anthropic, OpenAI, Gemini, "
+                    "OpenRouter, or a vision OpenCode Go model like "
+                    "glm-5.3-flash or kimi-k3).", model=model), "muted")
+            self._clear_foto()
+        self._convo.append(message)
+        self._round = 0
+        self._failed = 0
+        self._nudged = False
+        self._last_prompt = prompt
+        self._gen += 1
+        self._next_turn()
+
+    def _on_send_clicked(self) -> None:
+        """The one button swaps job while the model works: Send → Stop."""
+        if self._busy:
+            self._on_stop()
+        else:
+            self._on_send()
+
+    def _on_stop(self) -> None:
+        """The HTTP turn in flight cannot be killed mid-socket: bump the
+        generation so its reply is discarded on arrival (``_on_reply``
+        drops stale ``gen``) and free the UI right away."""
+        self._gen += 1
+        self._append(tr("Stopped — the answer in flight is discarded."),
+                     "muted")
+        self._finish()
+
+    def _next_turn(self) -> None:
+        self._busy = True
+        self._send.setText(tr("Stop"))
+        self._send.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+        self._status.setText(tr("thinking…"))
+        self._status.setVisible(True)
+        self._bar.setVisible(True)
+        gen = self._gen
+        provider, model, key, ollama = self._config()
+        self._warn_local_load(provider, model)
+        convo = ai.compact_messages(ai.slim_messages(
+            self._convo, vision=ai.supports_vision(provider, model)))
+
+        budget = TOKENS_BY_PROVIDER.get(provider, MAX_TOKENS)
+
+        def on_retry(n, total, wait, reason) -> None:
+            # A busy provider (Gemini's 503 «high demand»): say so and
+            # wait, instead of ending the recipe at the walls.
+            self._reply.emit({"retry": True, "n": n, "total": total,
+                              "wait": wait, "reason": reason, "gen": gen})
+
+        prompt = system_prompt()
+
+        def worker() -> None:
+            try:
+                text = ai.chat(provider, model, key, prompt, convo,
+                               ollama_url=ollama, max_tokens=budget,
+                               on_retry=on_retry, session_id=self._session)
+                self._reply.emit({"ok": True, "text": text, "gen": gen})
+            except Exception as exc:  # noqa: BLE001 — shown in the chat
+                self._reply.emit({"ok": False, "error": str(exc),
+                                  "gen": gen})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_reply(self, msg: dict) -> None:
+        if msg.get("gen") is not None and msg["gen"] != self._gen:
+            return          # a stopped turn's late reply — discard
+        if msg.get("retry"):
+            reason = str(msg.get("reason", ""))
+            short = reason.split(":", 1)[0]
+            status = tr(
+                "The provider is busy ({why}) — retry {n} of {total} in {wait} s…",
+                why=short, n=msg.get("n"), total=msg.get("total"),
+                wait=int(msg.get("wait", 0)))
+            self._status.setText(status)
+            self._append(status, "muted")
+            return
+        if msg.get("modelos"):
+            self._modelos.setEnabled(True)
+            if msg.get("ok"):
+                models = msg.get("models") or []
+                current = self._model.currentText()
+                self._model.clear()
+                self._model.addItems(models)
+                self._model.setEditText(current)
+                self._append(tr(
+                    "{n} models available to your key — pick one from "
+                    "the list.", n=len(models)), "ok")
+                self._model.showPopup()
+            else:
+                self._append(tr("Could not list models: {err}",
+                                err=msg.get("msg")), "err")
+            return
+        if msg.get("probar"):
+            self._probar.setEnabled(True)
+            if msg.get("ok"):
+                self._local_warm = True
+                self._append(tr("Connection OK — the model answered."),
+                             "ok")
+            else:
+                self._append(tr("Connection failed: {err}",
+                                err=msg.get("msg")), "err")
+                bad = self._bad_key_hint(self._effective_provider(),
+                                         str(msg.get("msg")))
+                if bad is not None:
+                    env = self._env_key()
+                    if env:            # nothing in the field to look at
+                        bad += tr(" The key came from the {var} "
+                                  "environment variable.", var=env[0])
+                    self._append(bad, "err")
+                if "model_not_found" in str(msg.get("msg")):
+                    self._append(tr(
+                        'That model no longer exists for your key — press '
+                        '"Models" to list the available ones.'), "err")
+            return
+        if not msg.get("ok"):
+            self._append(tr("Error: {err}", err=msg.get("error")), "err")
+            self._finish()
+            return
+        self._local_warm = True
+        text = ai.strip_thoughts(msg["text"])
+        self._convo.append({"role": "assistant", "text": text})
+        self._append(text, "ai")
+        code = ai.extract_code(text)
+        if code is None and ai.truncated_code(text):
+            # Cut by max_tokens mid-recipe: half a block must neither run
+            # nor end the loop silently — ask for a smaller, complete one.
+            if self._round < MAX_ROUNDS:
+                self._round += 1
+                self._append(tr("The reply was cut off mid-code — asking "
+                                "for a shorter, complete block."), "muted")
+                self._convo.append({"role": "user", "text":
+                    "Tu respuesta se cortó a mitad del bloque ```python "
+                    "(límite de tokens). NO continúes donde quedaste: "
+                    "reenvía UN bloque completo y más corto, avanzando "
+                    "solo la primera parte del trabajo; el resto irá en "
+                    "turnos siguientes."})
+                self._next_turn()
+                return
+            self._append(tr('The reply was cut off and the step limit is '
+                            'used up — type "continue" to keep going.'),
+                         "err")
+            self._finish()
+            return
+        if code is not None and self._round >= MAX_ROUNDS:
+            # A recipe arrived but the budget for ONE request is spent:
+            # never swallow it silently — the convo survives, so any new
+            # message (e.g. "continúa") picks up exactly here.
+            self._append(tr('Step limit reached for one request '
+                            '({n}) — type "continue" to keep going.',
+                            n=MAX_ROUNDS), "muted")
+            self._finish()
+            return
+        if code is None:
+            if self._round == 0 and not self._nudged and _asks_to_build(
+                    self._last_prompt) and "?" not in text[-80:]:
+                # A model that narrates a build it never sent (Groq's
+                # compound answered «se añadió una cumbrera…» with no
+                # block, Marco 2026-09-15): one push, then let it be.
+                self._nudged = True
+                self._append(tr("No code came back — asking for the recipe."),
+                             "muted")
+                self._convo.append({"role": "user", "text":
+                    "No incluiste ningún bloque ```python: NADA se ejecutó "
+                    "y el modelo no cambió. Escribe ahora la receta completa "
+                    "en UN bloque ```python (sin describirla antes)."})
+                self._next_turn()
+                return
+            self._finish()
+            return
+        self._round += 1
+        result = ai.run_transactional(self._viewport, code, self._scope)
+        summary = []
+        if result["stdout"]:
+            out = result["stdout"].rstrip()
+            if len(out) > 1500:      # a print-happy recipe rides EVERY turn
+                out = out[:700] + "\n… (recortado) …\n" + out[-700:]
+            summary.append(out)
+        self._failed = self._failed + 1 if result["error"] else 0
+        if result["error"]:
+            summary.append("ERROR (todo revertido): " + str(result["error"]))
+            if result["stderr"]:
+                summary.append(result["stderr"].rstrip()[-800:])
+        summary.append(f"(cambió el modelo: {result['changed']})")
+        feedback = "Resultado de la ejecución:\n" + "\n".join(summary)
+        self._append(feedback, "muted")
+        provider, model = self._config()[:2]
+        shot = None
+        # Only shoot when the model CHANGED: after an error or an
+        # inspect-only block the previous screenshot is still accurate
+        # (slim_messages keeps the latest one in the convo).
+        if (self._shots.isChecked() and result["changed"]
+                and ai.supports_vision(provider, model)):
+            shot = self._screenshot_b64()
+        self._convo.append({"role": "user", "text": feedback,
+                            **({"image_png_b64": shot} if shot else {})})
+        if self._failed >= MAX_FAILED_ROUNDS:
+            # The error is already in the convo: «continúa» (or a clearer
+            # request) picks up from here with the model knowing why.
+            self._append(tr('{n} attempts in a row failed — stopping here. '
+                            'Rephrase the request or type "continue" to '
+                            'let it try again.', n=self._failed), "err")
+            if ai.small_local_model(provider, model):
+                self._append(self._small_model_hint(model), "muted")
+            self._finish()
+            return
+        self._next_turn()
+
+    def _warn_local_load(self, provider: str, model: str) -> None:
+        """Ollama loads the model into memory on the first request — tens
+        of seconds of silence that read as a hang (#461). The first time,
+        also say if the model is too small to write recipes."""
+        if provider != "ollama" or self._local_warm:
+            return
+        self._append(tr("The local server is loading the model — the "
+                        "first answer takes longer."), "muted")
+        if ai.small_local_model(provider, model):
+            self._append(self._small_model_hint(model), "muted")
+
+    def _small_model_hint(self, model: str) -> str:
+        return tr("{model} is a small model and often fails at writing "
+                  "code. A code model works much better, e.g. {suggested} "
+                  "(ollama pull {suggested}).", model=model,
+                  suggested=ai.DEFAULT_MODELS["ollama"])
+
+    def _finish(self) -> None:
+        self._busy = False
+        self._send.setEnabled(True)
+        self._send.setText(tr("Send"))
+        self._send.setIcon(self.style().standardIcon(QStyle.SP_ArrowForward))
+        self._status.setVisible(False)
+        self._bar.setVisible(False)
+
+    def _screenshot_b64(self) -> str | None:
+        try:
+            # 640 px JPEG: the model reads a screenshot fine at that size
+            # and it costs a quarter of the 768 px PNG it used to be —
+            # the screenshot is the fattest thing in every turn.
+            image = self._viewport.render_image(640, 427)
+            buf = QBuffer()
+            buf.open(QIODevice.WriteOnly)
+            image.save(buf, "JPEG", 72)
+            return base64.b64encode(bytes(buf.data())).decode()
+        except Exception:  # noqa: BLE001 — vision is best-effort
+            return None
+
+
+def key_placeholder(chosen, environ=None) -> str:
+    """What an empty key field means for the provider combo's data: the
+    local server only on Auto and Local — with Anthropic picked, «empty =
+    local AI» was wrong (#998 review)."""
+    if not chosen or chosen in ("auto", "ollama"):
+        return tr("empty = local AI (Ollama, LM Studio)")
+    env = ai.env_key(chosen, environ)
+    if env:
+        return tr("empty = {var} from the environment", var=env[0])
+    return tr("paste your {name} key", name=ai.PROVIDER_INFO[chosen][0])
+
+
+def env_key_note(chosen, key: str, environ=None) -> str:
+    """The line under an EMPTY key field when the environment has a key
+    (#998), "" otherwise. ``chosen`` is the provider combo's data: a
+    provider by name uses its variable; on Auto the field stays the local
+    server, so the note only says which provider to pick. Shared with the
+    Preferences dialog."""
+    if key:
+        return ""
+    if chosen and chosen != "auto":
+        env = ai.env_key(chosen, environ)
+        return (tr("Using {var} from the environment", var=env[0])
+                if env else "")
+    for prov in ai.PROVIDERS:
+        env = ai.env_key(prov, environ)
+        if env:
+            return tr("{var} is set in the environment — choose {name} as "
+                      "the provider to use it", var=env[0],
+                      name=ai.PROVIDER_INFO[prov][0])
+    return ""
+
+
+def _esc(text: str) -> str:
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+#: The tests and older code name it by its dialog-era name.
+AsistenteDialog = AsistentePanel
+
+
+def setup(app) -> None:
+    """The «AI» tab of the side tray (shared with the MCP bridge) and
+    Extensions ▸ AI Assistant (Ctrl+Shift+A), which brings the tab
+    forward — shown again if it was hidden — with the cursor in the input."""
+    panel = AsistentePanel(app.viewport)
+    dock = app.add_panel(tr("AI"), panel, panel="ai", stretch=1)
+    app.window._ai_assistant = panel
+
+    def summon() -> None:
+        app.show_panel(dock)
+        panel.focus_input()
+
+    app.add_menu_action(tr("AI Assistant"), summon, "Ctrl+Shift+A", tr(
+        "Open a chat with an AI that can read and change the model."))

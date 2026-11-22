@@ -1,0 +1,96 @@
+# IngeTrazo snap — strict confinement, wrapping the PyInstaller bundle.
+#
+# The CI (release.yml, job "snap") stages this template with @VERSION@
+# substituted, drops the onedir bundle in ./payload and the desktop entry
+# in snap/gui/, then snapcore/action-build packs it. The bundle carries its
+# own Qt; the stage-packages below cover exactly what the bundle EXPECTS
+# from the host (libX11 and friends are excluded from the bundle since the
+# NVIDIA fix — inside a snap "the host" is core22 plus these packages) plus
+# GL dispatch and fonts, which a bare core22 lacks.
+name: ingetrazo
+base: core22
+version: "@VERSION@"
+title: IngeTrazo
+summary: Traza como a mano — modelador 3D libre para arquitectura e ingeniería
+description: |
+  IngeTrazo (se lee in-je-TRA-so: ingeniería + trazo) es un modelador 3D
+  libre (GPL-3.0) para arquitectura, ingeniería civil e impresión 3D, en
+  español, para trazar como a mano. Abre archivos .skp con su propio lector
+  libre (openskp), así que los modelos de tu equipo se importan sin
+  conversiones ni peajes.
+
+  Lo que trae:
+
+  - Modelado que se siente a mano: empujar/tirar, sígueme, grupos y componentes,
+    inferencias y medidas exactas por teclado.
+  - Sombras con la posición real del sol por geolocalización, fecha y hora:
+    estudios de asoleamiento como entregable de obra.
+  - Secciones con relleno, láminas listas para imprimir y estilos de
+    presentación.
+  - Importa SKP, DXF, DWG, DAE, OBJ, GLB y STL; exporta DXF, DAE, OBJ, GLB, STL e IFC.
+  - Terreno georreferenciado con mapa base, curvas y perfiles.
+  - Etiquetado BIM (IFC) con metrados en vivo, rumbo al presupuesto.
+  - Biblioteca de componentes y materiales, incluida la malla cocada para
+    cercos.
+
+  Parte del ecosistema IngePresupuestos: terreno → trazo → BIM →
+  presupuesto.
+
+  IngeTrazo (pronounced EEN-heh-TRAH-soh, "the engineer's stroke") is a free,
+  open-source 3D modeler to draw as if by hand. It opens .skp files
+  with its own free reader (openskp), and brings push/pull modeling, real-sun
+  shadow studies, sections, print sheets, DXF/DWG import and BIM (IFC)
+  tagging. Spanish-first UI, English available.
+
+  IngeTrazo is an independent project, written from scratch and not
+  affiliated with any other software vendor.
+license: GPL-3.0-or-later
+website: https://ingetrazo.com
+contact: https://github.com/ingelibre/ingetrazo/issues
+source-code: https://github.com/ingelibre/ingetrazo
+issues: https://github.com/ingelibre/ingetrazo/issues
+grade: stable
+confinement: strict
+
+apps:
+  ingetrazo:
+    command: opt/ingetrazo/ingetrazo
+    plugs:
+      - opengl
+      - x11
+      - wayland
+      - desktop
+      - desktop-legacy
+      - home
+      - network
+      - removable-media
+    environment:
+      # xcb (X11/XWayland) for the first snap iteration: stable everywhere.
+      # Native Wayland inside strict confinement is a later refinement.
+      QT_QPA_PLATFORM: xcb
+      FONTCONFIG_PATH: $SNAP/etc/fonts
+
+parts:
+  bundle:
+    plugin: dump
+    source: payload
+    override-build: |
+      mkdir -p "$CRAFT_PART_INSTALL/opt/ingetrazo"
+      cp -a "$CRAFT_PART_SRC/." "$CRAFT_PART_INSTALL/opt/ingetrazo/"
+      # never ship openskp's SDK-written blank template (see ingetrazo.spec)
+      find "$CRAFT_PART_INSTALL" -type d -name _scaffold -path '*openskp*' -prune -exec rm -rf {} +
+    stage-packages:
+      - libgl1
+      - libegl1
+      - libopengl0
+      - libx11-6
+      - libx11-xcb1
+      - libxcb-glx0
+      - libxkbcommon-x11-0
+      - libxcb-cursor0
+      - libxcb-icccm4
+      - libxcb-keysyms1
+      - libxcb-shape0
+      - libfontconfig1
+      - fontconfig-config
+      - fonts-dejavu-core

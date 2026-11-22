@@ -1,0 +1,802 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.ingetrazo.IngeTrazo</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>IngeTrazo</name>
+  <summary>Draw as if by hand: free 3D modeler for architecture and engineering</summary>
+  <summary xml:lang="es">Traza como a mano: modelador 3D libre para arquitectura e ingeniería</summary>
+  <developer id="com.ingetrazo">
+    <name>Marco Sumari Tellez</name>
+  </developer>
+  <description>
+    <p>
+      Free 3D modeler that lets you draw as if by hand: push/pull modelling, groups and components, materials with
+      textures, dimensions and leader texts, layers, scenes and display
+      styles — plus a sheet composer that turns the model into printable,
+      to-scale plan sheets (PDF/DXF).
+    </p>
+    <p xml:lang="es">
+      Modelador 3D libre para trazar como a mano: empujar/tirar, grupos y componentes, materiales con texturas,
+      cotas y textos guía, capas, escenas y estilos de visualización — más
+      un compositor de láminas que convierte el modelo en planos imprimibles
+      a escala (PDF/DXF).
+    </p>
+    <p>
+      Opens .skp files natively (2013–2026, through the
+      pure-Python OpenSKP library), imports and exports COLLADA and OBJ,
+      exports STL, glTF/GLB and IFC4 for BIM quantity take-off, and brings
+      real terrain in: base-map tiles, 3D elevation, photogrammetry meshes
+      and survey points.
+    </p>
+    <p xml:lang="es">
+      Abre archivos .skp de forma nativa (2013–2026, vía la
+      librería puro-Python OpenSKP), importa y exporta
+      COLLADA y OBJ, exporta STL, glTF/GLB e IFC4 para metrados BIM, y trae
+      el terreno real: mapas base, elevación 3D, mallas de fotogrametría y
+      puntos topográficos.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.ingetrazo.IngeTrazo.desktop</launchable>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://ingetrazo.com/images/screenshots/principal.jpeg</image>
+      <caption>Modelling a plaza: push/pull, groups, materials and shadows</caption>
+      <caption xml:lang="es">Modelando una plaza: empujar/tirar, grupos, materiales y sombras</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://ingetrazo.com/images/screenshots/laminas.jpeg</image>
+      <caption>The sheet composer: to-scale plans with dimensions, labels and a title block</caption>
+      <caption xml:lang="es">El compositor de láminas: planos a escala con cotas, etiquetas y cajetín</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://ingetrazo.com/images/screenshots/terreno.jpeg</image>
+      <caption>Real terrain: base-map tiles, 3D elevation and survey data under the model</caption>
+      <caption xml:lang="es">Terreno real: mapa base, elevación 3D y levantamientos bajo el modelo</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://ingetrazo.com/images/screenshots/importar.jpeg</image>
+      <caption>A plaza modelled in IngeTrazo on its satellite terrain, with its layers and scenes</caption>
+      <caption xml:lang="es">Una plaza modelada en IngeTrazo sobre su terreno satelital, con sus capas y escenas</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://ingetrazo.com/images/screenshots/componentes.jpeg</image>
+      <caption>A component library of 1510 models and 427 textures, browsed from the tray</caption>
+      <caption xml:lang="es">Biblioteca de 1510 componentes y 427 texturas, desde la bandeja</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://ingetrazo.com/images/screenshots/bim.jpeg</image>
+      <caption>BIM tags on the geometry you drew, exported to IFC4 for quantity take-off</caption>
+      <caption xml:lang="es">Etiquetas BIM sobre lo trazado, exportadas a IFC4 para el metrado</caption>
+    </screenshot>
+  </screenshots>
+  <url type="homepage">https://ingetrazo.com</url>
+  <url type="bugtracker">https://github.com/ingelibre/ingetrazo/issues</url>
+  <url type="vcs-browser">https://github.com/ingelibre/ingetrazo</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.6.1" date="2026-11-08">
+      <description>
+        <p>Up to four views in one tab, scenes as tabs, a notice when a newer
+        version is out, PNG with a transparent background, translucent glass
+        in Monochrome, Bulgarian and Traditional Chinese, more reliable
+        Push/Pull and angle tools, and dozens of fixes to imports, paint and
+        groups.</p>
+        <p xml:lang="es">Hasta cuatro vistas en una pestaña, escenas como
+        pestañas, aviso de versión nueva, PNG con fondo transparente, vidrio
+        translúcido en Monocromo, búlgaro y chino tradicional, Empujar/Tirar y
+        herramientas de ángulo más fiables, y decenas de arreglos de
+        importación, pintura y grupos.</p>
+      </description>
+    </release>
+    <release version="0.6.0" date="2026-11-01">
+      <description>
+        <p>Several projects in tabs in the same window; 17 languages, the
+        latest Arabic with a right-to-left interface and Ukrainian; Push/Pull
+        cuts doors and windows through real walls; .skp files import with
+        their groups and components; curved surfaces shade round; softer,
+        more natural ambient occlusion; and over forty community
+        contributions.</p>
+        <p xml:lang="es">Varios proyectos en pestañas en la misma ventana;
+        17 idiomas, los últimos el árabe con la interfaz de derecha a
+        izquierda y el ucraniano; Empujar/Tirar abre puertas y ventanas en muros reales; los
+        .skp llegan con sus grupos y componentes; las superficies curvas se
+        ven redondas; oclusión ambiental más suave y natural; y más de
+        cuarenta aportes de la comunidad.</p>
+      </description>
+    </release>
+    <release version="0.5.11" date="2026-10-27">
+      <description>
+        <p>Layers 2.0 with their own tab, colour, line type and weight per
+        layer and printing per layer; ambient occlusion is no longer
+        experimental; sharp sun shadows in exported pictures, in sheets and
+        in a still view; Japanese, Korean, Vietnamese and Thai; the
+        extension manager downloads again on a fresh Windows; and over
+        thirty community contributions.</p>
+        <p xml:lang="es">Capas 2.0 con pestaña propia, color, tipo y grosor
+        de línea e impresión por capa; la oclusión ambiental deja de ser
+        experimental; sombras del sol nítidas en las imágenes exportadas,
+        en las láminas y con la vista quieta; japonés, coreano, vietnamita
+        y tailandés; el gestor de extensiones vuelve a descargar en un
+        Windows recién instalado; y más de treinta aportes de la
+        comunidad.</p>
+      </description>
+    </release>
+    <release version="0.5.10.1" date="2026-10-27">
+      <description>
+        <p>Fixes a data loss: a group or component painted whole with a
+        texture lost it on its second save. Experimental ambient occlusion
+        in the Styles panel (off by default), sun shadows without staircase
+        edges, and network folders no longer stop the file dialogs on
+        Windows.</p>
+        <p xml:lang="es">Arregla una pérdida de datos: un grupo o componente
+        pintado entero con una textura la perdía al segundo guardado.
+        Oclusión ambiental experimental en el panel Estilos (apagada por
+        defecto), sombras del sol sin escalones, y en Windows las carpetas
+        de red ya no bloquean los diálogos de archivos.</p>
+      </description>
+    </release>
+    <release version="0.5.10" date="2026-10-26">
+      <description>
+        <p>The Rust engine is now on by default, in this Flatpak too, with
+        the Python engine as a fallback; huge models no longer lag while
+        drawing, selecting, moving and undoing; a snap where two faces
+        cross; Camera, Axes to hide the world axes and Camera, Field of
+        View to set the lens; and about sixty fixes.</p>
+        <p xml:lang="es">El motor Rust viene activado por defecto, también
+        en este Flatpak, con el motor de Python de reserva; los modelos
+        enormes ya no dan tirones al dibujar, seleccionar, mover y
+        deshacer; enganche donde se cruzan dos caras; Cámara, Ejes para
+        ocultar los ejes del mundo y Cámara, Campo de visión para elegir la
+        lente; y unos sesenta arreglos.</p>
+      </description>
+    </release>
+    <release version="0.5.9" date="2026-10-19">
+      <description>
+        <p>An experimental Rust engine (off by default) that makes hidden
+        lines, intersections and huge models many times faster; the first
+        point of Line, Rectangle, Circle and Arc snaps to the axes; switch
+        between orbit and pan without letting go of the wheel; extension
+        menus that sort themselves when there are many; library components
+        placed again become copies of the same component; and many
+        fixes.</p>
+        <p xml:lang="es">Un motor Rust experimental (apagado por defecto)
+        que hace varias veces más rápidas las líneas ocultas, las
+        intersecciones y los modelos enormes; el primer punto de Línea,
+        Rectángulo, Círculo y Arco se engancha a los ejes; pasar de orbitar a
+        desplazar sin soltar la rueda; menús de extensiones que se ordenan
+        solos cuando hay muchas; los componentes de la biblioteca colocados
+        de nuevo son copias del mismo componente; y muchos arreglos.</p>
+      </description>
+    </release>
+    <release version="0.5.8" date="2026-10-12">
+      <description>
+        <p>An Extension Manager to browse, install, update and disable
+        extensions from the catalog; document units (metric, millimetres,
+        imperial or custom); a Model Browser with every group and component
+        in a tree; editing inside large groups and push/pull on terrain
+        several times faster; huge models that open, save and weigh much
+        less; and more than forty fixes.</p>
+        <p xml:lang="es">Un gestor de extensiones para explorar, instalar,
+        actualizar y desactivar las del catálogo; unidades del documento
+        (métricas, milímetros, imperiales o a medida); un Navegador del
+        modelo con todos los grupos y componentes en árbol; editar dentro de
+        grupos grandes y empujar en terreno varias veces más rápido; modelos
+        enormes que abren, guardan y pesan mucho menos; y más de cuarenta
+        arreglos.</p>
+      </description>
+    </release>
+    <release version="0.5.7" date="2026-09-30">
+      <description>
+        <p>Parametric windows with the Windowizer example extension, the
+        selection marked with dots, back edges drawn dashed (K), an X-ray
+        mode that dims the edges behind faces (Alt+X), Scale grips that snap
+        to other objects, a short description for every command, an instant
+        command search (F3), Indonesian, big models with thousands of
+        mirrored components that open and close quickly, and Render with
+        Blender working in the Flatpak.</p>
+        <p xml:lang="es">Ventanas paramétricas con la extensión de ejemplo
+        Windowizer, la selección marcada con puntos, aristas traseras en
+        discontinua (K), un modo Rayos X que atenúa las aristas detrás de
+        las caras (Alt+X), pinzas de Escalar que enganchan otros objetos,
+        una descripción breve para cada comando, el buscador de comandos
+        (F3) al instante, indonesio, modelos grandes con miles de
+        componentes espejados que abren y cierran rápido, y Renderizar con
+        Blender funcionando en el Flatpak.</p>
+      </description>
+    </release>
+    <release version="0.5.6.1" date="2026-09-29">
+      <description>
+        <p>The AI assistant, the MCP bridge and Render with Blender load again
+        in the Windows, macOS, AppImage and tar packages; IngeTrazo describes
+        itself on its own terms across the interface and its listings.</p>
+        <p xml:lang="es">El Asistente IA, el puente MCP y Renderizar con
+        Blender vuelven a cargar en los paquetes de Windows, macOS, AppImage
+        y tar; IngeTrazo se describe por sí mismo en la interfaz y sus
+        fichas.</p>
+      </description>
+    </release>
+    <release version="0.5.6" date="2026-09-29">
+      <description>
+        <p>Render with Blender: photorealistic images of the view with the
+        Blender you already have, by day or by night with your own point
+        lights and spots, and an option that renders the view by itself
+        whenever you stop moving. The AI assistant and the MCP bridge get a
+        tab in the sidebar, and Window ▸ Panels hides the tabs you do not
+        use. From the community: command search (F3), Extension API 2, STL
+        import, Paste in Place and Zoom Selection. A typed angle is no
+        longer scaled by the document unit.</p>
+        <p xml:lang="es">Renderizar con Blender: imágenes fotorrealistas de
+        la vista con el Blender que ya tengas, de día o de noche con luces y
+        focos propios, y una opción que renderiza sola la vista cada vez que
+        te detienes. El Asistente IA y el puente MCP tienen su pestaña en la
+        barra lateral, y Ventana ▸ Paneles oculta las pestañas que no uses.
+        De la comunidad: buscador de comandos (F3), API de extensiones 2,
+        importar STL, Pegar en su lugar y Zoom a la selección. Un ángulo
+        tecleado ya no se escala con la unidad del documento.</p>
+      </description>
+    </release>
+    <release version="0.5.5" date="2026-09-28">
+      <description>
+        <p>IngeTrazo keeps only free pieces: the link to an external .skp
+        converter and the .skp export are retired, and .skp files keep
+        opening with the free built-in reader. The icons are updated to
+        stay consistent across the interface. Orbit turns about what you are looking at, Push/Pull
+        stops at the Tape's guides, rotating lands exactly on the snapped
+        point, saving no longer leaves a phantom "unsaved changes", lengths
+        show in the document's units, and Shift+R repeats the last
+        command.</p>
+        <p xml:lang="es">IngeTrazo se queda solo con piezas libres: el
+        enlace a un conversor externo de .skp y la exportación a .skp se
+        retiran, y los .skp se siguen abriendo con el lector libre
+        integrado. Los íconos se actualizan para mantenerlos coherentes en
+        toda la interfaz. La órbita gira alrededor de lo que miras,
+        Empujar/Tirar se detiene en las guías de la Cinta, rotar cae exacto
+        en el punto enganchado, guardar ya no deja «cambios sin guardar»
+        fantasma, las medidas salen en las unidades del documento, y
+        Mayús+R repite el último comando.</p>
+      </description>
+    </release>
+    <release version="0.5.3" date="2026-09-25">
+      <description>
+        <p>Rotation grips on Move and a Select submenu;
+        count and spacing in one entry (5x10m); 3D mouse navigation; Edit ▸
+        Invert Selection; an empty .skp opens empty. Fixes from users'
+        videos: Scale no longer tears loose geometry, a group turned about
+        its centre is redrawn, and a reference image is no longer covered
+        by what lies behind it. Opening documents no longer leaks memory. Extensions can now keep data in the
+        document, add a side panel and offer inferences — Levels is the
+        first, shipped as an example.</p>
+      </description>
+    </release>
+    <release version="0.5.2" date="2026-09-24">
+      <description>
+        <p>A group of groups is a group again and Make Unique keeps the
+        subgroups; Make Component over several groups makes one; Ctrl+Tab
+        between the model and the sheets; Two-Point Perspective and Export
+        Current View as DXF; the guide the Tape and Protractor will leave
+        shows before the click; and a smoother sheet composer — cursors,
+        two-click placement, editing several dimensions at once.</p>
+      </description>
+    </release>
+    <release version="0.5.1" date="2026-09-23">
+      <description>
+        <p>What you draw inside a group shows at once; a door drawn from
+        the floor goes through the wall; copy and paste between windows;
+        Orient Faces; Zoom Extents that frames the model as you look at
+        it; the orbit no longer sticks to the mouse on Windows; a First
+        Person walk; and a status bar with room to read each tool's
+        hint.</p>
+      </description>
+    </release>
+    <release version="0.5.0" date="2026-09-23">
+      <description>
+        <p>Solids, local axes and Mac. The Solid Tools (Outer
+        Shell, Union, Subtract, Trim, Intersect, Split) and Intersect
+        Faces; local axes for groups and components, with Change Axes and
+        .skp files that keep them; the Rotated Rectangle's protractors;
+        Explode one level at a time; a light theme, or the desktop's;
+        and a first packaged build for macOS.</p>
+      </description>
+    </release>
+    <release version="0.4.9" date="2026-09-21">
+      <description>
+        <p>@pacaeiro's release: sixteen of his reports, and Rafael's guides.
+        What was still open from him since 0.4.4 (model units, rectangle
+        from the centre, offset on edges, the shared vertex) and his new
+        batch of 20–21 September: Divide, the camera saved in the
+        document, a progress bar on open, section planes that finish and
+        take their axis colour, the undo cap, scrolling lists, Paint with
+        the usual rule (face over group), hidden things you can click, the
+        linear dimension, the axis magnet in every drawing tool. From
+        Rafael's third review: the Tape pulls guides off the axes and
+        leaves guide points with their segment, and the AI Assistant says
+        plainly when the key is missing. And the program speaks Brazilian
+        Portuguese thanks to @dafrobozao. Recent files, at last.</p>
+        <p xml:lang="es">La release de @pacaeiro: dieciséis de sus reportes, y las guías
+        de Rafael. Lo que quedaba abierto de él desde la 0.4.4 (unidades
+        del modelo, rectángulo desde el centro, desfase de aristas, el
+        vértice compartido) y la tanda nueva del 20 y 21 de septiembre:
+        Dividir, la cámara guardada en el documento, la barra de progreso
+        al abrir, los planos de sección que terminan y se colorean por
+        eje, los pasos de deshacer, el scroll de las listas, Pintar con la
+        regla de siempre (cara sobre grupo), lo oculto que se puede
+        clicar, la cota lineal, el imán de ejes en todas las herramientas
+        de dibujo. De la tercera revisión de Rafael: la cinta saca guías
+        desde los ejes y deja puntos guía con su segmento, y el Asistente
+        IA dice en claro cuándo falta la clave. Y el programa habla
+        portugués de Brasil gracias a @dafrobozao. Archivos recientes, por
+        fin.</p>
+      </description>
+    </release>
+    <release version="0.4.8" date="2026-09-20">
+      <description>
+        <p>@pacaeiro's batch on 0.4.7, and what came out of checking 0.4.7
+        point by point. His five reports of the day: the axis magnet Tape,
+        Protractor and Move lacked (Move only caught Z from an oblique
+        view), the face behind winning in the parallel camera, a group
+        grouped into a copy of itself, and the magenta arc taking a typed
+        number as bulge instead of radius. From Marco's check: a dimension
+        that did not follow its group when scaled — the missing case from
+        the video's first user —, sheet dimensions' text gap to the
+        standard, 3D Text in metres, the north's N turning with the needle,
+        Zoom and Zoom Window on the sheet, and tooltips that came out as a
+        strip.</p>
+        <p xml:lang="es">La tanda de @pacaeiro sobre la 0.4.7, y lo que
+        salió de comprobar la 0.4.7 punto por punto. Sus cinco reportes del
+        día: el imán de ejes que faltaba en Cinta, Transportador y Mover
+        (Mover solo enganchaba Z desde una vista oblicua), la cara de atrás
+        que ganaba en vista paralela, un grupo que se agrupaba dentro de
+        una copia de sí mismo, y el arco magenta que tomaba el número como
+        comba en vez de como radio. De la comprobación de Marco: la cota
+        que no seguía al grupo al escalarlo —el caso que faltaba del
+        usuario del vídeo—, la separación texto–línea de las cotas de
+        lámina a la norma, Texto 3D en metros, la N que gira con la aguja,
+        Zoom y Zoom ventana en la lámina, y las pistas de los iconos que
+        salían en una tira.</p>
+      </description>
+    </release>
+    <release version="0.4.7" date="2026-09-20">
+      <description>
+        <p>The sheets half of Rafael's second review, and dimensions to
+        the standard. The other half of his one-hour video (0.4.6 was the
+        model) plus his video on drafting standards, which Marco checked
+        point by point. The big pieces: the section cut COVERS (the poché
+        is no longer see-through); dimensions to ISO — text above and
+        centred, read head to the left, the line runs on under the text,
+        arrows by default; radius and diameter with one click on the arc;
+        the angular dimension finally snaps; the forced-straight and the
+        baseline dimensions of AutoCAD; and, in the model, dimensions that
+        hold their vertices — scale the drawing and the dimension resizes
+        and re-measures — the first thing a user of DriveMeca's video
+        missed, with Move sliding the line and the ends a choice. Also the
+        print preview that did nothing in the Flatpak, the vector flicker
+        while moving a view, a typed 10:1 silently turned into 1:1, a new
+        frame wearing a deleted view, @pacaeiro's #38 on Ctrl+A, and the
+        toolbars that left Walkthrough at the bottom of the column.</p>
+        <p xml:lang="es">Las láminas de la segunda revisión de Rafael, y la
+        acotación a norma. La otra mitad de su vídeo de una hora (la 0.4.6
+        fue la del modelo) más su vídeo de normativa de acotación, que
+        Marco revisó punto por punto. Lo grande: la sección TAPA (el poché
+        ya no se ve a través); cotas a la norma ISO —texto encima y
+        centrado, se lee girando la cabeza a la izquierda, la línea se
+        prolonga bajo el texto, flechas por defecto—; radio y diámetro con
+        un clic sobre el arco; la angular que por fin engancha; la cota
+        forzada recta y la línea base de AutoCAD; y en el modelo, cotas
+        que siguen a la geometría —escalas el dibujo y la cota se
+        redimensiona y vuelve a medir—, lo primero que echó en falta un
+        usuario del vídeo de DriveMeca, con Mover desplazando la línea y
+        los extremos a elegir. Además la vista previa de impresión que en
+        el Flatpak no hacía nada, el parpadeo vectorial al mover una vista,
+        un 10:1 tecleado que salía 1:1 en silencio, un marco nuevo vestido
+        con una escena borrada, la #38 de @pacaeiro sobre Ctrl+A, y las
+        barras que dejaban a Paseo al fondo de la columna.</p>
+      </description>
+    </release>
+    <release version="0.4.6" date="2026-09-19">
+      <description>
+        <p>The model half of Rafael's second review, complete. His one-hour
+        video on 0.4.x was split in two releases: this is the MODEL one —
+        the three bugs and the five requests — and the next will be the
+        sheets. The big pieces: a walkthrough camera (Position Camera, Look
+        Around and Walk) to see interiors; hiding
+        objects, and layers you can actually use; 3D text that stays
+        editable, one group per letter; and a new inference — a window on the next wall level with the first one, the
+        horizontal plane through the corner cut by the wall the cursor is
+        on. Also @pacaeiro's issue #34 on snapping under a lock: references
+        are fetched on both sides of the start, level ones too, Shift over
+        the soft axis cue has snaps, and pressing the tool's key again
+        resets it.</p>
+        <p xml:lang="es">Lo del modelo de la segunda revisión de Rafael,
+        entero. Su vídeo de una hora sobre la 0.4.x se repartió en dos
+        releases: esta es la del MODELO —los tres bugs y los cinco pedidos—
+        y la siguiente será la de las láminas. Lo grande: la cámara de
+        paseo (Situar cámara, Mirar alrededor y Caminar)
+        para mirar los interiores; ocultar objetos y capas que se usan de
+        verdad; texto 3D que sigue siendo editable, con un grupo por letra;
+        y una inferencia nueva: la ventana de la pared de al
+        lado a la altura de la primera, el plano horizontal por la esquina
+        cortado con la pared a la que apuntas. Y la issue #34 de @pacaeiro
+        sobre los snaps bajo bloqueo: las referencias se pescan a los dos
+        lados del inicio, las que están a nivel también, Shift sobre el eje
+        suave tiene snaps, y pulsar de nuevo la tecla de la herramienta la
+        reinicia.</p>
+      </description>
+    </release>
+    <release version="0.4.5" date="2026-09-18">
+      <description>
+        <p>Forty-eight minutes: that is how long it took @pacaeiro to
+        download 0.4.4, test it and reopen the two issues we had called
+        closed. He was right about both. The arrow-key axis lock now lets go
+        the moment the LINE exists rather than when the operation ends — the
+        Line tool chains, so the operation is the whole polyline, and that
+        is not what he meant. And Shift's lock finally offers the same snap
+        points the arrow lock does: an endpoint on the locked line, the
+        crossing with another edge, a corner or midpoint projected onto it.
+        Shift is the lock you reach for precisely so you can hold a
+        direction and go and fetch a point from another object.</p>
+        <p xml:lang="es">Cuarenta y ocho minutos: eso tardó @pacaeiro en
+        descargar la 0.4.4, probarla y reabrir las dos issues que dábamos por
+        cerradas. Tenía razón en las dos. El bloqueo de eje con las flechas
+        se suelta ahora en cuanto la LÍNEA existe, y no cuando termina la
+        operación — la herramienta Línea encadena, así que la operación es la
+        polilínea entera, y no era eso lo que él decía. Y el bloqueo con
+        Shift ofrece por fin los mismos puntos de imantado que el de flechas:
+        un extremo sobre la recta bloqueada, el cruce con otra arista, y una
+        esquina o punto medio proyectados sobre ella. Shift es el bloqueo que
+        usas precisamente para fijar una dirección e ir a buscar un punto a
+        otro objeto.</p>
+      </description>
+    </release>
+    <release version="0.4.4" date="2026-09-18">
+      <description>
+        <p>The inference release, and nearly all of it came out of drawing.
+        An afternoon of live testing turned up seven faults no automated test
+        had seen. The arrow-key axis lock now lasts one operation instead of
+        until Esc, and a locked axis no longer traps you inside a polyline —
+        the click meant to close the figure came back as a plain axis point,
+        so it only LOOKED closed. The axis inference now magnetises instead
+        of merely lighting up: the status bar said "On red axis" while the
+        line came out a couple of centimetres out of true. The Line tool can
+        reach the third axis, the one most perpendicular to the camera, which
+        no camera could offer before because the cursor lands on the work
+        plane and a plane holds only two of the three. Three faults of one
+        family: an inference derived from a point was beating the point it
+        came from, so clicking the middle of a wall landed centimetres off,
+        and pausing over a point to see it made that point unreachable.
+        Rectangles are born facing the right way whichever diagonal you drag
+        — two of the four gave a back face, which travels into the .skp and
+        the BIM tagging. Erasing no longer leaves stray vertices in the
+        document. And the two labels on the canvas are finally in your own
+        language.</p>
+        <p xml:lang="es">La release de la inferencia, y casi toda salió de
+        dibujar. Una tarde de pruebas en vivo destapó siete fallos que no
+        había visto ninguna prueba automática. El bloqueo de eje con las
+        flechas dura ahora una operación en vez de hasta que pulses Esc, y
+        con un eje bloqueado ya se puede cerrar una figura: el clic sobre el
+        punto de partida volvía como un punto de eje cualquiera, así que solo
+        PARECÍA cerrada. La inferencia de eje imanta de verdad en vez de
+        limitarse a encenderse: la barra decía «En eje rojo» y la línea salía
+        dos o tres centímetros torcida. La Línea alcanza el tercer eje, el
+        más perpendicular a la cámara, que ninguna vista podía ofrecer porque
+        el cursor se apoya en el plano de trabajo y un plano solo contiene
+        dos de los tres. Tres fallos de una misma familia: una inferencia
+        derivada de un punto le ganaba al punto del que salía, así que clicar
+        el medio de un muro caía centímetros al lado, y pausar sobre un punto
+        para verlo lo volvía inalcanzable. Los rectángulos nacen con la cara
+        correcta arrastres por donde arrastres — dos de las cuatro diagonales
+        daban el reverso, que viaja al .skp y al etiquetado BIM. Borrar ya no
+        deja vértices sueltos en el documento. Y los dos rótulos del visor
+        salen por fin en tu idioma.</p>
+      </description>
+    </release>
+    <release version="0.4.3" date="2026-09-17">
+      <description>
+        <p>.skp files that used to be refused now open: the reader moves
+        to the upstream openskp 1.3.0, checked against 214 real drawings
+        before the change. Exporting every sheet to PDF no longer drops one
+        silently. A sheet can now hold a PERSPECTIVE view, with its own sun
+        and shadows, for an isometric that looks like the site rather than a
+        drawing. More from a draughtsman's testing: Rotate +
+        Ctrl lays a polar array with "3x" or "/3"; Ctrl on the Tape Measure
+        cycles guide lines, guide points and plain measuring, and on the
+        Protractor turns the guide on and off, with a + beside the cursor
+        telling you which; snapping with an axis locked works whichever way
+        you draw and finds the world origin; the Tape pulls a guide off an
+        edge inside a group or component; and Alt no longer takes the
+        inferences away when you switch windows with Alt+Tab. The people
+        outside the project whose work is in it are now credited in Help
+        &gt; About.</p>
+        <p xml:lang="es">Archivos .skp que antes no abrían ahora
+        abren: el lector pasa a la versión oficial de openskp 1.3.0,
+        comprobada contra 214 dibujos reales antes del cambio. Exportar
+        todas las láminas a PDF ya no se deja una fuera en silencio. Una
+        lámina puede llevar ahora una vista en PERSPECTIVA, con su propio
+        sol y sus sombras, para que una isométrica se vea como en campo y no
+        como un dibujo. Más cosas salidas de las pruebas de un
+        delineante: Girar + Ctrl reparte copias en círculo con «3x» o «/3»;
+        Ctrl en la cinta métrica recorre líneas guía, puntos guía y medida
+        sola, y en el transportador pone y quita la guía, con un + junto al
+        cursor que dice en cuál estás; con un eje bloqueado el imantado
+        funciona dibujes hacia donde dibujes y encuentra el origen del
+        mundo; la cinta saca una guía de una arista que está dentro de un
+        grupo o componente; y Alt ya no se lleva las inferencias al cambiar
+        de ventana con Alt+Tab. Las personas de fuera del proyecto cuyo
+        trabajo está dentro aparecen acreditadas en Ayuda ▸ Acerca de.</p>
+      </description>
+    </release>
+    <release version="0.4.2" date="2026-09-16">
+      <description>
+        <p>The .skp export works again in the Windows installer, the
+        AppImage, the tarball and the snap (the packaging shipped openskp's
+        modules but not its data). Requests from a
+        draughtsman: Move + Ctrl copies and "3x" / "/3" lay an array; the
+        Tape Measure pulls a guide from another guide; the Protractor
+        tilts with click-and-drag; the Down arrow locks the Circle,
+        Polygon, Rectangle and arcs perpendicular to the hovered edge
+        (the magenta reference), the way to start a pipe on an
+        inclined axis; Move and Rotate no longer infer against the
+        geometry being moved; two crossing guides give their intersection
+        again.</p>
+        <p xml:lang="es">La exportación a .skp vuelve a funcionar en el
+        instalador de Windows, el AppImage, el tar y el snap (el paquete
+        llevaba los módulos de openskp pero no sus datos). Pedidos de
+        un delineante: Mover + Ctrl copia y «3x» /
+        «/3» hacen una matriz; la cinta métrica saca una guía de otra guía;
+        el transportador se inclina con clic y arrastre; la flecha abajo
+        fija el círculo, el polígono, el rectángulo y los arcos
+        perpendiculares a la arista bajo el cursor (la referencia
+        magenta), la manera de empezar un tubo sobre un eje inclinado;
+        Mover y Rotar ya no infieren contra lo que se mueve; dos guías que
+        se cruzan vuelven a dar su intersección.</p>
+      </description>
+    </release>
+    <release version="0.4.1" date="2026-09-15">
+      <description>
+        <p>The world origin wins: coming to the origin aligned with an
+        encouraged point or with the red axis used to click millimetres
+        beside it (the projection onto the axis) and leave tiny stubs; the
+        origin is a named point like a corner and now beats the linear
+        inferences.</p>
+        <p xml:lang="es">El origen gana: al acercarte al origen alineado con
+        un punto animado o con el eje rojo, el clic caía a milímetros
+        (la proyección sobre el eje) y quedaban tramos diminutos; el origen
+        es un punto con nombre, como una esquina, y ahora manda sobre las
+        inferencias lineales.</p>
+      </description>
+    </release>
+    <release version="0.4.0" date="2026-09-15">
+      <description>
+        <p>Inference reworked, three tools that were missing, and
+        the Linux packages fixed for NVIDIA. Rectangle, circle and arcs draw
+        on the plane facing the view and show it on the cursor; From Point
+        before the first click, two points at once, tangent at vertex, arc
+        midpoints, component origins — all reaching into nested groups. The
+        Arc rounds a corner: tangent preview, magenta at the
+        same distance on the next edge, a double-click trims the corner. New
+        tools: Fillet rounds the edges of a solid (chains, box corners,
+        concave edges), Position Texture puts pins on a face
+        (move, scale, rotate, shear; back side too) and a sampled position
+        travels to other faces; painting a curved surface wraps the image
+        around it. A rim piece pushed flush onto the far face is cut through.
+        The status bar shows one hint for the tool and its step, the tray
+        reflows its swatches with the width, and the AI assistant builds a
+        whole house in one recipe, retries a busy provider and sends lighter
+        screenshots; the MCP bridge names every client that can use it. The
+        tarball and AppImage leave the C++ runtime and GLib to the host, which
+        is what aborted GLX on NVIDIA.</p>
+        <p xml:lang="es">Inferencia renovada, tres herramientas que
+        faltaban y los paquetes Linux arreglados para NVIDIA. Rectángulo,
+        círculo y arcos dibujan en el plano que mira a la vista y lo enseñan
+        en el cursor; «Desde el punto» antes del primer clic, dos puntos a
+        la vez, tangente en el vértice, puntos medios de arco, orígenes de
+        componente — todo alcanza grupos anidados. El Arco redondea esquinas:
+        vista previa tangente, magenta a la misma distancia en
+        la arista contigua, doble clic recorta la esquina. Herramientas
+        nuevas: Redondear redondea las aristas de un sólido (cadenas,
+        esquinas de caja, cóncavas), Posicionar textura pone pines
+        sobre una cara (mover, escalar, rotar, cizallar; también el
+        reverso) y la muestra viaja a otras caras; pintar una superficie
+        curva envuelve la imagen. Una pieza del borde empujada a ras de la
+        cara opuesta se corta de lado a lado. La barra de estado da una sola
+        pista por herramienta y paso, la bandeja reparte las muestras según
+        el ancho, y el asistente IA levanta una casa entera en una receta,
+        reintenta cuando el proveedor está saturado y manda capturas más
+        ligeras; el puente MCP nombra todos los clientes que pueden usarlo.
+        El tarball y el AppImage dejan al sistema el runtime de C++ y GLib,
+        que era lo que abortaba GLX en NVIDIA.</p>
+      </description>
+    </release>
+    <release version="0.3.20" date="2026-09-14">
+      <description>
+        <p>The orthomosaic, labels with several arrows, and the toolbars'
+        new face. A drone orthomosaic comes in as a GeoTIFF with nothing to
+        install — a built-in reader handles Deflate, LZW, PackBits and JPEG
+        tiles and lands the picture on the map at its true size and place;
+        images and the base map take an opacity; scenes remember the base
+        map, the terrain and the sun, and sheet views render with exactly
+        that. In the sheet composer a label can point at two or three things
+        with one text, its background hugs the letters, and raster views
+        honour the edge and profile pens. The toolbars get icons drawn one by
+        one, a size setting (Preferences), a sidebar that folds away like
+        LibreOffice's and a clean screen (Ctrl+0) with a way out — in the
+        model window and the composer alike. Plus store screenshots, the
+        Flatpak window tied to its launcher, and an AppImage that offers to
+        add itself to the applications menu.</p>
+        <p xml:lang="es">El ortomosaico, las etiquetas con varias flechas y
+        la cara nueva de las barras. El ortomosaico del dron entra como
+        GeoTIFF sin instalar nada —un lector propio maneja Deflate, LZW,
+        PackBits y teselas JPEG y deja la imagen sobre el mapa a su tamaño y
+        en su sitio—; las imágenes y el mapa base tienen opacidad; las
+        escenas recuerdan el mapa base, el terreno y el sol, y las vistas de
+        las láminas se renderizan con eso mismo. En el compositor una
+        etiqueta señala dos o tres cosas con un solo texto, su fondo se pega
+        a las letras y las vistas ráster respetan las plumas de aristas y
+        perfiles. Las barras estrenan iconos dibujados uno a uno, tamaño
+        configurable (Preferencias), una barra lateral que se pliega como en
+        LibreOffice y una pantalla limpia (Ctrl+0) con salida — en la ventana
+        del modelo y en el compositor. Además capturas en la tienda, la
+        ventana del Flatpak ligada a su lanzador y un AppImage que se ofrece
+        a añadirse al menú de aplicaciones.</p>
+      </description>
+    </release>
+    <release version="0.3.19" date="2026-09-14">
+      <description>
+        <p>The project north. A model drawn square to the axes no longer has
+        to be turned to fit its site: the Terrain panel gets a North angle
+        (degrees clockwise from the green axis) that turns the
+        base map, the 3D terrain, imported paths and points and the sun under
+        the model, while the model — and its front/right/top views and axis
+        locks — stays put. "Straighten model on the map" converts a model
+        that was already turned and dragged into place, without moving a
+        single point on the ground. Plus the first three contributions from
+        an outside tester: Shift locks the exact axis, construction guides
+        are dashed again, and toolbar icons can be made larger.</p>
+        <p xml:lang="es">El norte del proyecto. Un modelo dibujado a escuadra
+        con los ejes ya no tiene que girarse para encajar en su sitio: el
+        panel Terreno tiene un ángulo del Norte (grados en sentido horario
+        desde el eje verde) que gira el mapa base, el
+        terreno 3D, las rutas y puntos importados y el sol bajo el modelo,
+        mientras el modelo —y sus vistas frontal/derecha/planta y bloqueos de
+        eje— se queda quieto. «Enderezar modelo sobre el mapa» convierte un
+        modelo que ya se giró y arrastró, sin mover un solo punto sobre el
+        terreno. Y las tres primeras contribuciones de un probador externo:
+        Shift bloquea el eje exacto, las guías vuelven a ser punteadas y los
+        iconos de las barras pueden agrandarse.</p>
+      </description>
+    </release>
+    <release version="0.3.18" date="2026-09-12">
+      <description>
+        <p>Nested groups: a group can hold groups,
+        you step into them level by level, and inside one the rest of the
+        model stays a reference — its corners and edges still snap, and the
+        centre of any circle or arc lights up as a green point. Faces have
+        two sides now: paint lands on the side you click, the back keeps the
+        style's colour, and glass, water and mesh read the same from both.
+        Import another IngeTrazo document as one component, placed with a
+        click; the .igz keeps your group names. Plus the fixes a day of real
+        work turned up: deleting and box-selecting inside a component, a
+        mirrored component losing its paint, a ghost of a moved arch.</p>
+        <p xml:lang="es">Grupos anidados: un grupo
+        puede contener grupos, se entra a ellos por niveles, y dentro de uno
+        el resto del modelo sigue siendo referencia — sus esquinas y aristas
+        snapean, y el centro de cualquier círculo o arco se enciende como un
+        punto verde. Las caras tienen dos lados: la pintura cae en el lado que
+        clicas, el reverso conserva el color del estilo, y cristal, agua y
+        malla se ven igual por los dos. Importa otro documento IngeTrazo como
+        un componente que se coloca con un clic; el .igz conserva los nombres
+        de los grupos. Y los arreglos que dejó un día de trabajo real: borrar
+        y seleccionar con caja dentro de un componente, un componente espejado
+        que perdía su pintura, el fantasma de un arco movido.</p>
+      </description>
+    </release>
+    <release version="0.3.17" date="2026-09-10">
+      <description>
+        <p>A whole day modelling a real job, and everything it turned up.
+        The rotated rectangle draws in a plane at last — including standing
+        square to it, by typing width and angle as with the protractor —
+        offset finally works inwards on concave shapes, unused tags and
+        materials can be purged in one click, a textured material can be
+        tinted a colour, and Reverse Faces is where you look for it: the
+        right-click menu. Keyboard: P is Push/Pull, and three
+        keys that quietly did nothing — H, O and F2 — work again.</p>
+        <p xml:lang="es">Un día entero modelando una obra de verdad, y todo
+        lo que salió de ahí. El rectángulo rotado por fin dibuja en un plano
+        —incluso de pie, escribiendo anchura y ángulo como con el
+        transportador—, la equidistancia ya funciona hacia adentro en formas
+        cóncavas, las capas y los materiales sin usar se purgan de un clic,
+        un material texturizado se puede teñir de un color, e Invertir caras
+        está donde se busca: en el menú del botón derecho. Teclado: P es
+        Empujar/Tirar, y tres teclas que no hacían nada sin
+        decirlo —H, O y F2— vuelven a funcionar.</p>
+      </description>
+    </release>
+    <release version="0.3.16" date="2026-09-09">
+      <description>
+        <p>Starts on machines whose graphics driver refuses the OpenGL
+        context the viewport asks for — an NVIDIA card under Wayland would
+        not open the application at all, and now it asks for less, or comes
+        back under X11, by itself. Orbiting no longer has its vertical axis
+        inverted: dragging down tips you up over the model, as it does
+        everywhere else. And a group made of nothing but lines and arcs
+        offers its snap points again and can be selected by clicking one of
+        its lines.</p>
+        <p xml:lang="es">Arranca en equipos cuyo driver gráfico rechaza el
+        contexto OpenGL que pide el visor — con una tarjeta NVIDIA sobre
+        Wayland la aplicación no abría siquiera, y ahora pide menos, o
+        vuelve bajo X11, ella sola. El orbitar deja de tener el eje vertical
+        invertido: arrastrar hacia abajo te asoma por encima del modelo,
+        como en todas partes. Y un grupo hecho solo de líneas y arcos vuelve
+        a ofrecer sus referencias y a poder seleccionarse pinchando una de
+        sus líneas.</p>
+      </description>
+    </release>
+    <release version="0.3.7.1" date="2026-08-28">
+      <description>
+        <p>The component library now speaks the language the interface is
+        being read in — its categories, the models' names and the licence.
+        Scale figures go by first name, the model card no longer prints
+        sizes in centimetres, and the eight unnamed colour swatches are
+        gone from the Materials tray.</p>
+        <p xml:lang="es">La biblioteca de componentes habla ahora el idioma
+        en que se lee la interfaz — sus categorías, los nombres de los
+        modelos y la licencia. Las figuras de escala van por nombre de
+        pila, la ficha del modelo ya no imprime medidas en centímetros, y
+        los ocho colores sin nombre desaparecen de la bandeja de
+        Materiales.</p>
+      </description>
+    </release>
+    <release version="0.3.7" date="2026-08-28">
+      <description>
+        <p>An online component library of 1510 models browsed from the
+        tray, 8 models and 6 scale figures bundled for offline use, 427
+        textures and the 213 RAL Classic colours — each with the real size
+        or the real name a specification needs. Plus the import fixes a
+        session of dogfooding turned up: models arrived lying on their
+        side, textures shattered on curved surfaces and were left behind
+        when a component was placed.</p>
+        <p xml:lang="es">Biblioteca de componentes en línea con 1510
+        modelos navegables desde la bandeja, 8 modelos y 6 figuras de
+        escala dentro del programa para trabajar sin red, 427 texturas y
+        los 213 colores RAL Classic — cada uno con el tamaño real o el
+        nombre real que hace falta para especificar. Y los arreglos de
+        importación que destapó una sesión de uso: los modelos entraban
+        tumbados, las texturas salían hechas añicos en lo curvo y se
+        quedaban atrás al colocar un componente.</p>
+      </description>
+    </release>
+    <release version="0.3.4" date="2026-08-25">
+      <description>
+        <p>Copy/paste for groups and components with a solid, textured
+        preview; the Protractor and Rotate rebuilt
+        (angle snapping, rise:run slopes, rotate-a-copy); tool cursors;
+        display styles with per-frame styles in the sheet composer; and a
+        real modelling session's worth of selection and guide fixes.</p>
+        <p xml:lang="es">Copiar/pegar grupos y componentes con vista previa
+        sólida y texturada; transportador y Rotar rehechos
+        (imanes de ángulo, pendientes subida:avance, rotar copia); cursores
+        de herramienta; estilos de visualización con estilo por marco en el
+        compositor; y una sesión real de fixes de selección y guías.</p>
+      </description>
+    </release>
+    <release version="0.3.3" date="2026-08-21">
+      <description>
+        <p>The complete .skp round trip: native .skp export, the full
+        2013–2026 corpus opens natively, and dimensions and leader texts
+        travel both ways. Named materials with per-material quantities.</p>
+        <p xml:lang="es">El viaje redondo .skp completo: export .skp
+        nativo, todo el corpus 2013–2026 abre nativo, y cotas y textos guía
+        viajan en ambas direcciones. Materiales con nombre y metrados por
+        material.</p>
+      </description>
+    </release>
+    <release version="0.3.2" date="2026-08-18">
+      <description>
+        <p>Extensions: a runtime plugin system with two bundled reference
+        plugins (Model info, Python console).</p>
+        <p xml:lang="es">Extensiones: sistema de plugins en runtime con dos
+        plugins de referencia incluidos (Info del modelo, Consola Python).</p>
+      </description>
+    </release>
+  </releases>
+</component>

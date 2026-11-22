@@ -1,0 +1,1504 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Marco Sumari Tellez and IngeTrazo contributors.
+"""SKP export — native .skp file via OpenSKP's pure-Python writer.
+
+Writes the scene as a legacy-format (v17) ``.skp`` file, readable wherever
+.skp files of the 2017 version or later open — no COLLADA round-trip, no
+external SDK, no Wine. Per-face paint (``Face.attrs["color"]``) becomes a
+.skp material, textured faces (``attrs["texture"]``) become image-mapped
+materials with their original textures embedded in the ``.skp``, layers
+become .skp tags, and face holes survive as inner loops.
+
+Structure survives too: a classic group (mesh in world coordinates, no
+``xform``) becomes a .skp group via ``add_group``, and component instances
+— sibling groups sharing one prototype mesh — become ONE component definition
+placed by N instances (``add_component_definition`` + ``add_instance``), so
+the shared geometry is stored once and stays editable as a component on the
+reading side. Loose mesh faces stay root-level. Hidden entities are not
+exported (mirroring ``meshexport.world_faces``); face-me figures become
+components in the .skp format's face-me convention (``_billboard_definition``).
+
+Coordinates are in **inches** (the .skp native unit); the model's metre-based
+geometry is scaled by ``_M_TO_IN``, and instance placements carry their
+rotation/scale 3×3 unchanged with the translation converted the same way.
+The file produced is the same legacy MFC format that ``openskp.create``
+targets — pre-2021, universally readable.
+"""
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+from PySide6.QtGui import QVector3D
+
+from core.materials import back_is_default
+from core.texture import face_uv_axes, projection_basis, uv_reference_points
+
+# The .skp face-me convention: a component that "always faces the camera"
+# turns about its own Z so that its LOCAL −Y axis points at the eye.
+_FACEME_FRONT = (0.0, -1.0)
+
+# IngeTrazo stores geometry in metres; the .skp format works in inches.
+_M_TO_IN = 39.37007874
+
+
+def _color_to_rgba(color):
+    """Convert a float (0.0-1.0) RGB colour to integer (0-255) RGBA."""
+    r, g, b = color[:3]
+    return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)), 255)
+
+
+def _pts_inches(points):
+    """``QVector3D`` positions (metres) as ``(x, y, z)`` tuples in inches."""
+    return [(v.x() * _M_TO_IN, v.y() * _M_TO_IN, v.z() * _M_TO_IN)
+            for v in points]
+
+
+def _is_soft_face(face):
+    """True when ANY of the face's bounding edges is soft — mirrors how the
+    import flags soft edges from the smoothed curved surfaces of .skp files."""
+    for v in face.loop:
+        for e in v.edges:
+            if getattr(e, "soft", False):
+                return True
+    return False
+
+
+def _boundary_edges(face):
+    """The edges around ``face``'s outer loop, in loop order."""
+    loop = face.loop
+    n = len(loop)
+    out = []
+    for i in range(n):
+        a, b = loop[i], loop[(i + 1) % n]
+        out.append(next((e for e in a.edges if e.other(a) is b), None))
+    return out
+
+
+def _is_hidden_face(face):
+    """True when EVERY bounding edge of the face is hidden: the writer's
+    ``hidden_edges`` applies to all the edges a face creates, so only a
+    face whose outline is fully invisible in IngeTrazo asks for it — a
+    figure's cut-out quad, a leaf card whose outline is its texture mask.
+    Without it the .skp reader drew a black rectangle around Sumari."""
+    edges = _boundary_edges(face)
+    return bool(edges) and all(e is not None and getattr(e, "hidden", False)
+                               for e in edges)
+
+
+def _supported(fn, *names) -> set:
+    """Which of ``names`` the installed OpenSKP's ``fn`` actually accepts.
+
+    The applied size and the opacity gate are OUR additions to the writer
+    (upstream PR #252; the size kwargs are ``applied_width``/``applied_height``
+    there, matching upstream's own ``applied_height``, while the pre-PR fork
+    spelled them ``width``/``height`` — the caller probes for both
+    generations). Passing them blind raised ``TypeError: add_material() got
+    an unexpected keyword argument 'opacity'`` against the pinned upstream —
+    CI red and, worse, every .skp save broken in a build made from it. The
+    rest of this module already guards its OpenSKP joins the same way; these
+    two slipped through.  Older library: the file is written without them (a
+    texture claims one inch per tile, glass exports opaque) instead of not
+    written at all."""
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):          # C accelerator / builtin
+        return set(names)
+    if any(pm.kind is inspect.Parameter.VAR_KEYWORD for pm in params.values()):
+        return set(names)
+    return {n for n in names if n in params}
+
+
+def _stage_texture(src: Path, stage_dir: Path | None, taken: set) -> Path | None:
+    """The image as the writer must see it: readable, PNG or JPEG, and at a
+    SHORT path. openskp stores ``image_path`` verbatim in the .skp and its
+    string writer refuses 255+ characters — AFTER the image bytes and the
+    applied size are already in its buffer. So a long path never "fell
+    back to a colour": the material was left half-written, the colour
+    record landed on top, and the reader refused the whole file (0.3.10's
+    Flatpak: a texture cached under a stacked-hash name of 250 characters
+    spilled into the temp fallback and the path passed 255). Staging into
+    ``stage_dir`` under the image's plain name keeps the stored string short
+    and keeps the user's home path out of the document; without a stage
+    dir (direct callers) the source path is used when it is short enough.
+    Returns None when the file cannot be embedded, and the caller writes a
+    solid colour WITHOUT having touched the writer."""
+    src = Path(src)
+    if stage_dir is None:                   # direct callers: no staging
+        return src if len(str(src)) < 200 else None
+    try:
+        data = src.read_bytes()
+    except OSError:
+        return None
+    from core.texture import texture_file_name
+    base = texture_file_name(src.name)
+    if not (data.startswith(b"\x89PNG\r\n\x1a\n") or data[:3] == b"\xff\xd8\xff"):
+        # BMP / TIFF / GIF — what imported .skp models often carry (a
+        # bridge's soda logos, a slaughterhouse's bronze). openskp embeds
+        # only PNG and JPEG, so re-encode through Qt instead of dropping
+        # the image; what Qt cannot read either becomes a colour.
+        from PySide6.QtGui import QImage
+        from PySide6.QtCore import QBuffer, QIODevice
+        img = QImage(str(src))
+        if img.isNull():
+            return None
+        buf = QBuffer()
+        buf.open(QIODevice.WriteOnly)
+        if not img.save(buf, "PNG"):
+            return None
+        data = bytes(buf.data())
+        base = base.rpartition(".")[0] + ".png" if "." in base else base + ".png"
+    name = base
+    n = 1
+    while name in taken:
+        n += 1
+        stem, dot, ext = base.rpartition(".")
+        name = f"{stem}-{n}.{ext}" if dot else f"{base}-{n}"
+    taken.add(name)
+    out = stage_dir / name
+    out.write_bytes(data)
+    return out
+
+
+def _collect_materials(faces_by_key, builder, stage_dir: Path | None = None,
+                       applied: dict | None = None):
+    """Register all materials on the builder BEFORE any geometry.
+
+    Returns ``mat_handles``: ``key → material_slot``. Unpainted faces never
+    reach here — their ``None`` key stays out of ``faces_by_key``, so they
+    export with no material at all (the .skp default material).
+
+    ``applied``, when given, is filled with ``key → (width, height)``: the
+    applied size in inches the TEXTURED materials were actually written with
+    (1.0 where the writer took none) — the per-face pins have to be scaled
+    by exactly that, see :func:`_compensate_pins`. Keys written as a colour
+    stay out of it, which is how the geometry pass knows not to pin them.
+    """
+    mat_handles = {}
+    from .meshexport import export_names
+
+    names = export_names(faces_by_key)
+    tex_ok = _supported(builder.add_texture_material,
+                        "applied_width", "applied_height",
+                        "width", "height", "opacity")
+    col_ok = _supported(builder.add_material, "opacity")
+    staged_names: set[str] = set()
+    for key, info in faces_by_key.items():
+        if info.get("map"):
+            staged = _stage_texture(info["src"], stage_dir, staged_names)
+            if staged is None:
+                # Unreadable, or not PNG/JPEG: a solid colour, decided HERE
+                # — never by catching the writer's exception, see
+                # _stage_texture.
+                col = info.get("color", (1.0, 1.0, 1.0))
+                mat_handles[key] = builder.add_material(
+                    names[key], _color_to_rgba(col))
+                continue
+            # The applied size, in inches: how much model space one tile
+            # covers. For a texture applied without positioning this IS
+            # the mapping — .skp files carry no per-face record for those
+            # — so leaving it out made every texture claim to span one
+            # inch however large it was. Marco's lawn (3.26 x 8.82 m)
+            # repeated 128 times and lost its aspect; only the surfaces
+            # whose tile was already inch-sized came out right.
+            w_kw, h_kw = (("applied_width", "applied_height")
+                          if "applied_width" in tex_ok
+                          else ("width", "height"))
+            extra = {k: v for k, v in
+                     ((w_kw, info.get("sw_in")),
+                      (h_kw, info.get("sh_in")),
+                      ("opacity", info.get("opacity")))
+                     if k in tex_ok}
+            mat_handles[key] = builder.add_texture_material(
+                names[key], str(staged), **extra)
+            if applied is not None:
+                applied[key] = (float(extra.get(w_kw) or 1.0),
+                                float(extra.get(h_kw) or 1.0))
+        else:
+            extra = ({"opacity": info.get("opacity")} if "opacity" in col_ok
+                     else {})
+            handle = builder.add_material(names[key],
+                                          _color_to_rgba(info["color"]),
+                                          **extra)
+            mat_handles[key] = handle
+    return mat_handles
+
+
+def _collect_layers(scene, builder, used=None):
+    """Register the scene's layers on the builder AFTER materials — only
+    the ones something exported sits on, when ``used`` (a set of names)
+    is given: a purge of unused items on Marco's pool threw away 8 of our 10
+    layers, every one of them empty, and IngeTrazo's default "Layer 0" is
+    the .skp "Layer0" already (a face on it carries no layer).
+
+    Returns ``layer_handles``: ``layer_name → layer_slot``."""
+    from core.layers import DEFAULT_LAYER
+    layer_handles = {}
+    for layer in getattr(scene, "layers", []):
+        name = getattr(layer, "name", None)
+        if not name or name in layer_handles or name == DEFAULT_LAYER:
+            continue
+        if used is not None and name not in used:
+            continue
+        layer_handles[name] = builder.add_layer(name)
+    return layer_handles
+
+
+def _opacity_key(attrs) -> tuple:
+    """Translucency is part of a material's identity: the same image painted
+    at two opacities is two .skp materials, and merging them would make
+    one of them wrong."""
+    op = attrs.get("opacity")
+    return () if op is None or float(op) >= 0.999 else (round(float(op), 3),)
+
+
+def _material_key_attrs(attrs):
+    """Compute the material-grouping key for a face — same logic as
+    ``formats.meshexport.collect_geometry`` and ``formats.obj``, except an
+    unpainted face keys to ``None``: the .skp format has a first-class default
+    material (OBJ/glTF don't, which is why meshexport bakes cream there),
+    so "never painted" round-trips as "no material" instead of coming back
+    as an explicit cream paint that pollutes the per-material takeoff.
+
+    Unlike meshexport, the registry identity (``attrs["mat"]``) is PART of
+    the key: two named materials sharing one recipe (e.g. "Yellow" and
+    "[0056_Yellow]", both the same RGB) stay separate materials in the
+    ``.skp`` instead of silently merging — merged names corrupt the
+    per-material takeoff after a round-trip. Measured on a real model
+    (toril 2017): 9 distinct names shared a recipe with another."""
+    mat = attrs.get("mat")
+    ident = (mat,) if mat else ()
+    tex = attrs.get("texture")
+    if tex is not None and tex.get("path"):
+        src = Path(tex["path"])
+        return ("tex", src.name) + ident + _opacity_key(attrs)
+    col = attrs.get("color")
+    if not col:
+        return None
+    return ("color", tuple(col)) + ident + _opacity_key(attrs)
+
+
+
+def _material_key(face):
+    """:func:`_material_key_attrs` of the face's own (front) paint."""
+    return _material_key_attrs(face.attrs or {})
+
+def _material_info_attrs(attrs):
+    """Build the info dict for a material key — same shape as
+    ``collect_geometry``'s ``materials[key]``."""
+    tex = attrs.get("texture")
+    if tex is not None and tex.get("path"):
+        src = Path(tex["path"])
+        info = {"color": (1.0, 1.0, 1.0), "map": src.name, "src": src}
+        sw, sh = tex.get("sw"), tex.get("sh")
+        if sw:
+            info["sw_in"] = float(sw) * _M_TO_IN
+        if sh:
+            info["sh_in"] = float(sh) * _M_TO_IN
+    else:
+        info = {"color": tuple(attrs["color"]), "map": None}
+    op = attrs.get("opacity")
+    if op is not None and float(op) < 0.999:
+        # Translucency lives on the MATERIAL in a .skp, so it has to reach
+        # the material record: a pool's water (0.6) exported as an opaque
+        # slab without it.
+        info["opacity"] = float(op)
+    mat_name = attrs.get("mat")
+    if mat_name:
+        info["mat"] = mat_name
+    return info
+
+
+
+def _material_info(face, key):
+    """:func:`_material_info_attrs` of the face's own (front) paint."""
+    return _material_info_attrs(face.attrs or {})
+
+def _split_containers(scene):
+    """The scene's exportable geometry, structured: ``(loose_faces,
+    classic_groups, definitions, root_placements)``.
+
+    ``defs`` is the component definitions to write, CHILDREN BEFORE PARENTS
+    (a .skp definition may only reference ones already closed): each
+    ``{"name", "mesh", "children"}`` where ``children`` is
+    ``(definition index, placing group)`` pairs. ``roots`` places the
+    top-level ones. Classic groups (no ``xform``) keep their mesh in world
+    coordinates and may place definitions too.
+
+    Definitions are keyed by prototype mesh AND nested structure, so the
+    hedge's 9600 faces are written ONCE and placed 48 times instead of
+    landing in the file 48 times over — which is the difference between the
+    14 MB the reference .skp takes for that model and the 80 MB we used to.
+
+    Mirrors ``meshexport.world_faces``'s rules: hidden entities are skipped
+    (face-me figures become definitions of their own, see
+    ``_billboard_definition``), and loose faces come from ``scene.loose_mesh``
+    so a group being edited is not double-counted (its mesh is already in
+    ``scene.groups``)."""
+    visible = getattr(scene, "entity_visible", None) or (lambda e: True)
+    mesh = getattr(scene, "loose_mesh", None) or getattr(scene, "mesh", None)
+    faces = mesh.faces if mesh is not None else getattr(scene, "faces", [])
+    loose_faces = [f for f in faces if visible(f)]
+
+    defs: list = []
+    index_of: dict = {}
+
+    def _kids(g):
+        return [c for c in (getattr(g, "children", None) or ())
+                if visible(c) and not getattr(c, "billboard", False)
+                and (c.mesh.faces or getattr(c, "children", None))]
+
+    def _figures(g):
+        return [c for c in (getattr(g, "children", None) or ())
+                if visible(c) and getattr(c, "billboard", False)
+                and c.mesh.faces]
+
+    def _register_figure(c):
+        key = ("figure", id(c))
+        idx = index_of.get(key)
+        if idx is None:
+            idx = index_of[key] = len(defs)
+            defs.append(_billboard_definition(c))
+        return idx
+
+    def _key(g):
+        return (id(g.mesh),
+                tuple((_key(c),
+                       tuple(c.xform.data()) if c.xform is not None else None,
+                       getattr(c, "layer", None)) for c in _kids(g)))
+
+    def _register(g):
+        """Definition index of ``g``'s content, registering its nested
+        definitions FIRST — post-order, which is exactly the order the
+        format needs them written in."""
+        key = _key(g)
+        idx = index_of.get(key)
+        if idx is not None:
+            return idx
+        children = [(_register(c), c) for c in _kids(g)]
+        children += [(_register_figure(c), c) for c in _figures(g)]
+        idx = index_of[key] = len(defs)
+        defs.append({"name": g.name, "mesh": g.mesh, "children": children})
+        return idx
+
+    classic, roots = [], []
+    classic_groups = []
+    figures_at_root = []
+    for g in getattr(scene, "groups", []):
+        if not visible(g):
+            continue
+        if getattr(g, "billboard", False):
+            if g.mesh.faces:
+                figures_at_root.append(g)
+            continue
+        kids = _kids(g)
+        figures = _figures(g)
+        if not g.mesh.faces and not kids and not figures:
+            continue
+        if (getattr(g, "xform", None) is None
+                or not getattr(g, "component", True)):
+            # A group of groups carries a matrix but is no component
+            # (issue #90): it goes out as a .skp GROUP too.
+            classic_groups.append((g, kids, figures))
+        else:
+            roots.append((_register(g), g))
+    # Figures go in LAST: a 1-face definition written first, ahead of the
+    # big ones, was the file the pinned OpenSKP produced with duplicate
+    # persistent IDs that the reader could load but not save (see
+    # _fix_pid_counter); with the figure anywhere else the same model saved.
+    for g in figures_at_root:
+        roots.append((_register_figure(g), g))
+    # Repeated geometry — inside a mesh or across the loose mesh and the
+    # classic groups — becomes shared definitions placed by translation.
+    sources = [("loose", mesh, loose_faces)] if mesh is not None else []
+    sources += [(id(g), g.mesh, None) for g, _k, _f in classic_groups]
+    protos, per_owner = _share_repeats(sources)
+    proto_idx = []
+    for k, (pmesh, n_faces) in enumerate(protos):
+        proto_idx.append(len(defs))
+        defs.append({"name": f"Repetido {k + 1} ({n_faces} caras)",
+                     "mesh": pmesh, "children": []})
+    if mesh is not None:
+        copies, loose_faces = per_owner["loose"]
+        for j, (pi, xf) in enumerate(copies):
+            roots.append((proto_idx[pi], _Copy(xf, f"Repetido {pi + 1}.{j + 1}")))
+    for g, kids, figures in classic_groups:
+        copies, faces = per_owner[id(g)]
+        entries = ([(_register(c), c) for c in kids]
+                   + [(_register_figure(c), c) for c in figures]
+                   + [(proto_idx[pi], _Copy(xf, f"Repetido {pi + 1}.{j + 1}"))
+                      for j, (pi, xf) in enumerate(copies)])
+        classic.append((g, entries, faces))
+    return loose_faces, classic, defs, roots
+
+
+def _billboard_definition(g) -> dict:
+    """A face-me group as a .skp component definition: its geometry in
+    the component's LOCAL frame, feet at the origin, front along −Y — the
+    axis a .skp reader turns toward the camera when the definition carries the
+    always-faces-camera behaviour (the same turn the viewport does around
+    the figure's anchor). The anchor becomes the instance's placement.
+
+    Figures were simply left out of the file before, so every 2D person
+    and cut-out tree vanished on reading (Marco's pool: the man on the
+    deck, the swimmers). Two kinds, mirroring the viewport's two passes:
+    a textured quad (``billboard is True``: a PNG cut-out) is rebuilt as
+    the canonical upright quad the viewport draws, whatever yaw its stored
+    quad has; a vector figure (``"mesh"``: the classic 2D people, real
+    outlines) keeps its faces, turned so the largest one's normal points
+    along −Y. A writer without the behaviour flag still gets the figure —
+    standing still, facing −Y — instead of nothing."""
+    import math
+    from core.mesh import Mesh
+    from core.group import _remap_uvws
+    from PySide6.QtGui import QMatrix4x4
+
+    verts = g.mesh.vertices
+    xs = [v.position.x() for v in verts]
+    ys = [v.position.y() for v in verts]
+    zs = [v.position.z() for v in verts]
+    anchor = QVector3D((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2, min(zs))
+    mesh = Mesh()
+    faces = list(g.mesh.faces)
+    tex = next((f.attrs.get("texture") for f in faces
+                if f.attrs.get("texture", {}).get("path")), None)
+    if g.billboard is True and tex is not None:
+        w = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        h = max(zs) - min(zs)
+        if w > 1e-9 and h > 1e-9:
+            quad = [QVector3D(-w / 2, 0, 0), QVector3D(w / 2, 0, 0),
+                    QVector3D(w / 2, 0, h), QVector3D(-w / 2, 0, h)]
+            face = mesh.add_face(quad)
+            # u across the quad, v up it: the whole picture once.
+            face.attrs = {"texture": {"path": tex["path"], "sw": w, "sh": h,
+                                      "uvw": [1.0 / w, 0.0, 0.0, 0.5,
+                                              0.0, 0.0, 1.0 / h, 0.0]}}
+            src = faces[0].attrs or {}
+            for k in ("layer", "opacity"):
+                if k in src:
+                    face.attrs[k] = src[k]
+            for e in _boundary_edges(face):     # the outline is the PNG's mask
+                if e is not None:
+                    e.hidden = True
+        return {"name": g.name or "Figura", "mesh": mesh, "children": [],
+                "billboard": True, "anchor": anchor}
+    # A vector figure: turn its largest face's normal onto −Y.
+    best, n0 = -1.0, None
+    for f in faces:
+        a = f.area() if hasattr(f, "area") else 0.0
+        if n0 is None or a > best:
+            n0, best = f.normal(), a
+    nh = QVector3D(n0.x(), n0.y(), 0.0) if n0 is not None else QVector3D()
+    m = QMatrix4x4()
+    if nh.length() > 1e-9:
+        nh.normalize()
+        turn = math.degrees(math.atan2(_FACEME_FRONT[1], _FACEME_FRONT[0])
+                            - math.atan2(nh.y(), nh.x()))
+        m.rotate(turn, 0.0, 0.0, 1.0)
+    m.translate(-anchor)
+    for f in faces:
+        pts = [m.map(QVector3D(p)) for p in f.vertices]
+        holes = [[m.map(QVector3D(p)) for p in h] for h in f.holes]
+        nf = mesh.add_face(pts, holes)
+        nf.attrs = dict(f.attrs or {})
+        for old, new in zip(_boundary_edges(f), _boundary_edges(nf)):
+            if old is not None and new is not None:
+                new.soft = getattr(old, "soft", False)
+                new.hidden = getattr(old, "hidden", False)
+    _remap_uvws(mesh, m)
+    return {"name": g.name or "Figura", "mesh": mesh, "children": [],
+            "billboard": True, "anchor": anchor}
+
+
+def _placement(entry, group):
+    """OpenSKP's ``(translation, matrix3x3)`` for placing ``group``: a
+    figure sits at its anchor with no turn (the reader turns it), anything
+    else by its own transform."""
+    if entry.get("billboard"):
+        a = entry["anchor"]
+        return ((a.x() * _M_TO_IN, a.y() * _M_TO_IN, a.z() * _M_TO_IN),
+                (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+    return _instance_placement(group.xform)
+
+
+def _loose_edge_runs(mesh, xf=None) -> list:
+    """The mesh's edges that bound no face, as ``(points, closed, hidden)``
+    polylines for the writer (issue #137, @pacaeiro: «edges without face
+    are not exported to .skp» — the path circle of a sphere, a construction
+    line, a lone outline). The edges of one curve (a circle, an arc) go out
+    as ONE polyline, a ring closed; any other edge on its own. ``xf`` maps
+    the points (a group written in its own axes)."""
+    free = [e for e in mesh.edges if not e.faces]
+    if not free:
+        return []
+
+    def pt(v):
+        p = v.position if hasattr(v, "position") else v
+        if xf is not None:
+            p = xf.map(p)
+        return (float(p.x()) * _M_TO_IN, float(p.y()) * _M_TO_IN,
+                float(p.z()) * _M_TO_IN)          # the .skp speaks inches
+
+    by_curve: dict = {}
+    singles = []
+    for e in free:
+        cid = getattr(e, "curve", None)
+        if cid is None:
+            singles.append(e)
+        else:
+            by_curve.setdefault(cid, []).append(e)
+    runs = []
+    for edges in by_curve.values():
+        chain = _chain_edges(edges)
+        if chain is None:
+            singles.extend(edges)
+            continue
+        verts, closed = chain
+        runs.append(([pt(v) for v in verts], closed,
+                     all(getattr(e, "hidden", False) for e in edges)))
+    for e in singles:
+        runs.append(([pt(e.v0), pt(e.v1)], False, bool(getattr(e, "hidden",
+                                                              False))))
+    return runs
+
+
+def _chain_edges(edges):
+    """``(vertices in order, closed)`` when ``edges`` form one simple path
+    or ring, else ``None``."""
+    adj: dict = {}
+    for e in edges:
+        adj.setdefault(id(e.v0), []).append((e.v1, e))
+        adj.setdefault(id(e.v1), []).append((e.v0, e))
+    if any(len(v) > 2 for v in adj.values()):
+        return None
+    ends = [e.v0 if len(adj[id(e.v0)]) == 1 else e.v1
+            for e in edges if len(adj[id(e.v0)]) == 1
+            or len(adj[id(e.v1)]) == 1]
+    start = ends[0] if ends else edges[0].v0
+    closed = not ends
+    order, used, cur = [start], set(), start
+    while True:
+        nxt = next(((v, e) for v, e in adj[id(cur)] if id(e) not in used),
+                   None)
+        if nxt is None:
+            break
+        v, e = nxt
+        used.add(id(e))
+        if closed and v is start:
+            break
+        order.append(v)
+        cur = v
+    if len(used) != len(edges):
+        return None                        # two pieces: not one polyline
+    return order, closed
+
+
+def _emit_loose_edges(sink, mesh, xf=None) -> None:
+    """Write the mesh's face-less edges into ``sink`` (the model, a group
+    or a component definition) — see :func:`_loose_edge_runs`."""
+    add = getattr(sink, "add_polyline", None)
+    if add is None:
+        return
+    for points, closed, hidden in _loose_edge_runs(mesh, xf):
+        if len(points) < 2:
+            continue
+        try:
+            add(points, closed=closed and len(points) >= 3,
+                hidden_edges=hidden)
+        except Exception:  # noqa: BLE001 - one odd line must not lose the file
+            continue
+
+
+def _local_group(g, faces, kids):
+    """``(placement, local_faces, local_kids)`` for a classic group with its
+    own axes, or ``None`` to write it as before (world coordinates, no
+    placement). Its faces are re-expressed in the axes' coordinates, and
+    anything placed inside it takes the inverse on the left."""
+    axes = getattr(g, "axes", None)
+    if axes is None or axes.isIdentity():
+        return None
+    inv, ok = axes.inverted()
+    if not ok:
+        return None
+    from core.group import transformed_mesh
+    local = transformed_mesh(g.mesh, inv)
+    if len(local.faces) != len(g.mesh.faces):
+        return None                         # a face did not survive the map
+    index = {id(f): i for i, f in enumerate(g.mesh.faces)}
+    try:
+        local_faces = [local.faces[index[id(f)]] for f in faces]
+    except KeyError:
+        return None
+    local_kids = []
+    for di, c in kids:
+        xf = getattr(c, "xform", None)
+        if getattr(c, "billboard", False) or xf is None:
+            return None                     # figures keep the old path
+        moved = _Copy(inv * xf, c.name)
+        moved.layer = getattr(c, "layer", None)
+        local_kids.append((di, moved))
+    return _instance_placement(axes), local_faces, local_kids
+
+
+class _Copy:
+    """A placement synthesised for a copy of a shared piece (see
+    :func:`_share_repeats`): what ``_placement`` needs of a group."""
+    __slots__ = ("xform", "name", "layer", "billboard")
+
+    def __init__(self, xform, name):
+        self.xform = xform
+        self.name = name
+        self.layer = None
+        self.billboard = False
+
+
+#: A piece has to carry at least this many faces before sharing it pays:
+#: an instance costs ~150 bytes, a face with its edges ~240.
+_MIN_PIECE_FACES = 20
+_MATCH_TOL = 2e-3       # metres: two copies agree when every point does
+
+
+def _shift_uvw(uvw, t):
+    """A world→UV map moved with its geometry by ``t``: the gradients stay,
+    the offsets absorb the move (``u = g·(p − t) + c``)."""
+    return [uvw[0], uvw[1], uvw[2],
+            uvw[3] - (uvw[0] * t.x() + uvw[1] * t.y() + uvw[2] * t.z()),
+            uvw[4], uvw[5], uvw[6],
+            uvw[7] - (uvw[4] * t.x() + uvw[5] * t.y() + uvw[6] * t.z())]
+
+
+def _local_mesh(faces, origin):
+    """``faces`` rebuilt in a mesh of their own with ``origin`` at (0, 0, 0):
+    paint, back paint, edge flags and world-anchored texture maps carried
+    along."""
+    from core.mesh import Mesh
+    mesh = Mesh()
+    for f in faces:
+        nf = mesh.add_face([QVector3D(p) - origin for p in f.vertices],
+                           [[QVector3D(p) - origin for p in h] for h in f.holes])
+        attrs = dict(f.attrs or {})
+        tex = attrs.get("texture")
+        if tex and tex.get("uvw"):
+            attrs["texture"] = {**tex, "uvw": _shift_uvw(tex["uvw"], origin)}
+        back = attrs.get("back")
+        btex = back.get("texture") if isinstance(back, dict) else None
+        if btex and btex.get("uvw"):
+            attrs["back"] = {**back, "texture": {**btex, "uvw": _shift_uvw(btex["uvw"], origin)}}
+        nf.attrs = attrs
+        for old, new in zip(_boundary_edges(f), _boundary_edges(nf)):
+            if old is not None and new is not None:
+                new.soft = getattr(old, "soft", False)
+                new.hidden = getattr(old, "hidden", False)
+    return mesh
+
+
+class _Piece:
+    """A connected piece of a mesh and what matching needs of it: its
+    origin (XY centroid, lowest z), its points about that origin, and a
+    fingerprint that ignores where it sits and how it is turned about Z."""
+    __slots__ = ("owner", "faces", "verts", "origin", "pts", "key")
+
+    def __init__(self, owner, faces, verts):
+        self.owner, self.faces, self.verts = owner, faces, verts
+        n = float(len(verts))
+        cx = sum(v.position.x() for v in verts) / n
+        cy = sum(v.position.y() for v in verts) / n
+        z0 = min(v.position.z() for v in verts)
+        self.origin = QVector3D(cx, cy, z0)
+        self.pts = [(v.position.x() - cx, v.position.y() - cy,
+                     v.position.z() - z0) for v in verts]
+        radial = sorted(round(math.hypot(x, y), 2) for x, y, _z in self.pts)
+        heights = sorted(round(z, 2) for _x, _y, z in self.pts)
+        self.key = (len(faces), len(verts), tuple(radial), tuple(heights))
+
+
+def _pieces(owner, mesh, faces=None):
+    """The connected pieces of ``mesh`` (faces joined through shared
+    vertices). ``faces`` restricts the walk (the loose mesh's VISIBLE
+    faces)."""
+    parent: dict = {}
+
+    def find(v):
+        root = v
+        while parent.get(root, root) is not root:
+            root = parent[root]
+        while parent.get(v, v) is not root:
+            nxt = parent[v]
+            parent[v] = root
+            v = nxt
+        return root
+
+    for e in mesh.edges:
+        ra, rb = find(e.v0), find(e.v1)
+        if ra is not rb:
+            parent[ra] = rb
+    by_root: dict = {}
+    for f in (mesh.faces if faces is None else faces):
+        if not f.loop:
+            continue
+        by_root.setdefault(find(f.loop[0]), []).append(f)
+    out = []
+    for fs in by_root.values():
+        verts = set()
+        for f in fs:
+            verts.update(f.loop)
+            for h in f.hole_loops:
+                verts.update(h)
+        out.append(_Piece(owner, fs, verts))
+    return out
+
+
+def _sorted_pts(pts):
+    return sorted(pts, key=lambda p: (round(p[0], 3), round(p[1], 3), round(p[2], 3)))
+
+
+def _same_points(a, b):
+    if len(a) != len(b):
+        return False
+    for pa, pb in zip(a, b):
+        if (abs(pa[0] - pb[0]) > _MATCH_TOL or abs(pa[1] - pb[1]) > _MATCH_TOL
+                or abs(pa[2] - pb[2]) > _MATCH_TOL):
+            return False
+    return True
+
+
+def _turn_onto(proto, cand):
+    """The angle (degrees) that turns ``cand`` about its vertical axis onto
+    ``proto`` — verified point for point — or ``None``. The farthest point
+    from the axis fixes the angle up to the ties among equally far points,
+    each of which is tried."""
+    ref = _sorted_pts(proto.pts)
+    r_max = max(math.hypot(x, y) for x, y, _z in proto.pts)
+    if r_max < 1e-6:
+        return 0.0 if _same_points(ref, _sorted_pts(cand.pts)) else None
+    px, py, _ = max(proto.pts, key=lambda p: math.hypot(p[0], p[1]))
+    a_ref = math.atan2(py, px)
+    tried = set()
+    for qx, qy, _ in cand.pts:
+        if abs(math.hypot(qx, qy) - r_max) > _MATCH_TOL:
+            continue
+        ang = a_ref - math.atan2(qy, qx)
+        k = round(ang, 4)
+        if k in tried:
+            continue
+        tried.add(k)
+        c, s_ = math.cos(ang), math.sin(ang)
+        turned = [(c * x - s_ * y, s_ * x + c * y, z) for x, y, z in cand.pts]
+        if _same_points(ref, _sorted_pts(turned)):
+            return math.degrees(ang)
+    return None
+
+
+def _same_paint(fa, fb, to_a):
+    """Whether two corresponding faces of two copies look the same: same
+    materials both sides and, for a texture, the same picture at the same
+    place on the piece (a default-projected texture is anchored to the
+    WORLD, so two copies of a wall may show different slices of it).
+    ``to_a`` maps ``fb``'s world onto ``fa``'s."""
+    if _material_key(fa) != _material_key(fb):
+        return False
+    ba, bb = fa.attrs.get("back"), fb.attrs.get("back")
+    if isinstance(ba, dict) != isinstance(bb, dict) \
+            or (ba is True) != (bb is True):
+        return False           # a two-sided face is not a one-sided one
+    if isinstance(ba, dict) and _material_key_attrs(ba) != _material_key_attrs(bb):
+        return False
+    pa = sorted(fa.vertices, key=lambda p: (round(p.x(), 3), round(p.y(), 3), round(p.z(), 3)))
+    pb = sorted(((to_a.map(q), q) for q in fb.vertices),
+                key=lambda pq: (round(pq[0].x(), 3), round(pq[0].y(), 3), round(pq[0].z(), 3)))
+    for ta, tb in ((fa.attrs.get("texture"), fb.attrs.get("texture")),
+                   ((ba or {}).get("texture") if isinstance(ba, dict) else None,
+                    (bb or {}).get("texture") if isinstance(bb, dict) else None)):
+        if not (ta and ta.get("path")):
+            continue
+        gu_a, cu_a, gv_a, cv_a = face_uv_axes(ta, fa.normal())
+        gu_b, cu_b, gv_b, cv_b = face_uv_axes(tb, fb.normal())
+        for p, (_pm, q) in zip(pa[:3], pb[:3]):
+            if abs(QVector3D.dotProduct(gu_a, p) + cu_a
+                   - QVector3D.dotProduct(gu_b, q) - cu_b) > 1e-3:
+                return False
+            if abs(QVector3D.dotProduct(gv_a, p) + cv_a
+                   - QVector3D.dotProduct(gv_b, q) - cv_b) > 1e-3:
+                return False
+    return True
+
+
+def _face_order(faces, to_frame):
+    def key(f):
+        c = to_frame.map(f.centroid())
+        return (round(c.x(), 3), round(c.y(), 3), round(c.z(), 3), len(f.loop))
+    return sorted(faces, key=key)
+
+
+def _share_repeats(sources):
+    """Copies of one piece — inside a mesh, or across meshes; moved, and
+    turned about the vertical — written ONCE and placed. ``sources`` is
+    ``[(owner, mesh, faces)]`` (``faces`` None for the whole mesh); returns
+    ``(protos, per_owner)``: ``protos[i] = (local_mesh, n_faces)`` and
+    ``per_owner[owner] = (copies, remaining_faces)`` with ``copies`` a list
+    of ``(proto_index, xform)`` — the placement, local metres → owner metres.
+
+    A model saved by an older IngeTrazo has its components exploded: Marco's
+    pool carries 24 hedges — 7200 leaves — fused into ONE group of 230 400
+    faces, three identical benches as three groups. The .skp format keeps such
+    things as one definition placed N times, and so does this writer for
+    groups that share a mesh object — but not for geometry that merely
+    LOOKS the same. Now it does: the connected pieces of every mesh get a
+    fingerprint that ignores position and turn about Z (face and vertex
+    counts, the sorted distances from the axis and heights), candidates are
+    turned onto the prototype and compared point for point, then paint face
+    for face (materials, both sides, texture placement). Only exact copies
+    share; a mirrored or rescaled copy is written as it is."""
+    from PySide6.QtGui import QMatrix4x4
+    pool = []
+    for owner, mesh, only in sources:
+        pool.extend(_pieces(owner, mesh, only))
+    per_owner = {owner: ([], []) for owner, _m, _o in sources}
+    classes: dict = {}
+    for piece in pool:
+        classes.setdefault(piece.key, []).append(piece)
+    protos = []
+    for key, members in classes.items():
+        if len(members) < 2 or key[0] < _MIN_PIECE_FACES:
+            for piece in members:
+                per_owner[piece.owner][1].extend(piece.faces)
+            continue
+        pending = list(members)
+        while pending:
+            proto = pending.pop(0)
+            matched, rest = [(proto, 0.0)], []
+            for cand in pending:
+                ang = _turn_onto(proto, cand)
+                if ang is None:
+                    rest.append(cand)
+                    continue
+                to_proto = QMatrix4x4()
+                to_proto.translate(proto.origin)
+                to_proto.rotate(ang, 0.0, 0.0, 1.0)
+                to_proto.translate(-cand.origin)
+                ident = QMatrix4x4()
+                if all(_same_paint(fa, fb, to_proto) for fa, fb
+                       in zip(_face_order(proto.faces, ident),
+                              _face_order(cand.faces, to_proto))):
+                    matched.append((cand, ang))
+                else:
+                    rest.append(cand)
+            pending = rest
+            if len(matched) < 2:
+                per_owner[proto.owner][1].extend(proto.faces)
+                continue
+            idx = len(protos)
+            protos.append((_local_mesh(proto.faces, proto.origin), len(proto.faces)))
+            for piece, ang in matched:
+                xf = QMatrix4x4()
+                xf.translate(piece.origin)
+                xf.rotate(-ang, 0.0, 0.0, 1.0)
+                per_owner[piece.owner][0].append((idx, xf))
+    return protos, per_owner
+
+
+def _opt_material(fn, handle) -> dict:
+    """``{"material": handle}`` when there is one and ``fn`` takes it
+    (openskp ≥ 1.3 does on instances and groups), else nothing."""
+    if handle is None or "material" not in _supported(fn, "material"):
+        return {}
+    return {"material": handle}
+
+
+def _iter_export_faces(loose_faces, classic, defs):
+    """Every face the geometry pass will emit, prototype meshes ONCE — the
+    material pass must cover exactly this set, no more (a prototype's attrs
+    are shared by its instances, so visiting it per-instance is redundant)."""
+    yield from loose_faces
+    for _g, _kids, faces in classic:
+        yield from faces
+    for d in defs:
+        yield from d["mesh"].faces
+
+
+_QUIRK_CACHE: dict = {}
+
+
+def _writer_uv_quirks(openskp, stage_dir: Path) -> frozenset:
+    """Which of two UV-pinning defects the installed OpenSKP writer has —
+    probed by BEHAVIOUR, the way ``_supported`` probes by signature, so the
+    compensation in :func:`_compensate_pins` switches itself off the day
+    upstream ships the fix (the release installs upstream's openskp, not
+    the fork: see the ``_supported`` docstring for how that bit before).
+
+    * ``"first-edge basis"`` — ``add_face(front_uv=)`` solves its 3×3 in the
+      basis (first edge, n × first edge) while the reader reads it in
+      (Z × n, n × Z × n): every pinned face came out turned by the angle of
+      its first edge. A palm trunk of thousands of quads, each with its own
+      first edge, arrived shattered.
+    * ``"unscaled pins"`` — a .skp keeps that matrix in INCHES of texture
+      space, divided by the material's applied size on reading; the
+      writer stores the pins' tile-unit UVs as given. Marco's pool water
+      (2 m tile = 78.7 in) came out 78.7× too big: one flat blue slab.
+      openskp's own ``edit`` module dodges this by writing applied size 1.0
+      — not an option here, where ``planar`` faces of the same material
+      rely on the real size.
+
+    Both measured through the former external converter (2026-09-04,
+    identity on 11 orientations once compensated). The probe writes one
+    horizontal square whose first edge runs along +Y, material applied size
+    10 in, pinned to ``u = x/10, v = y/10``, and reads the stored matrix
+    back with openskp's parser (calibrated against real files): a correct
+    writer stores a diagonal with positive entries and unit scale; the
+    first-edge basis shows as a 90° turn, unscaled pins as scale 10. A
+    writer the probe cannot exercise is trusted as fixed."""
+    quirks = _QUIRK_CACHE.get(id(openskp))
+    if quirks is not None:
+        return quirks
+    found: set = set()
+    try:
+        from PySide6.QtGui import QImage
+        png = stage_dir / "uv-probe.png"
+        img = QImage(4, 4, QImage.Format_RGBA8888)
+        img.fill(0xFFFFFFFF)
+        img.save(str(png), "PNG")
+        b = openskp.create()
+        ok = _supported(b.add_texture_material,
+                        "applied_width", "applied_height", "width", "height")
+        size = {k: 10.0 for k in (("applied_width", "applied_height")
+                                  if "applied_width" in ok
+                                  else ("width", "height")) if k in ok}
+        mat = b.add_texture_material("uv-probe", str(png), **size)
+        b.add_face([(0.0, 0.0, 0.0), (0.0, 10.0, 0.0),
+                    (-10.0, 10.0, 0.0), (-10.0, 0.0, 0.0)],
+                   material=mat,
+                   front_uv=[((0.0, 0.0, 0.0), (0.0, 0.0)),
+                             ((10.0, 0.0, 0.0), (1.0, 0.0)),
+                             ((0.0, 10.0, 0.0), (0.0, 1.0))])
+        out = stage_dir / "uv-probe.skp"
+        b.save(str(out))
+        model = openskp.SkpFile.open(str(out)).parse()
+        face = next(iter(model.root.faces.values()))
+        m = face.uv_transform
+        if m is not None and len(m) == 9:
+            a0, b0, c0, d0 = m[0], m[1], m[3], m[4]
+            if a0 <= 0 or abs(b0) > 1e-6 * max(1.0, abs(a0)):
+                found.add("first-edge basis")
+            if abs(math.sqrt(abs(a0 * d0 - b0 * c0)) - 10.0) < 1e-3:
+                found.add("unscaled pins")
+    except Exception:  # noqa: BLE001 — a writer we can't probe: trust it
+        found = set()
+    quirks = frozenset(found)
+    _QUIRK_CACHE[id(openskp)] = quirks
+    return quirks
+
+
+def _compensate_pins(pairs, pts_in, normal, quirks, applied):
+    """Undo in advance what the installed writer will do wrong with the
+    pins (:func:`_writer_uv_quirks`), so the matrix that lands in the file
+    is the one a .skp reader reads back correctly.
+
+    Scale: the UVs handed over in inches of texture space (× applied size),
+    which is what the reader divides by the applied size on read. Basis: in
+    place of the real point, one whose projection on the WRITER's basis
+    (U = first edge of the very point list it receives — the face, or the
+    triangle of the fallback — W = n × U) equals the real point's
+    projection on the reader's (Z × n, n × Z × n). The writer only ever dots
+    a pin's point with its two axes, never asks it to lie on the face, so
+    the fit it solves is exactly the one it should have solved."""
+    aw, ah = applied
+    if "unscaled pins" in quirks:
+        pairs = [(pt, (u * aw, v * ah)) for pt, (u, v) in pairs]
+    if "first-edge basis" in quirks and len(pts_in) >= 2:
+        # The normal the reader will read is the plane the WRITER computes
+        # from these very points, in float64 — not IngeTrazo's float32
+        # one. A horizontal face is exactly vertical there while the
+        # float32 normal carried (2.9e-6, 0, 1): the Z × n basis snaps to
+        # the world axes only at the vertical, so the two bases were 90°
+        # apart and every horizontal countertop in Marco's pool came out
+        # turned. (Face.normal accumulates in doubles since, but the
+        # writer's own plane is the one that ends up in the file.)
+        nt = _writer_normal(pts_in) or _tuple3(QVector3D(normal).normalized())
+        ux, uy, uz = (pts_in[1][i] - pts_in[0][i] for i in range(3))
+        lu = math.sqrt(ux * ux + uy * uy + uz * uz)
+        if lu < 1e-12:
+            return pairs                   # degenerate: the writer will balk
+        u = (ux / lu, uy / lu, uz / lu)
+        w = (nt[1] * u[2] - nt[2] * u[1],
+             nt[2] * u[0] - nt[0] * u[2],
+             nt[0] * u[1] - nt[1] * u[0])
+        lw = math.sqrt(sum(c * c for c in w))
+        if lw < 1e-12:
+            return pairs
+        w = (w[0] / lw, w[1] / lw, w[2] / lw)
+        xr, yr = projection_basis(nt)
+        fixed = []
+        for pt, uv in pairs:
+            px = pt[0] * xr[0] + pt[1] * xr[1] + pt[2] * xr[2]
+            py = pt[0] * yr[0] + pt[1] * yr[1] + pt[2] * yr[2]
+            fixed.append(((px * u[0] + py * w[0],
+                           px * u[1] + py * w[1],
+                           px * u[2] + py * w[2]), uv))
+        pairs = fixed
+    return pairs
+
+
+def _tuple3(v) -> tuple:
+    return (v.x(), v.y(), v.z())
+
+
+def _writer_normal(pts_in) -> tuple | None:
+    """The unit plane normal the OpenSKP writer stores for ``pts_in`` —
+    its own Newell sum in float64 — so the pins are expressed against the
+    plane the reader will actually read. Falls back to the same sum done
+    here when the writer does not expose it."""
+    try:
+        from openskp.create import _plane_from_polygon
+        nx, ny, nz, _d = _plane_from_polygon(pts_in)
+        return (nx, ny, nz)
+    except Exception:  # noqa: BLE001 — refactored writer or degenerate face
+        n = len(pts_in)
+        nx = ny = nz = 0.0
+        for i in range(n):
+            x0, y0, z0 = pts_in[i]
+            x1, y1, z1 = pts_in[(i + 1) % n]
+            nx += (y0 - y1) * (z0 + z1)
+            ny += (z0 - z1) * (x0 + x1)
+            nz += (x0 - x1) * (y0 + y1)
+        ln = math.sqrt(nx * nx + ny * ny + nz * nz)
+        return (nx / ln, ny / ln, nz / ln) if ln > 1e-12 else None
+
+
+def _face_uv_pairs(face, points=None, quirks=frozenset(), applied=(1.0, 1.0),
+                   tex=None):
+    """Where the face's texture sits, as the three ``(point, (u, v))`` pairs
+    OpenSKP fits its UV matrix through — or ``None`` for an untextured or
+    degenerate face, which then takes the .skp default projection.
+
+    Without this the exporter wrote textured faces with no mapping at all,
+    and a model saved from IngeTrazo opened in a web .skp viewer with every
+    texture gone, each surface flat in its average colour (Marco's pool: the
+    water lavender, the deck terracotta, the palm a black silhouette). The
+    recipe is shared with the renderer through ``core.texture.face_uv_axes``,
+    so what the .skp carries is what the viewport showed.
+
+    The points are handed over in INCHES, like the rest of the geometry, but
+    the coordinates are read in metres — a pair only says "this point lands
+    on that texture coordinate", and the two spaces must not be mixed.
+
+    ``quirks``/``applied`` (from :func:`_writer_uv_quirks` and
+    ``_collect_materials``) route the pairs through :func:`_compensate_pins`
+    for a writer that would otherwise store them turned and unscaled.
+    ``tex`` names the texture dict to pin (the back side's, when that is
+    painted differently); the face's own front texture by default."""
+    if tex is None:
+        tex = face.attrs.get("texture")
+    if not tex or not tex.get("path"):
+        return None
+    if tex.get("planar"):
+        # The .skp default projection: the material's applied size is the
+        # whole mapping and the file carries no per-face record — its own
+        # files do exactly this for a texture applied without positioning
+        # (all three faces of the calibration model, and two thirds of the
+        # textured faces in Marco's pool). Pinning one here would fight the
+        # format AND rotate the result, since the writer expresses a UV
+        # matrix in the face's first-edge basis while the reader uses one
+        # derived from the normal.
+        return None
+    ref = uv_reference_points(points if points is not None else face.vertices,
+                              face.normal())
+    if ref is None:
+        return None
+    gu, cu, gv, cv = face_uv_axes(tex, face.normal())
+    pairs = [
+        (pt, (QVector3D.dotProduct(gu, p) + cu,
+              QVector3D.dotProduct(gv, p) + cv))
+        for p, pt in zip(ref, _pts_inches(ref))
+    ]
+    if not quirks:
+        return pairs
+    verts = points if points is not None else face.vertices
+    return _compensate_pins(pairs, _pts_inches(verts), face.normal(),
+                            quirks, applied)
+
+
+def _emit_face(sink, face, mat_handles, layer_handles, SkpWriteError,
+               quirks=frozenset(), applied=None):
+    """Write one face (outer loop + holes) to ``sink`` — the root builder or
+    an open group/component definition; all three expose the same
+    ``add_face``.
+
+    OpenSKP's ``add_face`` requires strict coplanarity (tolerance ~1e-6 ×
+    the face's SPAN) and our vertices are float32, so a small face far from
+    the origin inherits the rounding of a big number and is refused: 15516 of
+    the 75486 faces of Marco's pool, each then written as a fan of triangles
+    (+18k face records, and the edges that come with them). Snapping each
+    face onto its own best-fit plane fixes the test and costs more: it moves
+    corners PER FACE, so neighbours stop sharing vertices and every shared
+    edge gets written twice (measured: 169878 edges -> 222473, file 28.7 ->
+    30.8 MB). The tolerance wants to scale with coordinate magnitude rather
+    than face span — an OpenSKP matter. Until then a rejected polygon falls
+    back to triangulation: ``face.triangulate()`` is hole-aware, triangles
+    are coplanar by definition, and the original corners are kept, so the
+    welding survives.
+
+    Pins go only with a material that was written TEXTURED (``applied``
+    knows which): an image that fell back to a colour has nothing to
+    position, and the fallback triangles get their own pins, fitted on the
+    triangle the writer sees.
+
+    Each side gets what it wears here, and the .skp shows the same:
+    ``attrs["back"]`` as a dict is the back's own material and pins,
+    ``True`` a two-sided face (the front's material and pins again), and an
+    absent back is the .skp default back — unless the front is
+    translucent, which reads on both sides here and so is painted on both
+    there (``core.materials.back_is_default``, the renderer's rule). Until
+    2026-09-11 every paint was drawn on both sides, and the writer had to
+    paint both to match (the lavender backs of Marco's pool in a web
+    .skp viewer, 2026-09-04); now the two agree face by face."""
+    key = _material_key(face)
+    material = mat_handles.get(key)
+    face_layer = face.attrs.get("layer")
+    layer = layer_handles.get(face_layer) if face_layer else None
+    soft = _is_soft_face(face)
+    hidden = _is_hidden_face(face)
+    size = applied.get(key) if applied is not None else (1.0, 1.0)
+    ftex = face.attrs.get("texture")
+    back = face.attrs.get("back")
+    if isinstance(back, dict):
+        bkey = _material_key_attrs(back)
+        back_material = mat_handles.get(bkey)
+        bsize = applied.get(bkey) if applied is not None else (1.0, 1.0)
+        btex = back.get("texture")
+    elif back is True or not back_is_default(face.attrs):
+        back_material, bsize, btex = material, size, ftex
+    else:
+        back_material, bsize, btex = None, None, None
+    both = _both_sides(sink) and back_material is not None
+
+    def pins(points, tex, sz):
+        if sz is None or not tex:
+            return None
+        return _face_uv_pairs(face, points, quirks=quirks, applied=sz, tex=tex)
+
+    def sides(points=None):
+        front_uv = pins(points, ftex, size)
+        if not both:
+            return {"front_uv": front_uv}
+        back_uv = front_uv if btex is ftex and bsize == size \
+            else pins(points, btex, bsize)
+        return {"front_uv": front_uv, "back_uv": back_uv,
+                "back_material": back_material}
+
+    try:
+        sink.add_face(
+            _pts_inches(face.vertices),
+            material=material,
+            layer=layer,
+            soft_edges=soft,
+            smooth_edges=soft,
+            hidden_edges=hidden,
+            holes=[_pts_inches(h) for h in face.holes],
+            **sides(),
+        )
+    except SkpWriteError:
+        for tri in face.triangulate():
+            try:
+                sink.add_face(
+                    _pts_inches(tri),
+                    material=material,
+                    layer=layer,
+                    soft_edges=True,
+                    smooth_edges=True,
+                    hidden_edges=hidden,
+                    **sides(tri),
+                )
+            except SkpWriteError:
+                pass  # Degenerate triangle — skip silently.
+
+
+_BOTH_SIDES: dict = {}
+
+
+def _both_sides(sink) -> bool:
+    """Whether this writer's ``add_face`` takes ``back_material``/``back_uv``
+    (guarded like every other OpenSKP join; probed once per builder class,
+    not per face)."""
+    kind = type(sink)
+    ok = _BOTH_SIDES.get(kind)
+    if ok is None:
+        ok = _BOTH_SIDES[kind] = (
+            _supported(sink.add_face, "back_material", "back_uv")
+            == {"back_material", "back_uv"})
+    return ok
+
+
+#: OpenSKP's placement for "no transform at all".
+_IDENTITY_PLACEMENT = ((0.0, 0.0, 0.0),
+                       (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+
+
+def _instance_placement(xform):
+    """Split a ``QMatrix4x4`` (local metres → world metres) into OpenSKP's
+    ``(translation, matrix3x3)``: the rotation/scale 3×3 is unitless so it
+    passes through row-major unchanged; only the translation converts to
+    inches. Inverse of ``skp_openskp._matrix``.
+
+    ``None`` is the IDENTITY, not an error: a CLASSIC group owns its
+    geometry in the coordinates its parent expects and has no matrix at all
+    — that is the whole difference from an instance. Reading rows off the
+    None killed the .skp export on any container holding such a child
+    (found on Plaza Yanque, 2026-09-17: «Group 8»)."""
+    if xform is None:
+        return _IDENTITY_PLACEMENT
+    r0, r1, r2 = xform.row(0), xform.row(1), xform.row(2)
+    matrix3x3 = (r0.x(), r0.y(), r0.z(),
+                 r1.x(), r1.y(), r1.z(),
+                 r2.x(), r2.y(), r2.z())
+    translation = (r0.w() * _M_TO_IN, r1.w() * _M_TO_IN, r2.w() * _M_TO_IN)
+    return translation, matrix3x3
+
+
+def save_skp(scene, path) -> None:
+    """Write the scene as a ``.skp`` to ``path``."""
+    try:
+        import openskp
+        from openskp import SkpWriteError
+    except ImportError as exc:
+        raise RuntimeError("OpenSKP is required for SKP export") from exc
+
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="ingetrazo-skp-") as stage:
+        _write_skp(scene, path, openskp, SkpWriteError, Path(stage))
+
+
+def _write_skp(scene, path, openskp, SkpWriteError, stage_dir: Path) -> None:
+    builder = openskp.create()
+    loose_faces, classic, defs, roots = _split_containers(scene)
+
+    # ---- Pass 1: collect material and layer info from all faces ----------
+    materials_info: dict[tuple, dict] = {}
+    for face in _iter_export_faces(loose_faces, classic, defs):
+        for attrs in (face.attrs, face.attrs.get("back")):
+            if not isinstance(attrs, dict):
+                continue
+            key = _material_key_attrs(attrs)
+            if key is None:  # unpainted — the .skp default material
+                continue
+            if key not in materials_info:
+                materials_info[key] = _material_info_attrs(attrs)
+            elif attrs.get("mat") and "mat" not in materials_info[key]:
+                materials_info[key]["mat"] = attrs["mat"]
+
+    # Register materials (must be before layers and geometry).
+    # A container's own paint (issue #47) is a material too: the .skp
+    # format keeps it on the group / instance and its default faces show it.
+    def _containers():
+        for g, kids, _faces in classic:
+            yield g
+            yield from (c for _ci, c in kids)
+        for d in defs:
+            yield from (c for _ci, c in d["children"])
+        yield from (g for _di, g in roots)
+
+    for g in _containers():
+        paint = getattr(g, "material", None)
+        if not isinstance(paint, dict):
+            continue
+        key = _material_key_attrs(paint)
+        if key is not None and key not in materials_info:
+            materials_info[key] = _material_info_attrs(paint)
+
+    applied: dict = {}
+    mat_handles = _collect_materials(materials_info, builder, stage_dir,
+                                     applied)
+
+    def _container_material(g):
+        paint = getattr(g, "material", None)
+        if not isinstance(paint, dict):
+            return None
+        return mat_handles.get(_material_key_attrs(paint))
+    # Textured faces get per-face pins; probe the writer once (a tiny .skp
+    # in the stage dir) to learn what it does to them.
+    quirks = _writer_uv_quirks(openskp, stage_dir) if applied else frozenset()
+
+    # Register layers (must be after materials, before geometry) — the
+    # ones in use only.
+    used_layers = {f.attrs.get("layer") for f in
+                   _iter_export_faces(loose_faces, classic, defs)}
+    for g, entries, _faces in classic:
+        used_layers.add(getattr(g, "layer", None))
+        used_layers.update(getattr(c, "layer", None) for _i, c in entries)
+    for d in defs:
+        used_layers.update(getattr(c, "layer", None) for _i, c in d["children"])
+    used_layers.update(getattr(g, "layer", None) for _i, g in roots)
+    used_layers.discard(None)
+    layer_handles = _collect_layers(scene, builder, used_layers)
+
+    # ---- Pass 2: emit geometry -------------------------------------------
+    # Groups and component definitions must ALL be written before any
+    # root-level face or instance — OpenSKP splices definitions in after
+    # materials and layers, so their slot numbering locks once root
+    # geometry starts.
+    faceme_ok = "always_faces_camera" in _supported(
+        builder.add_component_definition, "always_faces_camera")
+
+    def _place_children(container, children):
+        """Write a container's nested placements — the component's own
+        internal sharing, kept instead of flattened."""
+        for ci, c in children:
+            translation, matrix3x3 = _placement(defs[ci], c)
+            # A child that is a GROUP (a classic one, or a group of groups)
+            # is placed as a .skp group, not as a component instance
+            # (issue #90); components, figures and shared repeats stay
+            # instances.
+            as_group = (not getattr(c, "billboard", False)
+                        and (getattr(c, "xform", None) is None
+                             or not getattr(c, "component", True)))
+            place = (container.add_group_instance
+                     if as_group and hasattr(container, "add_group_instance")
+                     else container.add_instance)
+            place(
+                handles[ci],
+                name=c.name,
+                translation=translation,
+                matrix3x3=matrix3x3,
+                layer=layer_handles.get(getattr(c, "layer", None)),
+                **_opt_material(place, _container_material(c)),
+            )
+
+    # Definitions come first and in registration order — post-order, so a
+    # definition is always closed before the one that places it is opened,
+    # which is the only order this format accepts.
+    handles: list = []
+    for d in defs:
+        flags = ({"always_faces_camera": True}
+                 if d.get("billboard") and faceme_ok else {})
+        with builder.add_component_definition(d["name"], **flags) as defn:
+            for face in d["mesh"].faces:
+                _emit_face(defn, face, mat_handles, layer_handles,
+                           SkpWriteError, quirks, applied)
+            if not d.get("billboard"):
+                _emit_loose_edges(defn, d["mesh"])
+            _place_children(defn, d["children"])
+        handles.append(defn)
+
+    for g, kids, faces in classic:
+        # A group that knows its own axes (issue #44) goes out the way
+        # the .skp format keeps groups: geometry in its local coordinates,
+        # the axes as the placement — so it opens in a reader turned the way
+        # it is, with its bounding box and axes on it.
+        if getattr(g, "xform", None) is not None:
+            # A group of groups: its own faces and its children's
+            # placements are in its local frame, its matrix places it.
+            placed = (_instance_placement(g.xform), faces, kids)
+        else:
+            placed = _local_group(g, faces, kids)
+        edge_xf = None
+        if placed is not None:
+            placement, faces, kids = placed
+            kw = {"translation": placement[0], "matrix3x3": placement[1]}
+            if getattr(g, "xform", None) is None:
+                edge_xf = g.axes.inverted()[0]   # into the group's axes
+        else:
+            kw = {}
+        with builder.add_group(
+                g.name, layer=layer_handles.get(getattr(g, "layer", None)),
+                **kw,
+                **_opt_material(builder.add_group,
+                                _container_material(g))) as grp:
+            for face in faces:
+                _emit_face(grp, face, mat_handles, layer_handles,
+                           SkpWriteError, quirks, applied)
+            _emit_loose_edges(grp, g.mesh, edge_xf)
+            _place_children(grp, kids)
+
+    for face in loose_faces:
+        _emit_face(builder, face, mat_handles, layer_handles, SkpWriteError,
+                   quirks, applied)
+    loose_mesh = (getattr(scene, "loose_mesh", None)
+                  or getattr(scene, "mesh", None))
+    if loose_mesh is not None:
+        _emit_loose_edges(builder, loose_mesh)
+
+    for di, g in roots:
+        translation, matrix3x3 = _placement(defs[di], g)
+        builder.add_instance(
+            handles[di],
+            name=g.name,
+            translation=translation,
+            matrix3x3=matrix3x3,
+            layer=layer_handles.get(getattr(g, "layer", None)),
+            **_opt_material(builder.add_instance, _container_material(g)),
+        )
+
+    _emit_annotations(scene, builder)
+
+    builder.save(str(Path(path)))
+    _fix_pid_counter(Path(path), builder)
+
+
+def _fix_pid_counter(path: Path, builder) -> None:
+    """Stopgap for the pinned OpenSKP: make the file's persistent-ID counter
+    cover every pid the writer handed out.
+
+    That writer numbers each section's pids from 1 again and grows the
+    header's counter by materials and layers only, so the reader — which
+    renumbers the duplicates it finds on load — could open our files but
+    not SAVE them (a serialization error on save; "Guardado
+    fallido" in a web .skp viewer, Marco 2026-09-04). A counter that covers the
+    biggest section rescues most models; the fork's writer runs one pid
+    sequence across sections (``_pid_start`` on the builder) and needs
+    nothing here. The field is a u32 at ``_PID_COUNTER_POS`` — measured:
+    2 000 000 round-trips through the former external converter. Best effort: any surprise in
+    the writer's internals leaves the file as written."""
+    if hasattr(builder, "_pid_start"):
+        return                                   # a writer that numbers pids right
+    try:
+        import struct
+        from openskp.create import _PID_COUNTER_POS as pos
+        writers = [getattr(builder, name, None) for name in
+                   ("_material_writer", "_layer_writer", "_definition_writer",
+                    "_geometry_writer")]
+        used = sum(max(0, w.next_pid - 1) for w in writers if w is not None)
+        if used <= 0:
+            return
+        with open(path, "r+b") as fh:
+            fh.seek(pos)
+            current = struct.unpack("<I", fh.read(4))[0]
+            fh.seek(pos)
+            fh.write(struct.pack("<I", current + used))
+    except Exception:  # noqa: BLE001 — refactored writer: leave the file alone
+        return
+
+
+def _emit_annotations(scene, builder) -> None:
+    """Write dimensions and leader texts, when this openskp has the writer
+    (add_dimension/add_text — our annotations branch; harmless no-op before
+    it lands upstream).
+
+    The .skp free dimension stores a SCALAR offset; the reader derives the
+    plane itself, so the scalar is our offset vector projected on the same
+    in-plane perpendicular the importer uses (cross(Z, segment) with the
+    import's fallbacks) — export∘import is the identity on our own files.
+    """
+    from PySide6.QtGui import QVector3D
+    add_dim = getattr(builder, "add_dimension", None)
+    add_text = getattr(builder, "add_text", None)
+    if add_dim is not None:
+        for dim in getattr(scene, "dimensions", []) or []:
+            seg = dim.b - dim.a
+            if seg.length() < 1e-9:
+                continue
+            perp = QVector3D.crossProduct(QVector3D(0.0, 0.0, 1.0), seg)
+            if perp.length() < 1e-9:               # vertical dimension
+                perp = QVector3D.crossProduct(QVector3D(1.0, 0.0, 0.0), seg)
+            perp.normalize()
+            (pa, pb) = _pts_inches([dim.a, dim.b])
+            add_dim(pa, pb,
+                    offset=QVector3D.dotProduct(dim.offset, perp) * _M_TO_IN)
+    if add_text is not None:
+        for lab in getattr(scene, "text_labels", []) or []:
+            text = (lab.text or "").strip()
+            if not text:
+                continue
+            (anchor,) = _pts_inches([lab.anchor])
+            leader = (lab.offset.x() * _M_TO_IN, lab.offset.y() * _M_TO_IN,
+                      lab.offset.z() * _M_TO_IN)
+            add_text(text, anchor, leader=leader)
