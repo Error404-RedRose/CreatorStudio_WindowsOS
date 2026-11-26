@@ -473,10 +473,9 @@ codingShellWss.on("connection", (ws) => {
       env: { ...process.env, FORCE_COLOR: "0", TERM: "dumb", PYTHONUNBUFFERED: "1" },
     });
     running = child;
-    const timer = setTimeout(() => {
-      send({ type: "stderr", data: "\nCommand stopped after 10 minutes.\n" });
-      stopRunning();
-    }, 10 * 60 * 1000);
+    // No Creator Studio timeout. Long build.bat, Python or any other slow
+    // script runs until it exits on its own; the Stop button cancels the
+    // whole process tree whenever the user wants.
     const forward = (stream, type) => {
       stream.on("data", (chunk) => {
         buffer += chunk.toString();
@@ -487,11 +486,9 @@ codingShellWss.on("connection", (ws) => {
     forward(child.stdout, "stdout");
     forward(child.stderr, "stderr");
     child.on("error", (error) => {
-      clearTimeout(timer);
       send({ type: "stderr", data: error.message + "\n" });
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
       running = null;
       send({ type: "exit", code: typeof code === "number" ? code : -1, cwd });
     });
@@ -846,13 +843,13 @@ const defaultSettings = () => ({
   // static themed surface so typing and 3D tools never compete with a shader.
   theme: "twilight",
   backgroundFx: "none",
-  backgroundBlur: 0,
+  backgroundBlur: 28,
   backgroundImage: "/backgrounds/twilight-default.png",
   backgroundImageBlur: 5,
   backgroundDarkness: 0,
   glassBlur: 10,
-  backgroundIntensity: 0,
-  backgroundSpeed: 1,
+  backgroundIntensity: 92,
+  backgroundSpeed: 16,
   backgroundZoomPct: 100,
   textScale: 1,
   uiScale: 1,
@@ -1136,6 +1133,49 @@ async function forceThemeOnce() {
   stored.themeForceApplied = true;
   await writeJsonAtomic(file, stored);
   bootLog("theme aligned once for this build", { theme: "twilight" });
+}
+
+/** Bump this when the shipped appearance defaults change and existing users
+ *  should receive them once. It is written to settings.json as a permanent
+ *  marker, so the reset never runs again on later updates. */
+const APPEARANCE_DEFAULTS_VERSION = "0.14.0-beta.116";
+
+/** Applies the appearance defaults used by Settings > Appearance > Reset
+ *  appearance exactly once to settings created by an older build. Users who
+ *  already have the marker keep their customized appearance forever. */
+async function applyAppearanceResetOnce() {
+  const file = path.join(DATA_DIR, "settings.json");
+  const stored = await readJson(file, {});
+  if (stored.appearanceResetApplied === true) return;
+  const hadSettings = Object.keys(stored).length > 0;
+  Object.assign(stored, {
+    theme: "twilight",
+    backgroundImage: "/backgrounds/twilight-default.png",
+    backgroundImageBlur: 5,
+    backgroundDarkness: 0,
+    glassBlur: 10,
+    backgroundFx: "none",
+    backgroundBlur: 28,
+    backgroundIntensity: 92,
+    backgroundSpeed: 16,
+    backgroundZoomPct: 100,
+    textScale: 1,
+    uiScale: 1,
+    appearanceResetApplied: true,
+    appearanceDefaultsVersion: APPEARANCE_DEFAULTS_VERSION,
+  });
+  await writeJsonAtomic(file, stored);
+  // A custom image lives in its own sidecar file. Remove it so the reset
+  // really falls back to the bundled Twilight background.
+  try {
+    await fs.rm(BACKGROUND_IMAGE_FILE, { force: true });
+  } catch {}
+  backgroundImageCache = "";
+  backgroundImageRevision = 0;
+  bootLog("appearance defaults applied once", {
+    hadSettings,
+    version: APPEARANCE_DEFAULTS_VERSION,
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -2574,6 +2614,9 @@ async function subscribeEvents(state, projectId, channel = "opencode") {
               if (!payload || payload === "[DONE]") continue;
               try {
                 const event = JSON.parse(payload);
+                if (event?.type === "message.updated") {
+                  recordAiUsage(event?.properties?.info, channel);
+                }
                 state.events.push({
                   type: event?.type,
                   sessionID:
@@ -4347,6 +4390,453 @@ async function runtimeAuthProviders() {
   }
   return entries;
 }
+
+/* ------------------------------------------------------------------ */
+/* AI usage monitoring                                                 */
+/* ------------------------------------------------------------------ */
+
+const AI_USAGE_FILE = path.join(DATA_DIR, "ai-usage.json");
+const AI_USAGE_WINDOW_MS = {
+  day: 24 * 60 * 60 * 1000,
+  week: 7 * 24 * 60 * 60 * 1000,
+  month: 30 * 24 * 60 * 60 * 1000,
+};
+let aiUsageEntries = null;
+let aiUsageSaveTimer = null;
+let aiUsageBackfillAt = 0;
+let aiUsageBackfillRunning = false;
+let claudeUsageCache = { at: 0, token: "", value: null };
+let openCodeGoUsageCache = { at: 0, key: "", value: null };
+let openRouterCache = { at: 0, key: "", value: null };
+
+async function loadAiUsageEntries() {
+  if (aiUsageEntries) return aiUsageEntries;
+  const stored = await readJson(AI_USAGE_FILE, { entries: [] });
+  const list = Array.isArray(stored?.entries) ? stored.entries : [];
+  aiUsageEntries = new Map();
+  for (const entry of list) {
+    if (!entry || !entry.id) continue;
+    aiUsageEntries.set(String(entry.id), entry);
+  }
+  return aiUsageEntries;
+}
+
+function scheduleAiUsageSave() {
+  if (aiUsageSaveTimer) return;
+  aiUsageSaveTimer = setTimeout(async () => {
+    aiUsageSaveTimer = null;
+    try {
+      const entries = [...(aiUsageEntries || new Map()).values()];
+      const cutoff = Date.now() - 62 * 24 * 60 * 60 * 1000;
+      const kept = entries
+        .filter((entry) => Number(entry.at) >= cutoff)
+        .sort((a, b) => Number(a.at) - Number(b.at))
+        .slice(-20000);
+      await writeJsonAtomic(AI_USAGE_FILE, { entries: kept, updatedAt: new Date().toISOString() });
+    } catch (error) {
+      log("warning", "data", "AI usage ledger save failed", { message: error?.message });
+    }
+  }, 1200);
+  aiUsageSaveTimer.unref?.();
+}
+
+/** Store one assistant message's tokens and cost. OpenCode emits the same
+ *  message id repeatedly while it streams, so the entry is upserted. */
+function recordAiUsage(info, channel = "") {
+  if (!info || info.role !== "assistant") return;
+  const id = String(info.id || "");
+  if (!id) return;
+  const tokens = info.tokens || {};
+  const cache = tokens.cache || {};
+  const input = Number(tokens.input || 0);
+  const output = Number(tokens.output || 0);
+  const reasoning = Number(tokens.reasoning || 0);
+  const cacheRead = Number(cache.read || 0);
+  const cacheWrite = Number(cache.write || 0);
+  const costValue = Number(info.cost);
+  const cost = Number.isFinite(costValue) ? costValue : 0;
+  if (!input && !output && !reasoning && !cacheRead && !cacheWrite && !(cost > 0)) return;
+  void loadAiUsageEntries().then((entries) => {
+    entries.set(id, {
+      id,
+      at: Number(info.time?.completed || info.time?.created || Date.now()),
+      providerID: String(info.providerID || ""),
+      modelID: String(info.modelID || ""),
+      input,
+      output,
+      reasoning,
+      cacheRead,
+      cacheWrite,
+      cost,
+      channel: String(channel || ""),
+    });
+    scheduleAiUsageSave();
+  });
+}
+
+function aiUsageTotals(entries, since) {
+  let tokensIn = 0;
+  let tokensOut = 0;
+  let tokens = 0;
+  let cacheTokens = 0;
+  let cost = 0;
+  let requests = 0;
+  for (const entry of entries) {
+    if (Number(entry.at) < since) continue;
+    const input = Number(entry.input || 0);
+    const output = Number(entry.output || 0);
+    const reasoning = Number(entry.reasoning || 0);
+    tokensIn += input;
+    tokensOut += output + reasoning;
+    tokens += input + output + reasoning;
+    cacheTokens += Number(entry.cacheRead || 0) + Number(entry.cacheWrite || 0);
+    cost += Number(entry.cost || 0);
+    requests += 1;
+  }
+  return {
+    tokensIn,
+    tokensOut,
+    tokens,
+    cacheTokens,
+    cost: Math.round(cost * 1000000) / 1000000,
+    requests,
+  };
+}
+
+/** Rebuild recent totals from OpenCode's own transcripts. This runs in the
+ *  background at most every five minutes so the first view of a build that
+ *  predates the ledger still shows real numbers shortly after opening Home. */
+async function backfillUsageFromOpenCode() {
+  if (aiUsageBackfillRunning) return;
+  aiUsageBackfillRunning = true;
+  try {
+    const states = [...codingServers.values(), ...ocServers.values()].filter(
+      (state) => state && state.baseUrl && state.auth,
+    );
+    const seen = new Set();
+    for (const state of states) {
+      if (seen.has(state.baseUrl)) continue;
+      seen.add(state.baseUrl);
+      try {
+        const sessions = await ocFetch(state, "/session", { signal: AbortSignal.timeout(9000) });
+        if (!Array.isArray(sessions)) continue;
+        const cutoff = Date.now() - AI_USAGE_WINDOW_MS.month;
+        const recent = sessions
+          .map((session) => ({
+            id: String(session?.id || ""),
+            at: Number(session?.time?.updated || session?.time?.created || 0),
+          }))
+          .filter((session) => session.id && session.at >= cutoff)
+          .sort((a, b) => b.at - a.at)
+          .slice(0, 180);
+        // Fetch a few transcripts at a time so the 30-day backfill finishes in
+        // one pass without opening hundreds of sockets at once.
+        for (let index = 0; index < recent.length; index += 6) {
+          const batch = recent.slice(index, index + 6);
+          await Promise.all(
+            batch.map(async (session) => {
+              try {
+                const messages = await ocFetch(state, `/session/${session.id}/message?limit=200`, {
+                  signal: AbortSignal.timeout(9000),
+                });
+                if (!Array.isArray(messages)) return;
+                for (const message of messages) {
+                  recordAiUsage(message?.info, state.channel || "coding");
+                }
+              } catch {}
+            }),
+          );
+        }
+      } catch {}
+    }
+    await loadAiUsageEntries();
+    scheduleAiUsageSave();
+  } finally {
+    aiUsageBackfillRunning = false;
+  }
+}
+
+async function runtimeAuthSecret(providerId) {
+  try {
+    const auth = (await readJson(runtimeAuthPath(), null)) || {};
+    const record = auth[providerId];
+    if (!record || typeof record !== "object") return "";
+    return String(record.type === "oauth" ? record.access || "" : record.key || "");
+  } catch {
+    return "";
+  }
+}
+
+/** OpenRouter is the one provider that exposes real USD credit balance. */
+async function fetchOpenRouterBalance(apiKey) {
+  if (!apiKey) return null;
+  if (openRouterCache.key === apiKey && Date.now() - openRouterCache.at < 120000) {
+    return openRouterCache.value;
+  }
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/credits", {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(7000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const payload = await res.json();
+    const total = Number(payload?.data?.total_credits);
+    const used = Number(payload?.data?.total_usage);
+    if (!Number.isFinite(total)) return null;
+    const value = {
+      usd: Number.isFinite(used) ? Math.max(0, total - used) : total,
+      totalUsd: total,
+      usedUsd: Number.isFinite(used) ? used : null,
+      source: "OpenRouter credits",
+    };
+    openRouterCache = { at: Date.now(), key: apiKey, value };
+    return value;
+  } catch (error) {
+    openRouterCache = { at: Date.now(), key: apiKey, value: null };
+    return null;
+  }
+}
+
+/** Claude Pro/Max exposes its rolling plan limits to OAuth tokens. */
+async function fetchClaudePlanUsage(accessToken) {
+  if (!accessToken) return null;
+  if (claudeUsageCache.token === accessToken && Date.now() - claudeUsageCache.at < 90000) {
+    return claudeUsageCache.value;
+  }
+  try {
+    const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "Creator-Studio",
+      },
+      signal: AbortSignal.timeout(7000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const payload = await res.json();
+    const fraction = (value) => {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return null;
+      return n > 1 ? n / 100 : n;
+    };
+    const bucket = (entry) =>
+      entry && typeof entry === "object"
+        ? {
+            utilization: fraction(entry.utilization),
+            resetsAt: entry.resets_at || entry.resetsAt || null,
+          }
+        : null;
+    const value = {
+      fiveHour: bucket(payload?.five_hour),
+      sevenDay: bucket(payload?.seven_day),
+      sevenDaySonnet: bucket(payload?.seven_day_sonnet),
+      sevenDayOpus: bucket(payload?.seven_day_opus),
+      source: "Claude plan limits",
+    };
+    claudeUsageCache = { at: Date.now(), token: accessToken, value };
+    return value;
+  } catch {
+    claudeUsageCache = { at: Date.now(), token: accessToken, value: null };
+    return null;
+  }
+}
+
+/** OpenCode Go exposes its rolling, weekly and monthly plan percentages. */
+async function fetchOpenCodeGoUsage(apiKey) {
+  if (!apiKey) return null;
+  if (openCodeGoUsageCache.key === apiKey && Date.now() - openCodeGoUsageCache.at < 60000) {
+    return openCodeGoUsageCache.value;
+  }
+  try {
+    const res = await fetch("https://opencode.ai/zen/go/v1/usage", {
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(7000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const payload = await res.json();
+    const usage = payload?.usage || {};
+    const fraction = (entry) => {
+      const n = Number(entry?.percent);
+      return Number.isFinite(n) ? Math.max(0, Math.min(1, n / 100)) : null;
+    };
+    const value = {
+      rolling: { percent: fraction(usage.rolling), resetsAt: usage.rolling?.resetsAt || null },
+      weekly: { percent: fraction(usage.weekly), resetsAt: usage.weekly?.resetsAt || null },
+      monthly: { percent: fraction(usage.monthly), resetsAt: usage.monthly?.resetsAt || null },
+    };
+    openCodeGoUsageCache = { at: Date.now(), key: apiKey, value };
+    return value;
+  } catch {
+    openCodeGoUsageCache = { at: Date.now(), key: apiKey, value: null };
+    return null;
+  }
+}
+
+async function resolveAiUsage() {
+  const settings = await getSettings();
+  const local = settings.localModels || {};
+  const backend = ["opencode", "hermes", "claude"].includes(local.activeBackend)
+    ? local.activeBackend
+    : "opencode";
+  const backendConfig = backend === "opencode" ? local.opencodeAccount || {} : local[backend] || {};
+  const entries = await loadAiUsageEntries();
+  const list = [...entries.values()];
+  const lastEntry = list.length
+    ? list.reduce((latest, entry) => (Number(entry.at) >= Number(latest.at) ? entry : latest))
+    : null;
+  const configProviderId = String(backendConfig.providerId || "");
+  // Prefer the provider that actually produced the newest message over the
+  // saved account selection, because the user can pick any model in OpenCode.
+  const providerId = String(lastEntry?.providerID || configProviderId || "");
+  const vaultRecord =
+    aiKeyVault.activeFor(backend, providerId) ||
+    aiKeyVault.rawRecords(backend).find((record) => record.providerId === providerId) ||
+    (backendConfig.vaultKeyId ? aiKeyVault.find(backendConfig.vaultKeyId) : null) ||
+    (configProviderId ? aiKeyVault.activeFor(backend, configProviderId) : null) ||
+    aiKeyVault.activeRecord(backend);
+  const providerName = String(
+    vaultRecord?.providerName ||
+      (providerId ? providerId : "") ||
+      backendConfig.providerName ||
+      (backend === "claude" ? "Claude" : backend === "hermes" ? "Hermes" : "OpenCode"),
+  );
+  const providerIsClaude =
+    backend === "claude" || /anthropic|claude/i.test(`${providerId} ${providerName}`);
+  const runtime = await runtimeAuthProviders().catch(() => []);
+  const runtimeAnthropic = runtime.find((entry) => entry.id === "anthropic") || null;
+  const claudeAccount = providerIsClaude ? detectClaudeAccount() : null;
+  const claudeRuntimeAccess =
+    providerIsClaude && runtimeAnthropic?.oauth ? await runtimeAuthSecret("anthropic") : "";
+  const oauthAccess = String(
+    (vaultRecord?.kind === "account" ? vaultRecord.access || "" : "") ||
+      claudeRuntimeAccess ||
+      (claudeAccount?.hasCredentials ? claudeAccount.access || "" : ""),
+  );
+  const credentialTokenType = vaultRecord
+    ? vaultRecord.kind === "account"
+      ? secretKind(vaultRecord.access || vaultRecord.refresh || "")
+      : "apiKey"
+    : "";
+  const isOauth =
+    credentialTokenType === "oauth" ||
+    Boolean(providerIsClaude && runtimeAnthropic?.oauth) ||
+    Boolean(claudeAccount?.hasCredentials && secretKind(claudeAccount.access || "") === "oauth");
+
+  const planRaw = String(
+    claudeAccount?.subscription || claudeAccount?.plan || claudeAccount?.organization || "",
+  );
+  const planPretty = planRaw
+    .replace(/^claude[_-]?/i, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+  let subscription = isOauth || Boolean(planRaw && /max|pro|team|enterprise/i.test(planRaw));
+  let planLabel = planPretty ? `Claude ${planPretty}` : isOauth ? "Subscription" : "";
+  if (/opencode[- ]?go/i.test(`${providerId} ${providerName}`)) {
+    subscription = true;
+    planLabel = "OpenCode Go";
+  } else if (/opencode[- ]?zen/i.test(`${providerId} ${providerName}`)) {
+    planLabel = planLabel || "OpenCode Zen";
+  }
+  if (backend === "hermes" && /nous/i.test(`${providerId} ${providerName}`)) {
+    subscription = true;
+    planLabel = "Nous free";
+  }
+  if (!subscription && credentialTokenType === "apiKey") planLabel = "Pay-as-you-go";
+  if (!planLabel) planLabel = "No account detected";
+
+  const isOpenCodeGo = /opencode[- ]?go/i.test(`${providerId} ${providerName}`);
+  let balance = null;
+  if (/openrouter/i.test(`${providerId} ${providerName}`)) {
+    const key = String(vaultRecord?.apiKey || (await runtimeAuthSecret("openrouter")) || "");
+    balance = await fetchOpenRouterBalance(key);
+  }
+  const goUsage = isOpenCodeGo
+    ? await fetchOpenCodeGoUsage(
+        String(vaultRecord?.apiKey || (await runtimeAuthSecret("opencode-go")) || ""),
+      )
+    : null;
+  if (!balance && isOpenCodeGo) {
+    // Go is a quota subscription, not a credit wallet. The plan dashboard
+    // reports $0.00 add-on credit, so show that explicitly.
+    balance = { usd: 0, totalUsd: null, usedUsd: null, source: "OpenCode Go plan" };
+  }
+  const planUsage = providerIsClaude && oauthAccess ? await fetchClaudePlanUsage(oauthAccess) : null;
+  const limits = goUsage
+    ? {
+        day: goUsage.rolling.percent,
+        week: goUsage.weekly.percent,
+        month: goUsage.monthly.percent,
+        dayResetsAt: goUsage.rolling.resetsAt,
+        weekResetsAt: goUsage.weekly.resetsAt,
+        monthResetsAt: goUsage.monthly.resetsAt,
+        source: "OpenCode Go plan",
+      }
+    : planUsage
+      ? {
+          day: planUsage.fiveHour?.utilization ?? null,
+          week: planUsage.sevenDay?.utilization ?? null,
+          month: null,
+          dayResetsAt: planUsage.fiveHour?.resetsAt || null,
+          weekResetsAt: planUsage.sevenDay?.resetsAt || null,
+          monthResetsAt: null,
+          source: planUsage.source,
+        }
+      : null;
+
+  const now = Date.now();
+  const windows = {
+    fiveHour: aiUsageTotals(list, now - 5 * 60 * 60 * 1000),
+    day: aiUsageTotals(list, now - AI_USAGE_WINDOW_MS.day),
+    week: aiUsageTotals(list, now - AI_USAGE_WINDOW_MS.week),
+    month: aiUsageTotals(list, now - AI_USAGE_WINDOW_MS.month),
+  };
+  const trackedSince = list.length ? new Date(Math.min(...list.map((entry) => Number(entry.at) || now))).toISOString() : "";
+
+  if (Date.now() - aiUsageBackfillAt > 5 * 60 * 1000) {
+    aiUsageBackfillAt = Date.now();
+    void backfillUsageFromOpenCode();
+  }
+
+  return {
+    backend,
+    backendLabel:
+      backend === "claude" ? "Claude" : backend === "hermes" ? "Hermes" : "OpenCode",
+    providerId,
+    providerName,
+    account: {
+      label: String(
+        vaultRecord?.label || (providerIsClaude ? claudeAccount?.email : "") || providerName || "Account",
+      ),
+      email: String(vaultRecord?.email || (providerIsClaude ? claudeAccount?.email : "") || ""),
+      plan: planLabel,
+      subscription,
+      authKind: isOauth ? "oauth" : credentialTokenType || "unknown",
+      providerName,
+    },
+    windows,
+    limits,
+    balance,
+    trackedSince,
+    updatedAt: new Date().toISOString(),
+    note: limits
+      ? limits.source === "OpenCode Go plan"
+        ? "Plan usage is read live from OpenCode Go. Go includes its quota; available add-on credit is $0.00."
+        : "Plan usage is read live from the Claude account."
+      : balance
+        ? "Balance is read from the provider account."
+        : subscription
+          ? "This account is on a subscription; extra token balance is not exposed by the provider."
+          : "This account bills per token. Remaining USD credit is shown when the provider exposes it (for example OpenRouter).",
+  };
+}
+
+app.get("/api/ai-usage", async (req, res) => {
+  try {
+    res.json({ ok: true, ...(await resolveAiUsage()) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 app.get("/api/ai-backends/accounts", async (req, res) => {
   try {
@@ -8090,6 +8580,24 @@ app.get("/api/coding/file", async (req, res) => {
   }
 });
 
+app.get("/api/coding/media", async (req, res) => {
+  try {
+    const root = resolveCodingRoot(String(req.query.dir || ""));
+    const target = path.resolve(root, String(req.query.path || ""));
+    if (!isInside(root, target)) return res.status(400).json({ error: "Path outside workspace" });
+    const stat = await fs.stat(target).catch(() => null);
+    if (!stat?.isFile()) return res.status(404).json({ error: "Media file not found." });
+    if (stat.size > 500 * 1024 * 1024) return res.status(400).json({ error: "Media file is larger than 500 MB." });
+    if (!/\.(png|jpe?g|gif|webp|avif|bmp|svg|ico|tiff?|mp4|webm|mov|m4v|ogv|ogg|mkv|avi)$/i.test(target)) {
+      return res.status(400).json({ error: "Unsupported media type." });
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.sendFile(target);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 const codingSizeCache = new Map();
 
 async function codingFolderSize(root) {
@@ -8176,6 +8684,37 @@ app.post("/api/coding/rename", async (req, res) => {
     }
     await fs.rename(source, target);
     res.json({ ok: true, path: path.relative(root, target).replace(/\\/g, "/"), name });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/coding/move", async (req, res) => {
+  try {
+    const root = resolveCodingRoot(String(req.body?.dir || ""));
+    const destRelative = String(req.body?.dest || "");
+    const destDir = path.resolve(root, destRelative);
+    if (!isInside(root, destDir)) return res.status(400).json({ error: "Destination outside workspace" });
+    const destStat = await fs.stat(destDir).catch(() => null);
+    if (!destStat?.isDirectory()) return res.status(400).json({ error: "Destination folder does not exist." });
+    const paths = Array.isArray(req.body?.paths) ? req.body.paths.map(String) : [];
+    if (!paths.length) return res.status(400).json({ error: "Select something to move." });
+    const moved = [];
+    for (const relative of paths) {
+      const source = path.resolve(root, relative);
+      if (!isInside(root, source) || source === root) continue;
+      if (destDir === source || destDir.startsWith(source + path.sep)) {
+        return res.status(400).json({ error: "A folder cannot be moved inside itself." });
+      }
+      const target = path.join(destDir, path.basename(source));
+      if (target === source) continue;
+      if (fssync.existsSync(target)) {
+        return res.status(409).json({ error: `"${path.basename(source)}" already exists in the destination.` });
+      }
+      await fs.rename(source, target);
+      moved.push({ from: relative, to: path.relative(root, target).replace(/\\/g, "/") });
+    }
+    res.json({ ok: true, moved });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
@@ -16603,6 +17142,7 @@ await migrateLegacyData();
 bootLog("legacy data check complete");
 await migrateBackgroundImage().catch((error) => log("warn", "data", "background image migration failed", { message: error?.message }));
 await forceThemeOnce().catch((error) => log("warn", "data", "one-time theme alignment failed", { message: error?.message }));
+await applyAppearanceResetOnce().catch((error) => log("warn", "data", "one-time appearance reset failed", { message: error?.message }));
 await migrateGitHubToken();
 await pruneLogs();
 bootLog("log maintenance complete");
