@@ -473,6 +473,20 @@ export const codingTools = [
     },
   },
   {
+    name: "coding_learning",
+    description:
+      "Load the user's permanent project memory: Global Learning entries, recent project notes, reusable 3D artifacts and indexed reference matches for this request. Every backend (OpenCode, Claude Code, Hermes) shares this memory, so call it before planning a task that continues earlier work and reuse the conventions it lists.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "The user's request or task keywords." },
+        github: { type: "boolean", description: "Also include matching indexed GitHub knowledge (default false)." },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "reference_search",
     description:
       "Search the user's indexed Reference Library: saved local folders, saved links and the text learned from them. Use this before assuming there is no local documentation for an API, engine or asset.",

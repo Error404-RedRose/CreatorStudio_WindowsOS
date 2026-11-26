@@ -6,13 +6,24 @@
  * forwarded over HTTP to the TwiX desktop bridge, which executes it against the
  * live Three.js scene in the connected workspace and returns a structured result.
  */
+import { readFileSync } from "node:fs";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { tools } from "../shared/tools.mjs";
 
 const BRIDGE_URL = process.env.TWIX_BRIDGE_URL || "http://127.0.0.1:4317";
-const BRIDGE_TOKEN = process.env.TWIX_BRIDGE_TOKEN || "";
+function bridgeToken() {
+  const file = process.env.TWIX_BRIDGE_TOKEN_FILE || "";
+  if (file) {
+    try {
+      const value = readFileSync(file, "utf8").trim();
+      if (value) return value;
+    } catch {}
+  }
+  return process.env.TWIX_BRIDGE_TOKEN || "";
+}
+const BRIDGE_TOKEN = bridgeToken();
 const PROJECT_ID = process.env.TWIX_PROJECT_ID || "";
 
 const server = new Server(
@@ -61,7 +72,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        token: BRIDGE_TOKEN,
+        token: bridgeToken(),
         projectId: PROJECT_ID,
         origin: "scene",
         name,

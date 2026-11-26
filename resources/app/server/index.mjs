@@ -15,6 +15,24 @@ import { registerForumRoutes } from "./forum.mjs";
 import { createSpeechService } from "./speech.mjs";
 import { MATERIALIZE_MAPS, materializeTextureFile } from "./materialize.mjs";
 import { discoverLocalAiEndpoints, ensureHermesApiServer, readHermesDirectProviders } from "./ai-endpoints.mjs";
+import { createAiKeyVault, secretKind } from "./ai-key-vault.mjs";
+import {
+  claudeCodeStatus,
+  detectAccounts,
+  detectClaudeAccount,
+  detectHermesAccount,
+  findClaudeCodeCli,
+} from "./ai-accounts.mjs";
+import {
+  ANTHROPIC_MODELS,
+  buildProviderCatalog,
+  findProvider,
+  listProviders,
+  opencodeProviderIdFor,
+} from "./ai-provider-catalog.mjs";
+import { startClaudeOAuthProxy } from "./claude-oauth-proxy.mjs";
+import { claudeCliInfo } from "./claude-cli.mjs";
+import { linkMcpTarget, mcpLinkStatus, unlinkMcpTarget } from "./ai-mcp-link.mjs";
 import { assessCommand } from "../shared/command-safety.mjs";
 import { createGithubIndex } from "./github-index.mjs";
 import {
@@ -63,12 +81,28 @@ import {
   waitForOpenCodeHealth,
 } from "./opencode-runtime.mjs";
 
+let consolePipeBroken = false;
+const noteBrokenConsolePipe = () => {
+  consolePipeBroken = true;
+};
+process.stdout?.on?.("error", noteBrokenConsolePipe);
+process.stderr?.on?.("error", noteBrokenConsolePipe);
+function safeConsoleError(...args) {
+  if (consolePipeBroken) return;
+  try {
+    console.error(...args);
+  } catch {
+    consolePipeBroken = true;
+  }
+}
+
 process.on("uncaughtException", (error) => {
-  console.error("[TwiX] uncaughtException", error?.stack || error);
+  if (/EPIPE|broken pipe/i.test(String(error?.message || ""))) consolePipeBroken = true;
+  safeConsoleError("[TwiX] uncaughtException", error?.stack || error);
   log("error", "process", "uncaughtException", { message: error?.message, stack: error?.stack });
 });
 process.on("unhandledRejection", (error) => {
-  console.error("[TwiX] unhandledRejection", error?.stack || error);
+  safeConsoleError("[TwiX] unhandledRejection", error?.stack || error);
   log("error", "process", "unhandledRejection", { message: error?.message, stack: error?.stack });
 });
 
@@ -96,6 +130,7 @@ const USER_DATA_DIR =
 const DOCUMENTS_DIR = process.env.TWIX_DOCUMENTS_DIR || path.join(os.homedir(), "Documents");
 const GLOBAL_DATA_DIR = path.join(DOCUMENTS_DIR, "3D Creator Studio");
 const DATA_DIR = process.env.TWIX_DATA_DIR || GLOBAL_DATA_DIR;
+const aiKeyVault = createAiKeyVault({ dataDir: DATA_DIR });
 const licenseService = createLicenseService({ dataDir: DATA_DIR, documentsDir: GLOBAL_DATA_DIR });
 const speechService = createSpeechService({
   dataDir: DATA_DIR,
@@ -190,6 +225,14 @@ const CHAT_FILE_TTL_MS = 10 * 60 * 1000;
 let chatTokenCache = { token: "", at: 0 };
 const SERVE_DIST = process.argv.includes("--serve-dist");
 const BRIDGE_TOKEN = randomBytes(24).toString("hex");
+// External MCP clients (Claude Desktop/Code, Hermes) read the live bridge token
+// from this file so their configs never contain a stolen-at-rest secret and do
+// not break every time Creator Studio restarts.
+const BRIDGE_TOKEN_FILE = path.join(DATA_DIR, "secrets", "bridge-token");
+try {
+  fssync.mkdirSync(path.dirname(BRIDGE_TOKEN_FILE), { recursive: true });
+  fssync.writeFileSync(BRIDGE_TOKEN_FILE, BRIDGE_TOKEN, { mode: 0o600 });
+} catch {}
 const MCP_SERVER = path.join(APP_ROOT, "server", "mcp-server.mjs");
 const APP_VERSION = (() => {
   try {
@@ -506,7 +549,65 @@ async function writeJsonAtomic(file, data) {
   await ensureDir(path.dirname(file));
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   await fs.writeFile(tmp, JSON.stringify(data, null, 2), "utf8");
-  await fs.rename(tmp, file);
+  await replaceFileWithRetry(tmp, file);
+}
+
+/**
+ * Windows can briefly refuse `rename` over an existing file (antivirus,
+ * Explorer previews, or a scanner holding the target). Retry, then fall back
+ * to removing the target and, last of all, writing in place so the user's
+ * settings are never lost.
+ */
+async function replaceFileWithRetry(tmp, file) {
+  const delays = [0, 40, 120, 250, 500, 900];
+  let lastError = null;
+  for (const delay of delays) {
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    try {
+      await fs.rename(tmp, file);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!["EPERM", "EBUSY", "EACCES", "EEXIST", "ENOTEMPTY"].includes(error?.code)) throw error;
+    }
+  }
+  try {
+    try {
+      await fs.rm(file, { force: true });
+    } catch {}
+    await fs.rename(tmp, file);
+    return;
+  } catch (error) {
+    lastError = error;
+  }
+  try {
+    const data = await fs.readFile(tmp);
+    await fs.writeFile(file, data);
+    await fs.rm(tmp, { force: true });
+    return;
+  } catch (error) {
+    lastError = error;
+  }
+  throw lastError;
+}
+
+/** Remove crash leftovers from previous atomic writes once they are cold. */
+async function cleanupTempFiles() {
+  try {
+    const entries = await fs.readdir(DATA_DIR);
+    const now = Date.now();
+    await Promise.all(
+      entries
+        .filter((name) => name.startsWith("settings.json.") && name.endsWith(".tmp"))
+        .map(async (name) => {
+          const target = path.join(DATA_DIR, name);
+          try {
+            const stats = await fs.stat(target);
+            if (now - stats.mtimeMs > 60_000) await fs.rm(target, { force: true });
+          } catch {}
+        }),
+    );
+  } catch {}
 }
 
 function sameFsPath(left, right) {
@@ -518,9 +619,9 @@ function sameFsPath(left, right) {
 
 async function writeFileAtomic(file, buffer) {
   await ensureDir(path.dirname(file));
-  const tmp = `${file}.${process.pid}.tmp`;
+  const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   await fs.writeFile(tmp, buffer);
-  await fs.rename(tmp, file);
+  await replaceFileWithRetry(tmp, file);
 }
 
 function safeName(name, fallback = "untitled") {
@@ -746,6 +847,10 @@ const defaultSettings = () => ({
   theme: "twilight",
   backgroundFx: "none",
   backgroundBlur: 0,
+  backgroundImage: "/backgrounds/twilight-default.png",
+  backgroundImageBlur: 5,
+  backgroundDarkness: 0,
+  glassBlur: 10,
   backgroundIntensity: 0,
   backgroundSpeed: 1,
   backgroundZoomPct: 100,
@@ -887,9 +992,30 @@ async function normalizeProjectDir() {
   return settings.defaultProjectDir;
 }
 
+const BACKGROUND_IMAGE_FILE = path.join(DATA_DIR, "background-image.dat");
+let backgroundImageCache = null;
+let backgroundImageRevision = 0;
+
+/** Custom background image lives beside settings.json, never inside it. */
+async function readBackgroundImage() {
+  if (backgroundImageCache !== null) return backgroundImageCache;
+  try {
+    backgroundImageCache = await fs.readFile(BACKGROUND_IMAGE_FILE, "utf8");
+    backgroundImageRevision = Date.now();
+  } catch {
+    backgroundImageCache = "";
+  }
+  return backgroundImageCache;
+}
+
+/** Small URL the renderer can use; multi-megabyte data URLs break CSS vars. */
+function backgroundImageUrl() {
+  return backgroundImageCache ? `/api/background-image?rev=${backgroundImageRevision || 1}` : "";
+}
+
 async function getSettings() {
   const stored = await readJson(path.join(DATA_DIR, "settings.json"), {});
-  return {
+  const settings = {
     ...defaultSettings(),
     ...stored,
     opencode: { ...defaultSettings().opencode, ...(stored.opencode || {}) },
@@ -925,9 +1051,24 @@ async function getSettings() {
     },
     localModels: mergeLocalModels(defaultSettings().localModels, stored.localModels),
   };
+  await readBackgroundImage();
+  if (backgroundImageCache) settings.backgroundImage = backgroundImageUrl();
+  else if (String(settings.backgroundImage || "").startsWith("/api/background-image")) settings.backgroundImage = "";
+  return settings;
 }
 
-async function saveSettings(patch) {
+let settingsWriteQueue = Promise.resolve();
+
+function saveSettings(patch) {
+  const run = settingsWriteQueue.then(
+    () => saveSettingsNow(patch),
+    () => saveSettingsNow(patch),
+  );
+  settingsWriteQueue = run.catch(() => null);
+  return run;
+}
+
+async function saveSettingsNow(patch) {
   const current = await getSettings();
   const next = {
     ...current,
@@ -942,8 +1083,59 @@ async function saveSettings(patch) {
     },
     localModels: mergeLocalModels(current.localModels, patch.localModels),
   };
+  // The data URL can be megabytes; keep it out of settings.json so every
+  // unrelated settings change writes a tiny file.
+  const backgroundImage = typeof next.backgroundImage === "string" ? next.backgroundImage : "";
+  if (backgroundImage.startsWith("data:")) {
+    next.backgroundImage = "";
+    if (backgroundImage !== backgroundImageCache) {
+      await writeFileAtomic(BACKGROUND_IMAGE_FILE, Buffer.from(backgroundImage, "utf8"));
+      backgroundImageCache = backgroundImage;
+      backgroundImageRevision = Date.now();
+    }
+  } else if (Object.prototype.hasOwnProperty.call(patch, "backgroundImage") && !backgroundImage) {
+    next.backgroundImage = "";
+    try {
+      await fs.rm(BACKGROUND_IMAGE_FILE, { force: true });
+    } catch {}
+    backgroundImageCache = "";
+    backgroundImageRevision = 0;
+  } else {
+    // Keep the bundled default, but never persist the derived image URL: it is
+    // rebuilt with a fresh revision from the sidecar on every read.
+    next.backgroundImage = backgroundImage.startsWith("/api/background-image") ? "" : backgroundImage;
+  }
   await writeJsonAtomic(path.join(DATA_DIR, "settings.json"), next);
-  return next;
+  return {
+    ...next,
+    backgroundImage: backgroundImage.startsWith("data:") ? backgroundImageUrl() : next.backgroundImage,
+  };
+}
+
+/** Move a legacy inline background data URL into its own file. */
+async function migrateBackgroundImage() {
+  const file = path.join(DATA_DIR, "settings.json");
+  const stored = await readJson(file, {});
+  const image = typeof stored.backgroundImage === "string" ? stored.backgroundImage : "";
+  if (!image.startsWith("data:")) return;
+  await writeFileAtomic(BACKGROUND_IMAGE_FILE, Buffer.from(image, "utf8"));
+  backgroundImageCache = image;
+  backgroundImageRevision = Date.now();
+  stored.backgroundImage = "";
+  await writeJsonAtomic(file, stored);
+  bootLog("settings background image moved to sidecar file", { bytes: image.length });
+}
+
+/** This release aligns every user on the shipped theme exactly once. The flag
+ *  is permanent, so later builds never touch the user's theme again. */
+async function forceThemeOnce() {
+  const file = path.join(DATA_DIR, "settings.json");
+  const stored = await readJson(file, {});
+  if (stored.themeForceApplied) return;
+  stored.theme = "twilight";
+  stored.themeForceApplied = true;
+  await writeJsonAtomic(file, stored);
+  bootLog("theme aligned once for this build", { theme: "twilight" });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1785,12 +1977,20 @@ async function writeAgentWorkspace(projectId, workspace) {
 
 const LOCAL_BACKEND_LOCAL_IDS = { hermes: "hermes-local", claude: "claude-local" };
 
+// Local Anthropic-compatible bridge for Claude Pro/Max subscription accounts.
+// Started at boot; openCodeLocalProviders points OpenCode at it.
+let claudeProxy = null;
+
 function localModelsDefaults() {
   return {
     activeBackend: "opencode",
+    opencodeAccount: { providerId: "opencode-go", providerName: "OpenCode Go", vaultKeyId: "" },
     hermes: {
       enabled: false,
       label: "Hermes",
+      providerId: "hermes-nous",
+      providerName: "Hermes - Nous free",
+      vaultKeyId: "",
       baseUrl: "",
       apiKey: "",
       apiStyle: "openai",
@@ -1801,9 +2001,12 @@ function localModelsDefaults() {
     claude: {
       enabled: false,
       label: "Claude",
+      providerId: "anthropic",
+      providerName: "Anthropic API",
+      vaultKeyId: "",
       baseUrl: "",
       apiKey: "",
-      apiStyle: "openai",
+      apiStyle: "anthropic",
       model: "claude-sonnet-4-5",
       context: 200000,
       reasoning: true,
@@ -1869,44 +2072,150 @@ async function localOllamaProvider() {
   return provider;
 }
 
-/** Build the OpenCode provider block for every enabled local LLM. */
+function modelConfig(ids, context, output = 8192) {
+  return Object.fromEntries(
+    [...new Set(ids.map((id) => String(id || "").trim()).filter(Boolean))].map((id) => [
+      id,
+      {
+        name: id,
+        limit: {
+          context: Math.max(1024, Number(context) || 131072),
+          output,
+        },
+      },
+    ]),
+  );
+}
+
+/** Resolve the active vault record for a backend/provider pair. */
+function activeVaultRecord(backend, providerId = "", vaultKeyId = "") {
+  if (vaultKeyId) {
+    const record = aiKeyVault.find(vaultKeyId);
+    if (record && record.backend === backend) return record;
+  }
+  return aiKeyVault.activeRecord(backend, providerId);
+}
+
+/**
+ * The Claude account that must serve the Claude backend. A Max plan OAuth
+ * token always wins over an API/usage key, because keys bill paid credits.
+ */
+function resolveClaudeAccountRecord() {
+  const active = aiKeyVault.activeFor("claude", "anthropic");
+  if (active?.kind === "account" && secretKind(active.access) === "oauth") return active;
+  const plan = aiKeyVault
+    .rawRecords("claude")
+    .filter(
+      (record) =>
+        record.kind === "account" &&
+        record.providerId === "anthropic" &&
+        secretKind(record.access) === "oauth",
+    )
+    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))[0];
+  return plan || active || null;
+}
+
+/**
+ * Build the OpenCode provider block for every enabled backend plus the active
+ * OpenCode account keys. API keys come from the encrypted vault, never from
+ * settings.json, so pressing Swap only changes the vault's active record and
+ * the next agent restart picks it up.
+ */
 async function openCodeLocalProviders(settings) {
   const local = settings?.localModels || {};
   const providers = {};
+
+  // OpenCode account/provider overrides. Each (backend, provider) has exactly
+  // one active vault record, which is what makes hot-swapping accounts instant.
+  for (const record of aiKeyVault.rawRecords("opencode")) {
+    const active = aiKeyVault.activeFor("opencode", record.providerId);
+    if (!active || active.id !== record.id) continue;
+    if (record.providerId === "ollama-local") continue;
+    const catalog = findProvider("opencode", record.providerId);
+    const baseUrl = String(record.baseUrl || catalog?.baseUrl || "").trim().replace(/\/+$/, "");
+    const models = [...new Set([...(record.models || []), ...(catalog?.models || [])])];
+    if (!baseUrl) continue;
+    const npm =
+      record.apiStyle === "anthropic" || record.providerId === "anthropic"
+        ? "@ai-sdk/anthropic"
+        : "@ai-sdk/openai-compatible";
+    const options = { baseURL: baseUrl, apiKey: record.apiKey };
+    if (npm === "@ai-sdk/anthropic") options.headers = { "anthropic-version": "2023-06-01" };
+    providers[record.providerId] = {
+      npm,
+      name: catalog?.name || record.providerName || record.providerId,
+      options,
+      models: modelConfig(models, 200000),
+    };
+  }
+
   const directHermes = local.hermes?.enabled ? await readHermesDirectProviders() : [];
   for (const kind of ["hermes", "claude"]) {
     const entry = local[kind];
     if (!entry?.enabled) continue;
-    const baseUrl = String(entry.baseUrl || "").trim().replace(/\/+$/, "");
-    const model = String(entry.model || "").trim();
+    const active = activeVaultRecord(kind, entry.providerId || "", entry.vaultKeyId || "");
+    const baseUrl = String(active?.baseUrl || entry.baseUrl || "").trim().replace(/\/+$/, "");
+    const model = String(active?.models?.[0] || entry.model || "").trim();
+    const apiKey = String(
+      active
+        ? active.kind === "account"
+          ? active.access || active.apiKey || ""
+          : active.apiKey || ""
+        : entry.apiKey || "",
+    ).trim();
     if (!baseUrl || !model) continue;
     // The Hermes agent endpoint streams Hermes-only tool events that OpenCode
     // cannot parse. When direct Hermes model providers are available, prefer
-    // those so Creator Studio tools work normally.
-    if (kind === "hermes" && directHermes.length && /:8642(?:\/|$)/.test(baseUrl)) continue;
-    const anthropic = entry.apiStyle === "anthropic";
+    // those so Creator Studio tools work normally - unless the user explicitly
+    // picked a non-Hermes provider (for example OpenRouter) with a vault key.
+    if (
+      kind === "hermes" &&
+      directHermes.length &&
+      /:8642(?:\/|$)/.test(baseUrl) &&
+      !active
+    ) {
+      continue;
+    }
+    // A Claude subscription account talks to api.anthropic.com in the Claude
+    // Code shape (Bearer token, CLI betas, identity prompt). The local proxy
+    // adds that shape, so OpenCode can use the account like a normal provider.
+    if (kind === "claude" && active?.kind === "account") {
+      if (!claudeProxy) {
+        pushLog(logs, "The Claude account bridge is not running, so the Claude account was skipped.");
+        continue;
+      }
+      const accountModels = [
+        ...new Set(
+          [model, ...(active?.models || []), ...(Array.isArray(entry.models) ? entry.models : []), ...ANTHROPIC_MODELS]
+            .map((id) => String(id || "").trim())
+            .filter(Boolean),
+        ),
+      ];
+      providers[LOCAL_BACKEND_LOCAL_IDS.claude] = {
+        npm: "@ai-sdk/anthropic",
+        name: String(active?.providerName || entry.providerName || "Claude account"),
+        options: { baseURL: claudeProxy.baseUrl, apiKey: "claude-account-bridge" },
+        models: modelConfig(accountModels, 200000),
+      };
+      continue;
+    }
+    const apiStyle = active?.apiStyle || entry.apiStyle || "openai";
+    const anthropic = apiStyle === "anthropic";
     const options = { baseURL: baseUrl };
-    if (entry.apiKey) options.apiKey = String(entry.apiKey);
+    if (apiKey) options.apiKey = apiKey;
     if (anthropic) options.headers = { "anthropic-version": "2023-06-01" };
     const modelIds = [
-      ...new Set([model, ...(Array.isArray(entry.models) ? entry.models : [])].map((id) => String(id || "").trim()).filter(Boolean)),
+      ...new Set(
+        [model, ...(active?.models || []), ...(Array.isArray(entry.models) ? entry.models : [])]
+          .map((id) => String(id || "").trim())
+          .filter(Boolean),
+      ),
     ];
     providers[LOCAL_BACKEND_LOCAL_IDS[kind]] = {
       npm: anthropic ? "@ai-sdk/anthropic" : "@ai-sdk/openai-compatible",
-      name: String(entry.label || kind) + " (local)",
+      name: String(active?.providerName || entry.providerName || entry.label || kind) + " (local)",
       options,
-      models: Object.fromEntries(
-        modelIds.map((id) => [
-          id,
-          {
-            name: id,
-            limit: {
-              context: Math.max(1024, Number(entry.context) || 131072),
-              output: 8192,
-            },
-          },
-        ]),
-      ),
+      models: modelConfig(modelIds, entry.context),
     };
   }
   const hermesEntryBase = String(local.hermes?.baseUrl || "").trim().replace(/\/+$/, "");
@@ -1916,15 +2225,7 @@ async function openCodeLocalProviders(settings) {
       npm: "@ai-sdk/openai-compatible",
       name: direct.name,
       options: { baseURL: direct.baseUrl, ...(direct.apiKey ? { apiKey: direct.apiKey } : {}) },
-      models: Object.fromEntries(
-        direct.models.map((id) => [
-          id,
-          {
-            name: id,
-            limit: { context: 1000000, output: 65536 },
-          },
-        ]),
-      ),
+      models: modelConfig(direct.models, 1000000, 65536),
     };
   }
   const ollama = await localOllamaProvider();
@@ -2021,8 +2322,46 @@ function openCodeServeArgs() {
   return ["serve", "--port", "0", "--hostname", "127.0.0.1", "--pure", "--print-logs", "--log-level", "WARN"];
 }
 
+/** Active vault keys for OpenCode-native providers that have no custom block. */
+function nativeOpenCodeVaultKeys() {
+  const keys = [];
+  for (const record of aiKeyVault.rawRecords("opencode")) {
+    const active = aiKeyVault.activeFor("opencode", record.providerId);
+    if (!active || active.id !== record.id) continue;
+    if (!active.apiKey) continue;
+    if (String(active.baseUrl || "").trim()) continue;
+    if (findProvider("opencode", record.providerId)?.baseUrl) continue;
+    keys.push({ providerId: record.providerId, apiKey: active.apiKey });
+  }
+  return keys;
+}
+
+/** Write native provider keys into a user-installed OpenCode credential file. */
+async function writeNativeKeysToOpenCodeAuth(keys, logs) {
+  if (!keys.length) return;
+  const file =
+    findV1AuthFile() || path.join(os.homedir(), ".local", "share", "opencode", "auth.json");
+  try {
+    const current = (await readJson(file, {})) || {};
+    const next = { ...current };
+    for (const key of keys) next[key.providerId] = { type: "api", key: key.apiKey };
+    await ensureDir(path.dirname(file)).catch(() => {});
+    await writeJsonAtomic(file, next);
+    if (process.platform !== "win32") await fs.chmod(file, 0o600).catch(() => {});
+    pushLog(
+      logs,
+      `Saved ${keys.length} provider API key${keys.length === 1 ? "" : "s"} to the OpenCode credential file.`,
+    );
+  } catch (error) {
+    pushLog(logs, `Could not save the provider API keys: ${error.message}`);
+  }
+}
+
 async function openCodeRuntimeEnv(runtime, configured, logs) {
-  if (runtime.source !== "managed") return {};
+  if (runtime.source !== "managed") {
+    await writeNativeKeysToOpenCodeAuth(nativeOpenCodeVaultKeys(), logs);
+    return {};
+  }
   // Keep the private 1.x runtime's auth and session data inside the app data
   // folder. Credentials live in a file with restricted permissions instead of
   // an environment variable that MCP tools and trusted shell commands inherit.
@@ -2037,6 +2376,18 @@ async function openCodeRuntimeEnv(runtime, configured, logs) {
   let auth = {};
   let legacyCount = 0;
   let v2Count = 0;
+  let runtimeCount = 0;
+
+  // Sign-ins the user completed in this runtime (for example the Anthropic
+  // OAuth login) live in the runtime auth file. Keep them, otherwise every
+  // restart would wipe the account the user just connected.
+  try {
+    const runtimeAuth = await readJson(authPath, null);
+    if (runtimeAuth && typeof runtimeAuth === "object") {
+      auth = { ...runtimeAuth };
+      runtimeCount = Object.keys(auth).length;
+    }
+  } catch {}
 
   const legacy = findV1AuthFile();
   if (legacy) {
@@ -2057,10 +2408,34 @@ async function openCodeRuntimeEnv(runtime, configured, logs) {
     pushLog(logs, `OpenCode 2.x credential import failed: ${error.message}`);
   }
 
+  // The active Claude account from the vault is written as an Anthropic OAuth
+  // credential so the built-in Anthropic provider uses the selected account.
+  const claudeAccount = resolveClaudeAccountRecord();
+  if (
+    claudeAccount &&
+    claudeAccount.kind === "account" &&
+    secretKind(claudeAccount.access) === "oauth" &&
+    (claudeAccount.access || claudeAccount.refresh)
+  ) {
+    auth.anthropic = {
+      type: "oauth",
+      refresh: claudeAccount.refresh || "",
+      access: claudeAccount.access || "",
+      expires: Number(claudeAccount.expires || 0),
+    };
+  }
+
+  // Providers OpenCode ships itself have no custom provider block, so their
+  // saved keys belong in the runtime credential file. OpenCode then uses its own
+  // endpoint and model list for them.
+  const nativeKeys = nativeOpenCodeVaultKeys();
+  for (const key of nativeKeys) auth[key.providerId] = { type: "api", key: key.apiKey };
+
   const count = Object.keys(auth).length;
   if (count) {
     const sources = [];
     if (v2Count) sources.push("OpenCode 2.x");
+    if (runtimeCount) sources.push("this runtime");
     if (legacyCount) sources.push("the existing OpenCode 1.x login");
     try {
       await writeJsonAtomic(authPath, auth);
@@ -2076,6 +2451,12 @@ async function openCodeRuntimeEnv(runtime, configured, logs) {
     pushLog(
       logs,
       "No OpenCode credentials were found; the private 1.x runtime will use public models.",
+    );
+  }
+  if (nativeKeys.length) {
+    pushLog(
+      logs,
+      `Loaded ${nativeKeys.length} OpenCode provider API key${nativeKeys.length === 1 ? "" : "s"} from Creator Studio's vault.`,
     );
   }
   return { XDG_DATA_HOME: dataHome };
@@ -2203,6 +2584,14 @@ async function subscribeEvents(state, projectId, channel = "opencode") {
                   at: Date.now(),
                 });
                 if (state.events.length > 120) state.events.splice(0, state.events.length - 120);
+                // A model request can die on a wedged socket. OpenCode retries
+                // five times and then gives up with "Cannot connect to API:
+                // ECONNRESET". Restarting the runtime clears its connection
+                // pool so the next prompt works instead of failing forever.
+                if (channel === "coding") {
+                  const resetReason = connectionResetReason(event);
+                  if (resetReason) scheduleRuntimeRecovery(projectId, resetReason);
+                }
                 logEvent(channel === "coding" ? "coding.opencode" : "opencode", event?.type, event);
                 broadcast(projectId, { type: channel === "coding" ? "coding.event" : "opencode.event", event });
               } catch {
@@ -2219,6 +2608,54 @@ async function subscribeEvents(state, projectId, channel = "opencode") {
     }
   };
   run();
+}
+
+const runtimeRecoveries = new Map();
+
+/**
+ * Detect the final connection-reset failure OpenCode reports after its retries.
+ * Returns a short reason string, or "" when the event is unrelated.
+ */
+function connectionResetReason(event) {
+  if (!event || typeof event !== "object") return "";
+  const type = String(event.type || "");
+  if (type !== "session.error") return "";
+  const error = event.properties && event.properties.error;
+  const text = [
+    error && error.data && typeof error.data.message === "string" ? error.data.message : "",
+    error && typeof error.message === "string" ? error.message : "",
+    error && typeof error.name === "string" ? error.name : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  if (!/ECONNRESET|socket connection was closed|Cannot connect to API|ECONNREFUSED|ETIMEDOUT|EPIPE/i.test(text)) {
+    return "";
+  }
+  return text.replace(/\s+/g, " ").slice(0, 240);
+}
+
+function scheduleRuntimeRecovery(projectId, reason) {
+  const state = codingServers.get(projectId);
+  if (!state || state.stopped) return;
+  const last = runtimeRecoveries.get(projectId) || 0;
+  if (Date.now() - last < 60_000) return;
+  runtimeRecoveries.set(projectId, Date.now());
+  log("warning", "coding", "Model connection was reset; restarting the OpenCode runtime", { projectId, reason });
+  broadcast(projectId, { type: "coding.status", status: "recovering", error: reason });
+  setTimeout(() => {
+    startCodingServer(projectId, state.root, Boolean(state.trusted), true, state.unityPort || null)
+      .then((next) => {
+        broadcast(projectId, {
+          type: "coding.runtime.recovered",
+          reason,
+          version: (next && next.version) || state.version || "",
+        });
+        log("info", "coding", "OpenCode runtime recovered after a connection reset", { projectId });
+      })
+      .catch((error) => {
+        log("error", "coding", "OpenCode runtime recovery failed", { projectId, message: error.message });
+      });
+  }, 1500);
 }
 
 const openCodeStarts = new Map();
@@ -2830,8 +3267,12 @@ async function providerAvailableModels(provider, models) {
   }
 }
 
-async function normalizeProviders(payload) {
+async function normalizeProviders(payload, managedIds = null) {
   const providers = payload?.providers || payload?.all || [];
+  // "managed" means the provider was connected in Creator Studio. Providers
+  // that only exist in OpenCode's own auth file are reported as unmanaged so
+  // the header model picker can hide them.
+  const managedFor = (id) => (managedIds instanceof Set ? managedIds.has(String(id || "")) : true);
   const connectedList = Array.isArray(payload?.connected) ? payload.connected : null;
   return Promise.all(
     providers.map(async (provider) => {
@@ -2855,6 +3296,7 @@ async function normalizeProviders(payload) {
       return {
         id: provider.id,
         name: provider.name || provider.id,
+        managed: managedFor(provider.id),
         connected,
         models: catalog.map(([id, model]) => ({
           id,
@@ -2867,6 +3309,50 @@ async function normalizeProviders(payload) {
       };
     }),
   );
+}
+
+/**
+ * Provider ids the user connected through Creator Studio itself. A key that
+ * only lives in OpenCode's own auth.json must not surface models here: Settings
+ * > AI backends is the one place to add, remove or swap a provider key.
+ */
+async function creatorManagedProviderIds() {
+  const managed = new Set();
+  try {
+    for (const record of aiKeyVault.rawRecords("opencode")) {
+      const active = aiKeyVault.activeFor("opencode", record.providerId);
+      if (active && active.id === record.id) managed.add(record.providerId);
+    }
+  } catch {}
+  // Local models are detected rather than keyed.
+  managed.add("ollama-local");
+  try {
+    const settings = await getSettings();
+    if (settings?.localModels?.claude?.enabled) managed.add("claude-local");
+    if (settings?.localModels?.hermes?.enabled) {
+      managed.add("hermes-local");
+      managed.add(settings.localModels.hermes.opencodeProviderId || "hermes-local");
+    }
+  } catch {}
+  try {
+    for (const direct of await readHermesDirectProviders()) managed.add(direct.providerId);
+  } catch {}
+  return managed;
+}
+
+/** Providers the running OpenCode runtime already knows about. */
+async function liveOpenCodeProviderList() {
+  let state = ocServers.get("__global__");
+  if (!state) {
+    for (const candidate of ocServers.values()) {
+      state = candidate;
+      break;
+    }
+  }
+  if (!state?.baseUrl) return [];
+  const payload = await ocFetch(state, "/config/providers").catch(() => null);
+  if (!payload) return [];
+  return await normalizeProviders(payload).catch(() => []);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2908,6 +3394,10 @@ Trusted workspace: **${trusted ? "ON ? full PC access" : "OFF ? workspace read-o
 10. Use GitHub proactively when related repositories, code, README files or assets would improve the result. Use coding_github_index_repo when a repository looks reusable so later prompts can find it in Global Learning. Reference and session context are supporting background; ignore them only when irrelevant.
 11. Recovery: a snapshot of the app source is saved before each prompt. If your edits stop the app or server from starting, run \`node scripts/recover-last.mjs\` to restore the latest snapshot, then reapply the intended change more carefully.
 12. Full refresh: after changing core app or server files, run \`node scripts/full-refresh.mjs\`. It reloads the window, restarts the supervised backend, and returns to the live Coding editor.
+
+## Shared project memory
+
+Call \`coding_learning\` with the user's request before planning a task that continues earlier work. It returns the permanent Global Learning notes, reusable artifacts and indexed reference matches. Claude Code, Hermes and OpenCode all read the same memory, so reuse the conventions and file paths it lists instead of re-deciding them.
 ${unitySection}
 ## Creator Studio 3D + Photo framework
 
@@ -3364,6 +3854,18 @@ app.get("/api/settings", async (req, res) => {
   res.json(await getSettings());
 });
 
+app.get("/api/background-image", async (req, res) => {
+  const raw = await readBackgroundImage();
+  const match = /^data:([^;]+);base64,([\s\S]+)$/.exec(raw);
+  if (!match) {
+    res.status(404).end();
+    return;
+  }
+  res.setHeader("content-type", match[1]);
+  res.setHeader("cache-control", "public, max-age=31536000, immutable");
+  res.end(Buffer.from(match[2], "base64"));
+});
+
 app.put("/api/settings", async (req, res) => {
   try {
     res.json(await saveSettings(req.body || {}));
@@ -3520,6 +4022,641 @@ app.post("/api/ai-backends/hermes/start", async (req, res) => {
     res.json(await ensureHermesApiServer());
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+
+/* ------------------------------------------------------------------ */
+/* API: AI provider accounts + encrypted key vault                     */
+/* ------------------------------------------------------------------ */
+
+async function reloadAgentServers() {
+  const ids = new Set([...codingServers.keys(), ...ocServers.keys()]);
+  for (const id of ids) await stopProjectServers(id).catch(() => null);
+  return [...ids];
+}
+
+function catalogFor(backend, providerId) {
+  const providers = listProviders(backend);
+  if (providerId) return providers.find((provider) => provider.id === providerId) || null;
+  return providers[0] || null;
+}
+
+/**
+ * Point one backend at a provider and (optionally) a saved key. Keys stay in
+ * the encrypted vault; settings.json only ever stores the provider id and the
+ * non-secret vault record id.
+ */
+async function applyAiBackendChoice({ backend, providerId = "", keyId = "", model = "" }) {
+  if (!["opencode", "claude", "hermes"].includes(backend)) {
+    throw new Error("Unknown AI backend.");
+  }
+  const settings = await getSettings();
+  const local = { ...settings.localModels };
+  let record = keyId
+    ? aiKeyVault.find(keyId)
+    : aiKeyVault.activeRecord(backend, providerId || undefined);
+  if (keyId && !record) throw new Error("That API key account no longer exists.");
+  // The Claude backend is a subscription bridge: if the chosen credential is an
+  // API/usage key while a Max plan OAuth account exists, use the plan account
+  // so requests never draw from paid credits.
+  if (
+    backend === "claude" &&
+    record?.kind === "account" &&
+    secretKind(record.access) !== "oauth"
+  ) {
+    const plan = resolveClaudeAccountRecord();
+    if (plan && secretKind(plan.access) === "oauth") record = plan;
+  }
+  // An account credential knows the catalog entry it was created from, so an
+  // account swap can never be mistaken for the API-key entry with the same id.
+  const chosenProvider = String(
+    record?.catalogId || providerId || record?.providerId || local[backend]?.providerId || "",
+  ).trim();
+  const catalog = catalogFor(backend, chosenProvider);
+  const baseUrl = String(
+    record?.baseUrl || catalog?.baseUrl || local[backend]?.baseUrl || "",
+  ).trim();
+  const apiStyle = record?.apiStyle || catalog?.apiStyle || "openai";
+  const models = [
+    ...new Set([
+      ...(record?.models || []),
+      ...(catalog?.models || []),
+      ...(local[backend]?.models || []),
+    ]),
+  ];
+  const chosenModel = String(model || local[backend]?.model || models[0] || "").trim();
+
+  local.activeBackend = backend;
+  if (backend === "opencode") {
+    if (record) {
+      local.opencodeAccount = {
+        providerId: chosenProvider,
+        providerName: record.providerName || catalog?.name || chosenProvider,
+        vaultKeyId: record.id,
+      };
+    }
+  } else {
+    local[backend] = {
+      ...local[backend],
+      enabled: true,
+      label: local[backend]?.label || (backend === "claude" ? "Claude" : "Hermes"),
+      providerId: chosenProvider,
+      opencodeProviderId: opencodeProviderIdFor(backend, chosenProvider),
+      providerName: record?.providerName || catalog?.name || chosenProvider,
+      vaultKeyId: record?.id || "",
+      baseUrl,
+      // Never persist a plaintext key; the server reads it from the vault.
+      apiKey: "",
+      apiStyle,
+      model: chosenModel,
+      models,
+    };
+  }
+  const next = await saveSettings({ localModels: local });
+  const restarted = await reloadAgentServers();
+  return {
+    ok: true,
+    backend,
+    providerId: chosenProvider,
+    key: record ? { id: record.id, label: record.label, masked: record.masked } : null,
+    model: chosenModel,
+    restarted,
+    settings: next,
+  };
+}
+
+app.get("/api/ai-backends/catalog", async (req, res) => {
+  try {
+    const [discovery, opencodeProviders] = await Promise.all([
+      discoverLocalAiEndpoints().catch(() => null),
+      liveOpenCodeProviderList().catch(() => []),
+    ]);
+    res.json({
+      ...buildProviderCatalog({ discovery, vault: aiKeyVault, opencodeProviders }),
+      vaultPath: aiKeyVault.path,
+      activeBackend: (await getSettings()).localModels?.activeBackend || "opencode",
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/ai-backends/keys", async (req, res) => {
+  try {
+    const backend = String(req.query.backend || "");
+    res.json({
+      keys: aiKeyVault.list(backend),
+      vaultPath: aiKeyVault.path,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai-backends/keys", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const backend = ["opencode", "claude", "hermes"].includes(body.backend)
+      ? body.backend
+      : "opencode";
+    const providerId = String(body.providerId || "").trim();
+    const catalog = catalogFor(backend, providerId);
+    const baseUrl = String(body.baseUrl || catalog?.baseUrl || "").trim();
+    const apiStyle = body.apiStyle || catalog?.apiStyle || "openai";
+    let models = Array.isArray(body.models) ? body.models.map(String) : [...(catalog?.models || [])];
+    const apiKey = String(body.apiKey || "").trim();
+    if (!apiKey) throw new Error("Paste an API key first.");
+    // OpenCode-native providers already know their endpoint and model list, so
+    // a key for one of them is stored without a URL and written to OpenCode's
+    // credential file instead of a custom provider block.
+    let nativeProvider = null;
+    if (!baseUrl && backend === "opencode" && providerId) {
+      const live = await liveOpenCodeProviderList().catch(() => []);
+      nativeProvider = live.find((provider) => provider.id === providerId) || null;
+      if (nativeProvider && !models.length) {
+        models = (nativeProvider.models || []).map((model) => String(model?.id || "")).filter(Boolean);
+      }
+    }
+    if (!baseUrl && !nativeProvider && !(backend === "opencode" && body.native)) {
+      throw new Error("Enter the provider endpoint URL first.");
+    }
+    // Validate the key and learn the real model list in one request. A failed
+    // probe does not block saving: some providers only support chat and reject
+    // /models, so fall back to the catalog list.
+    if (baseUrl) {
+      try {
+        const probe = await testLocalModelEndpoint({ baseUrl, apiKey, apiStyle, model: models[0] || "" });
+        if (probe.models?.length) models = probe.models;
+      } catch {}
+    }
+    const key = await aiKeyVault.add({
+      backend,
+      providerId: providerId || catalog?.id || "custom",
+      catalogId: providerId || catalog?.id || "custom",
+      providerName: catalog?.name || providerId,
+      label: body.label || "",
+      apiKey,
+      baseUrl,
+      apiStyle,
+      models,
+    });
+    if (backend !== "opencode") {
+      const settings = await getSettings();
+      const local = {
+        ...settings.localModels,
+        [backend]: {
+          ...settings.localModels[backend],
+          providerId: key.providerId,
+          opencodeProviderId: opencodeProviderIdFor(backend, key.providerId),
+          providerName: key.providerName,
+          vaultKeyId: key.id,
+          baseUrl,
+          apiKey: "",
+          apiStyle,
+          model: settings.localModels[backend]?.model || models[0] || "",
+          models,
+        },
+      };
+      await saveSettings({ localModels: local });
+    }
+    res.json({ ok: true, key, models });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai-backends/keys/:id/activate", async (req, res) => {
+  try {
+    const key = await aiKeyVault.activate(req.params.id);
+    const result = await applyAiBackendChoice({
+      backend: key.backend,
+      providerId: key.providerId,
+      keyId: key.id,
+    });
+    res.json({ ...result, key });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai-backends/keys/:id/reveal", async (req, res) => {
+  try {
+    res.json(aiKeyVault.reveal(req.params.id));
+  } catch (error) {
+    res.status(404).json({ error: error.message });
+  }
+});
+
+app.delete("/api/ai-backends/keys/:id", async (req, res) => {
+  try {
+    res.json(await aiKeyVault.remove(req.params.id));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai-backends/select", async (req, res) => {
+  try {
+    const body = req.body || {};
+    res.json(
+      await applyAiBackendChoice({
+        backend: body.backend,
+        providerId: body.providerId,
+        keyId: body.keyId,
+        model: body.model,
+      }),
+    );
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/ai-backends/mcp", async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const projectId = String(req.query.projectId || GLOBAL_PROJECT_ID || "");
+    const root = settings.defaultProjectDir || GLOBAL_PROJECT_ROOT;
+    res.json(
+      mcpLinkStatus({
+        appRoot: APP_ROOT,
+        dataDir: DATA_DIR,
+        port: PORT,
+        tokenFile: BRIDGE_TOKEN_FILE,
+        projectId,
+        root,
+      }),
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai-backends/mcp/link", async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const body = req.body || {};
+    const result = await linkMcpTarget(String(body.target || "claude-desktop"), {
+      appRoot: APP_ROOT,
+      dataDir: DATA_DIR,
+      port: PORT,
+      tokenFile: BRIDGE_TOKEN_FILE,
+      projectId: String(body.projectId || GLOBAL_PROJECT_ID || ""),
+      root: settings.defaultProjectDir || GLOBAL_PROJECT_ROOT,
+    });
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai-backends/mcp/unlink", async (req, res) => {
+  try {
+    res.json(await unlinkMcpTarget(String(req.body?.target || "claude-desktop")));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* API: account sign-ins (Claude Pro/Max, Hermes/Nous, OpenCode)        */
+/* ------------------------------------------------------------------ */
+
+function runtimeAuthPath() {
+  return path.join(DATA_DIR, "runtime", "opencode", "data", "opencode", "auth.json");
+}
+
+/** Which providers the running OpenCode runtime has credentials for. */
+async function runtimeAuthProviders() {
+  const auth = (await readJson(runtimeAuthPath(), null)) || {};
+  const entries = [];
+  for (const [id, record] of Object.entries(auth)) {
+    if (!record || typeof record !== "object") continue;
+    const secret = record.type === "oauth" ? record.access : record.key;
+    entries.push({
+      id,
+      type: record.type || "api",
+      oauth: record.type === "oauth",
+      masked: typeof secret === "string" && secret.length > 8
+        ? `${secret.slice(0, 4)}...${secret.slice(-4)}`
+        : secret
+          ? "set"
+          : "",
+      expires: Number(record.expires || 0),
+    });
+  }
+  return entries;
+}
+
+app.get("/api/ai-backends/accounts", async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const accounts = detectAccounts();
+    const runtime = await runtimeAuthProviders().catch(() => []);
+    const anthropic = runtime.find((entry) => entry.id === "anthropic");
+    res.json({
+      accounts,
+      runtime,
+      claudeConnected: Boolean(anthropic),
+      claudeRuntimeAuth: anthropic || null,
+      vault: aiKeyVault.list(),
+      settings: {
+        activeBackend: settings.localModels?.activeBackend || "opencode",
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai-backends/accounts/import", async (req, res) => {
+  try {
+    const source = String(req.body?.source || "");
+    if (source === "claude-token") {
+      const token = String(req.body?.token || "").trim();
+      if (!token) throw new Error("Paste the token from Claude Code setup-token first.");
+      if (secretKind(token) !== "oauth") {
+        throw new Error(
+          "That token is an Anthropic API/usage key, so it bills paid credits instead of your Max plan. " +
+            "For plan usage press Sign in to Claude Code and import the OAuth token (it starts with sk-ant-oat).",
+        );
+      }
+      const credential = await aiKeyVault.add({
+        kind: "account",
+        backend: "claude",
+        providerId: "anthropic",
+        catalogId: "anthropic-account",
+        providerName: "Claude Pro / Max",
+        label: String(req.body?.label || "Claude account"),
+        email: String(req.body?.email || ""),
+        subscription: "claude",
+        access: token,
+        refresh: "",
+        expires: Date.now() + 365 * 24 * 60 * 60 * 1000,
+        apiStyle: "anthropic",
+        models: [],
+      });
+      res.json({ ok: true, credential });
+      return;
+    }
+    if (source === "claude-account") {
+      const claude = detectClaudeAccount();
+      if (!claude.hasCredentials) {
+        throw new Error(
+          "No Claude OAuth tokens were found on this PC. Use Sign in with Claude to connect the account first.",
+        );
+      }
+      const credential = await aiKeyVault.add({
+        kind: "account",
+        backend: "claude",
+        providerId: "anthropic",
+        catalogId: "anthropic-account",
+        providerName: "Claude Pro / Max",
+        label: claude.email || "Claude account",
+        email: claude.email,
+        subscription: claude.subscription || claude.plan,
+        access: claude.access,
+        refresh: claude.refresh,
+        expires: claude.expires,
+        apiStyle: "anthropic",
+        models: [],
+      });
+      res.json({ ok: true, credential });
+      return;
+    }
+    if (source === "opencode-anthropic") {
+      const auth = (await readJson(runtimeAuthPath(), null)) || {};
+      const anthropic = auth.anthropic;
+      if (!anthropic || anthropic.type !== "oauth") {
+        throw new Error(
+          "OpenCode has no Anthropic sign-in yet. Press Sign in with Claude and finish the login in the window that opens.",
+        );
+      }
+      const credential = await aiKeyVault.add({
+        kind: "account",
+        backend: "claude",
+        providerId: "anthropic",
+        catalogId: "anthropic-account",
+        providerName: "Claude Pro / Max",
+        label: "Claude account",
+        email: String(req.body?.email || ""),
+        access: String(anthropic.access || ""),
+        refresh: String(anthropic.refresh || ""),
+        expires: Number(anthropic.expires || 0),
+        apiStyle: "anthropic",
+        models: [],
+      });
+      res.json({ ok: true, credential });
+      return;
+    }
+    if (source === "hermes-nous") {
+      const hermes = detectHermesAccount();
+      if (!hermes.nous.hasCredentials) {
+        throw new Error("Hermes has no Nous account token on this PC. Sign in to Hermes first.");
+      }
+      const credential = await aiKeyVault.add({
+        kind: "apiKey",
+        backend: "hermes",
+        providerId: "hermes-nous",
+        catalogId: "hermes-nous-account",
+        providerName: "Hermes - Nous account",
+        label: hermes.nous.email || "Nous account",
+        email: hermes.nous.email,
+        apiKey: hermes.nous.access,
+        baseUrl: hermes.nous.baseUrl,
+        apiStyle: "openai",
+        models: ["nous/welcome"],
+      });
+      res.json({ ok: true, credential });
+      return;
+    }
+    if (source === "hermes-blitzboy") {
+      const hermes = detectHermesAccount();
+      if (!hermes.blitzboy.hasCredentials) {
+        throw new Error("Hermes has no BlitzBoy key on this PC.");
+      }
+      const credential = await aiKeyVault.add({
+        kind: "apiKey",
+        backend: "hermes",
+        providerId: "hermes-blitzboy",
+        providerName: "Hermes - BlitzBoy",
+        label: "BlitzBoy",
+        apiKey: hermes.blitzboy.apiKey,
+        baseUrl: hermes.blitzboy.baseUrl,
+        apiStyle: "openai",
+        models: ["abliterated-model"],
+      });
+      res.json({ ok: true, credential });
+      return;
+    }
+    throw new Error("Unknown account source.");
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+/**
+ * Open a terminal window that runs "opencode auth login" against the same
+ * runtime Creator Studio uses, so the OAuth credential lands in the runtime
+ * auth file. The user finishes the login in that window.
+ */
+app.get("/api/ai-backends/claude-bridge", async (req, res) => {
+  res.json({
+    running: Boolean(claudeProxy),
+    baseUrl: claudeProxy ? claudeProxy.baseUrl : "",
+    // "cli" means claude.exe runs the requests (plan usage); "api" replays the
+    // OAuth token against api.anthropic.com (billed as extra usage now).
+    mode: claudeProxy ? claudeProxy.mode : "",
+    cli: claudeProxy ? claudeProxy.cli : claudeCliInfo(),
+  });
+});
+
+/**
+ * Send a two-token message through the real Claude account path. This is what
+ * the Settings card calls so "connected" means the account actually answered.
+ */
+app.post("/api/ai-backends/claude/test", async (req, res) => {
+  try {
+    const record = resolveClaudeAccountRecord() || aiKeyVault.activeFor("claude", "anthropic");
+    if (!record || record.kind !== "account") {
+      res.status(400).json({ ok: false, error: "Save a Claude account first, then test again." });
+      return;
+    }
+    if (!claudeProxy) throw new Error("The Claude account bridge is not running. Restart the app.");
+    const settings = await getSettings();
+    const model = String(
+      req.body?.model || settings.localModels?.claude?.model || ANTHROPIC_MODELS[1] || "claude-sonnet-4-5",
+    ).trim();
+    const started = Date.now();
+    const response = await fetch(claudeProxy.baseUrl + "/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model,
+        max_tokens: 4,
+        messages: [{ role: "user", content: "Reply with exactly: pong" }],
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+    const body = await response.text().catch(() => "");
+    let detail = "";
+    try {
+      const parsed = JSON.parse(body);
+      if (response.ok) {
+        detail = (parsed.content || [])
+          .map((part) => (part?.type === "text" ? part.text : ""))
+          .join(" ")
+          .trim();
+      } else {
+        detail = parsed?.error?.message || parsed?.error?.type || "";
+      }
+    } catch {}
+    log(response.ok ? "info" : "warning", "claude-proxy", "Claude account test", {
+      status: response.status,
+      model,
+      elapsedMs: Date.now() - started,
+    });
+    res.json({
+      ok: response.ok,
+      status: response.status,
+      model,
+      mode: claudeProxy ? claudeProxy.mode : "",
+      cli: claudeProxy ? claudeProxy.cli : claudeCliInfo(),
+      elapsedMs: Date.now() - started,
+      reply: detail.slice(0, 200),
+      error: response.ok ? "" : detail || body.slice(0, 300),
+    });
+  } catch (error) {
+    res.status(502).json({ ok: false, error: error.message });
+  }
+});
+
+app.get("/api/ai-backends/claude-code", async (req, res) => {
+  try {
+    res.json(claudeCodeStatus());
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+function openTerminal(title, command) {
+  if (process.platform === "win32") {
+    const child = spawn("cmd.exe", ["/c", "start", title, "cmd.exe", "/k", command], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false,
+    });
+    child.unref();
+    return;
+  }
+  const child = spawn("sh", ["-c", command], { detached: true, stdio: "ignore" });
+  child.unref();
+}
+
+app.post("/api/ai-backends/claude-code/login", async (req, res) => {
+  try {
+    const cli = findClaudeCodeCli();
+    if (!cli) throw new Error("Claude Code was not found. Install it, then try again.");
+    openTerminal("Creator Studio - Claude Code sign-in", `"${cli}" auth login --claudeai`);
+    res.json({
+      ok: true,
+      cli,
+      message: "A Claude Code sign-in window opened. Sign in with your Claude account, then close it.",
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai-backends/claude-code/token", async (req, res) => {
+  try {
+    const cli = findClaudeCodeCli();
+    if (!cli) throw new Error("Claude Code was not found. Install it, then try again.");
+    openTerminal("Creator Studio - Claude token", `"${cli}" setup-token`);
+    res.json({
+      ok: true,
+      cli,
+      message:
+        "A token window opened. Finish the Claude subscription check, copy the token it prints, then paste it below.",
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai-backends/signin", async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const runtime = await resolveOpenCodeExecutable({
+      configured: String(settings.opencode?.executable || "opencode"),
+      dataDir: DATA_DIR,
+      appRoot: APP_ROOT,
+    });
+    const dataHome = path.join(DATA_DIR, "runtime", "opencode", "data");
+    const command = `set "XDG_DATA_HOME=${dataHome}" && "${runtime.executable}" auth login`;
+    if (process.platform === "win32") {
+      const child = spawn(
+        "cmd.exe",
+        ["/c", "start", "Creator Studio - Claude sign-in", "cmd.exe", "/k", command],
+        { detached: true, stdio: "ignore", windowsHide: false },
+      );
+      child.unref();
+    } else {
+      const child = spawn("sh", ["-c", command], {
+        detached: true,
+        stdio: "ignore",
+        env: { ...process.env, XDG_DATA_HOME: dataHome },
+      });
+      child.unref();
+    }
+    res.json({
+      ok: true,
+      executable: runtime.executable,
+      message:
+        "A sign-in window opened. Choose Anthropic and sign in with your Claude account, then close the window.",
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
   }
 });
 
@@ -5609,8 +6746,14 @@ app.post("/api/chat/delete", async (req, res) => {
       return res.status(404).json({ error: "That message is no longer on the cloud." });
     }
     const author = String(row.u || row.user || "").toLowerCase();
-    if (author !== username.toLowerCase()) {
-      return res.status(403).json({ error: "You can only delete your own messages." });
+    const requester = username.toLowerCase();
+    // TwilightStudio.Dev moderates the studio and can remove any chat message;
+    // everyone else can only delete their own messages.
+    const canModerate = requester === "twilightstudio.dev";
+    if (author !== requester && !canModerate) {
+      return res.status(403).json({
+        error: "You can only delete your own messages.",
+      });
     }
     const attempts = [
       ["/api/bitboy_chat_messages/" + encodeURIComponent(id), { method: "DELETE" }],
@@ -6759,7 +7902,7 @@ app.post("/api/coding/prefs", async (req, res) => {
       trusted: Boolean(trusted),
       currentSession: String(currentSession || ""),
       sessionId: sessionId || null,
-      sessions: Array.isArray(sessions) ? sessions.slice(-30) : [],
+      sessions: Array.isArray(sessions) ? sessions.slice(0, 30) : [],
       updatedAt: new Date().toISOString(),
     });
     res.json({ ok: true });
@@ -13839,7 +14982,9 @@ app.post("/api/opencode/connect", async (req, res) => {
     const state = await startOpenCode(projectId, workspace || "prop", Boolean(force));
     await ai3dTerminateStaleWork(projectId, state).catch(() => null);
     const payload = await ocFetch(state, "/config/providers").catch(() => null);
-    const providers = payload ? await normalizeProviders(payload) : [];
+    const providers = payload
+      ? await normalizeProviders(payload, await creatorManagedProviderIds())
+      : [];
     const settings = await getSettings();
     res.json({
       ok: true,
@@ -13864,7 +15009,9 @@ app.post("/api/opencode/global/connect", async (req, res) => {
     const force = Boolean(req.body?.force);
     const state = await startOpenCode("__global__", "prop", force);
     const payload = await ocFetch(state, "/config/providers").catch(() => null);
-    const providers = payload ? await normalizeProviders(payload) : [];
+    const providers = payload
+      ? await normalizeProviders(payload, await creatorManagedProviderIds())
+      : [];
     const settings = await getSettings();
     res.json({
       ok: true,
@@ -15451,8 +16598,11 @@ bootLog("Creator Studio server starting", {
 await ensureDir(DATA_DIR);
 await ensureDir(LOG_DIR);
 bootLog("data directories ready");
+await cleanupTempFiles();
 await migrateLegacyData();
 bootLog("legacy data check complete");
+await migrateBackgroundImage().catch((error) => log("warn", "data", "background image migration failed", { message: error?.message }));
+await forceThemeOnce().catch((error) => log("warn", "data", "one-time theme alignment failed", { message: error?.message }));
 await migrateGitHubToken();
 await pruneLogs();
 bootLog("log maintenance complete");
@@ -15469,6 +16619,28 @@ bootLog("example mod ready");
 await loadPersistedReferenceDictionary().catch(() => null);
 scheduleReferenceIndex(2500);
 
+try {
+  claudeProxy = await startClaudeOAuthProxy({
+    vault: aiKeyVault,
+    log,
+    models: ANTHROPIC_MODELS,
+    resolveAccount: resolveClaudeAccountRecord,
+    // Anthropic bills replayed OAuth tokens as third-party extra usage, so the
+    // official Claude Code CLI runs the requests and spends plan limits.
+    preferCli: true,
+    appRoot: APP_ROOT,
+    dataDir: DATA_DIR,
+    port: PORT,
+    bridgeToken: BRIDGE_TOKEN,
+    bridgeTokenFile: BRIDGE_TOKEN_FILE,
+    // Stable port so running OpenCode sessions keep a valid baseURL across
+    // backend restarts instead of hitting a dead socket (ECONNRESET).
+    preferredPort: (Number(PORT) || 4317) + 1,
+  });
+} catch (error) {
+  log("warning", "claude-proxy", `Could not start the Claude account bridge: ${error.message}`);
+}
+
 const httpServer = server.listen(PORT, "127.0.0.1", () => {
   const url = `http://127.0.0.1:${PORT}`;
   console.log(`Creator Studio server ready on ${url}`);
@@ -15478,6 +16650,13 @@ const httpServer = server.listen(PORT, "127.0.0.1", () => {
   console.log(`MCP bridge: ${MCP_SERVER}`);
   if (!SERVE_DIST) console.log(`Open the Vite dev server (usually http://localhost:5173)`);
 });
+// The renderer and the coding agent keep pooled sockets to this server. With
+// Node's 5s keep-alive default a recycled socket surfaces as ECONNRESET, and
+// long agent streams outlive the 5 minute request timeout.
+httpServer.keepAliveTimeout = 120_000;
+httpServer.headersTimeout = 130_000;
+httpServer.requestTimeout = 0;
+
 httpServer.on("error", (error) => {
   console.error(`[boot] Creator Studio server failed to listen on ${PORT}: ${error?.message || error}`);
   log("error", "server", "listen failed", { port: PORT, message: error?.message, code: error?.code });

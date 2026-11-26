@@ -14,7 +14,17 @@ const APP_ROOT = process.env.TWIX_APP_ROOT ? path.resolve(process.env.TWIX_APP_R
 const TRUSTED = process.env.TWIX_CODING_TRUSTED === "1";
 const UNITY_PORT = process.env.TWIX_UNITY_BRIDGE_PORT ? Number(process.env.TWIX_UNITY_BRIDGE_PORT) : null;
 const BRIDGE_URL = process.env.TWIX_BRIDGE_URL || "";
-const BRIDGE_TOKEN = process.env.TWIX_BRIDGE_TOKEN || "";
+function bridgeToken() {
+  const file = process.env.TWIX_BRIDGE_TOKEN_FILE || "";
+  if (file) {
+    try {
+      const value = fssync.readFileSync(file, "utf8").trim();
+      if (value) return value;
+    } catch {}
+  }
+  return process.env.TWIX_BRIDGE_TOKEN || "";
+}
+const BRIDGE_TOKEN = bridgeToken();
 const IGNORED = new Set([
   "node_modules",
   ".git",
@@ -397,7 +407,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              token: BRIDGE_TOKEN,
+              token: bridgeToken(),
               projectId,
               origin: "coding",
               name: toolName,
@@ -636,6 +646,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ...result,
         ...(approvedDanger ? { safety: { approved: true, severity: assessment.severity } } : {}),
       });
+    }
+    if (name === "coding_learning") {
+      if (!BRIDGE_URL) return respond({ ok: false, error: "Creator Studio bridge is not configured for this workspace." }, true);
+      const query = String(args.query || "").trim();
+      const params = new URLSearchParams({
+        q: query,
+        workspace: ROOT,
+        github: args.github ? "1" : "0",
+      });
+      const payload = await bridgeFetch("/api/global-project/context?" + params.toString(), { timeoutMs: 45000 });
+      return respond({ ok: true, ...payload });
     }
     if (name.startsWith("reference_")) {
       if (name === "reference_sources") {
