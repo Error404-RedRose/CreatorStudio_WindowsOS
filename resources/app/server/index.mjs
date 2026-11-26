@@ -852,7 +852,7 @@ const defaultSettings = () => ({
   backgroundSpeed: 16,
   backgroundZoomPct: 100,
   textScale: 1,
-  uiScale: 1,
+  uiScale: 0.8,
   reducedMotion: false,
   soundEffects: true,
   soundVolume: 0.8,
@@ -1138,7 +1138,7 @@ async function forceThemeOnce() {
 /** Bump this when the shipped appearance defaults change and existing users
  *  should receive them once. It is written to settings.json as a permanent
  *  marker, so the reset never runs again on later updates. */
-const APPEARANCE_DEFAULTS_VERSION = "0.14.0-beta.116";
+const APPEARANCE_DEFAULTS_VERSION = "0.14.0-beta.120";
 
 /** Applies the appearance defaults used by Settings > Appearance > Reset
  *  appearance exactly once to settings created by an older build. Users who
@@ -1160,7 +1160,7 @@ async function applyAppearanceResetOnce() {
     backgroundSpeed: 16,
     backgroundZoomPct: 100,
     textScale: 1,
-    uiScale: 1,
+    uiScale: 0.8,
     appearanceResetApplied: true,
     appearanceDefaultsVersion: APPEARANCE_DEFAULTS_VERSION,
   });
@@ -1176,6 +1176,18 @@ async function applyAppearanceResetOnce() {
     hadSettings,
     version: APPEARANCE_DEFAULTS_VERSION,
   });
+}
+
+/** 80% is now the shipped app scale. Align every existing install once without
+ *  touching themes or custom background images. */
+async function applyDefaultAppScaleOnce() {
+  const file = path.join(DATA_DIR, "settings.json");
+  const stored = await readJson(file, {});
+  if (stored.defaultAppScaleApplied === true) return;
+  stored.uiScale = 0.8;
+  stored.defaultAppScaleApplied = true;
+  await writeJsonAtomic(file, stored);
+  bootLog("app scale default applied once", { uiScale: 0.8 });
 }
 
 /* ------------------------------------------------------------------ */
@@ -17195,6 +17207,7 @@ bootLog("legacy data check complete");
 await migrateBackgroundImage().catch((error) => log("warn", "data", "background image migration failed", { message: error?.message }));
 await forceThemeOnce().catch((error) => log("warn", "data", "one-time theme alignment failed", { message: error?.message }));
 await applyAppearanceResetOnce().catch((error) => log("warn", "data", "one-time appearance reset failed", { message: error?.message }));
+await applyDefaultAppScaleOnce().catch((error) => log("warn", "data", "one-time app scale default failed", { message: error?.message }));
 await migrateGitHubToken();
 await pruneLogs();
 bootLog("log maintenance complete");
