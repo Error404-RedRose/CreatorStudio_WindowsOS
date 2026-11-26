@@ -8403,7 +8403,18 @@ app.post("/api/coding/prefs", async (req, res) => {
 
 app.post("/api/coding/prompt", async (req, res) => {
   try {
-    const { projectId, sessionId, text, model, dir, trusted, images = [], githubRepo = null, history = [] } = req.body || {};
+    const {
+      projectId,
+      sessionId,
+      text,
+      model,
+      dir,
+      trusted,
+      images = [],
+      githubRepo = null,
+      history = [],
+      overdrive = true,
+    } = req.body || {};
     const requestedRoot = dir ? resolveCodingRoot(dir) : null;
     let state = codingServers.get(projectId);
     let rootChanged = false;
@@ -8445,42 +8456,58 @@ app.post("/api/coding/prompt", async (req, res) => {
       if (!image?.dataUrl) continue;
       parts.push({ type: "file", mime: image.mime || "image/png", filename: image.name || "reference.png", url: image.dataUrl });
     }
-    // Pre-flight research runs before the model is called: GitHub repositories
-    // and code plus the indexed local links and folders are all in the system
-    // prompt before the first tool call can happen.
-    const research = await preflightResearch(text || "");
+    // Overdrive runs the full Creator Studio pre-flight pipeline. With it off,
+    // send a raw prompt to OpenCode with the MCP tool instructions only.
+    const research = overdrive
+      ? await preflightResearch(text || "")
+      : { briefing: "", referenceText: "", githubText: "", counts: {}, elapsedMs: 0, terms: "" };
     // Per-prompt knowledge injection: system prompts are not reliably re-read
     // on a continued OpenCode session, so the briefing is also a prompt part.
-    if (research.briefing) {
+    if (overdrive && research.briefing) {
       parts.unshift({ type: "text", text: research.briefing });
     }
-    const referenceContext = research.referenceText;
-    const githubContext = research.githubText;
-    const globalContext = await globalLearningContextFor(text || "", state.root);
-    const sessionContext = await sessionContextFor(state, text || "");
+    const referenceContext = overdrive ? research.referenceText : "";
+    const githubContext = overdrive ? research.githubText : "";
+    const globalContext = overdrive ? await globalLearningContextFor(text || "", state.root) : "";
+    const sessionContext = overdrive ? await sessionContextFor(state, text || "") : "";
     if (sid) {
       const ensured = await ocEnsureSession(state, sid, sessionTitle);
       sid = ensured.sessionId;
       sessionRecreated = Boolean(ensured.recreated);
     }
     const historyContext = sessionRecreated || !sid ? conversationHistoryBlock(history) : "";
-    const system = [
+    const baseSystem = [
       "You are the coding agent for Creator Studio.",
       knowledgeInstructions,
-      globalContext,
       `Active workspace (the only project to edit): ${state.root}`,
       `Trusted workspace: ${state.trusted ? "ON - full PC access" : "OFF"}`,
       `Never edit, scan or run commands against the Creator Studio application folder (${APP_ROOT}) or any other project unless it is the active workspace or the user explicitly asks in this prompt.`,
       "Use coding_* tools only. Work mainly in the selected workspace, linearly, one edit or command at a time. Report build/test results honestly.",
-      "The Pre-flight research briefing below already ran for this prompt. Consult it before your first coding_write_file or coding_run_command. The MCP research gate blocks writes and commands when no fresh briefing exists.",
-      research.briefing,
-      githubInstructions,
-      githubContext,
-      referenceContext,
-      sessionContext,
-      historyContext,
-    ].filter(Boolean).join("\n");
-    await writeResearchGate(projectId, research, text);
+    ];
+    const system = (overdrive
+      ? [
+          ...baseSystem,
+          "The Pre-flight research briefing below already ran for this prompt. Consult it before your first coding_write_file or coding_run_command. The MCP research gate blocks writes and commands when no fresh briefing exists.",
+          research.briefing,
+          githubInstructions,
+          githubContext,
+          referenceContext,
+          sessionContext,
+          historyContext,
+        ]
+      : [
+          ...baseSystem,
+          "Overdrive is off. Work from the user's direct prompt. The MCP coding tools are available; use them when the task requires reading, editing or running commands.",
+          historyContext,
+        ]
+    ).filter(Boolean).join("\n");
+    if (overdrive) await writeResearchGate(projectId, research, text);
+    else
+      await writeResearchGate(
+        projectId,
+        { counts: { overdrive: false }, terms: "", elapsedMs: 0 },
+        text,
+      );
     const sent = await ocSendPrompt(state, {
       sessionId: sid,
       title: sessionTitle,
@@ -8515,7 +8542,7 @@ app.post("/api/coding/prompt", async (req, res) => {
       sessionId: sid,
       sessionRecreated,
       recovery,
-      research: { counts: research.counts, elapsedMs: research.elapsedMs },
+      research: overdrive ? { counts: research.counts, elapsedMs: research.elapsedMs } : null,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -8706,16 +8733,41 @@ app.post("/api/coding/move", async (req, res) => {
       if (destDir === source || destDir.startsWith(source + path.sep)) {
         return res.status(400).json({ error: "A folder cannot be moved inside itself." });
       }
-      const target = path.join(destDir, path.basename(source));
+      let target = path.join(destDir, path.basename(source));
       if (target === source) continue;
       if (fssync.existsSync(target)) {
-        return res.status(409).json({ error: `"${path.basename(source)}" already exists in the destination.` });
+        // Windows Explorer-style move: keep both items and add a numbered
+        // suffix instead of failing the whole drag.
+        const original = path.basename(source);
+        const ext = path.extname(original);
+        const stem = ext ? original.slice(0, -ext.length) : original;
+        let index = 2;
+        while (fssync.existsSync(target) && index < 1000) {
+          const candidate = ext ? `${stem} (${index})${ext}` : `${stem} (${index})`;
+          target = path.join(destDir, candidate);
+          index += 1;
+        }
+        if (fssync.existsSync(target)) {
+          return res.status(409).json({ error: `Could not find a free name for "${original}".` });
+        }
       }
-      await fs.rename(source, target);
+      try {
+        await fs.rename(source, target);
+      } catch (error) {
+        return res.status(400).json({
+          error: `Could not move "${path.basename(source)}": ${error.message}`,
+        });
+      }
       moved.push({ from: relative, to: path.relative(root, target).replace(/\\/g, "/") });
     }
     res.json({ ok: true, moved });
   } catch (error) {
+    log("warning", "coding", "move failed", {
+      dir: req.body?.dir || "",
+      dest: req.body?.dest || "",
+      paths: Array.isArray(req.body?.paths) ? req.body.paths.slice(0, 20) : [],
+      message: error?.message || String(error),
+    });
     res.status(400).json({ error: error.message });
   }
 });
