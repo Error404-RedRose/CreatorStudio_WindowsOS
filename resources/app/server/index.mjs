@@ -1,6 +1,7 @@
 import express from "express";
 import AdmZip from "adm-zip";
 import { WebSocketServer } from "ws";
+import pty from "@homebridge/node-pty-prebuilt-multiarch";
 import { spawn, exec as execCommand } from "node:child_process";
 import { createServer as createHttpServer } from "node:http";
 import { randomUUID, randomBytes, createHash } from "node:crypto";
@@ -385,12 +386,17 @@ const wss = new WebSocketServer({ noServer: true });
  * the authenticated local bridge. Commands are manual, not AI tool calls, so
  * the user sees the exact command and output. */
 const codingShellWss = new WebSocketServer({ noServer: true });
+const codingTerminalWss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   let pathname = "";
   try {
     pathname = new URL(req.url || "/", "http://127.0.0.1").pathname;
   } catch {
     socket.destroy();
+    return;
+  }
+  if (pathname === "/ws/coding-terminal") {
+    codingTerminalWss.handleUpgrade(req, socket, head, (ws) => codingTerminalWss.emit("connection", ws, req));
     return;
   }
   if (pathname === "/ws/coding-shell") {
@@ -406,6 +412,7 @@ server.on("upgrade", (req, socket, head) => {
 codingShellWss.on("connection", (ws) => {
   let cwd = process.cwd();
   let running = null;
+  let runnerMode = "";
   let buffer = "";
   const send = (payload) => {
     if (ws.readyState === 1) ws.send(JSON.stringify(payload));
@@ -416,8 +423,9 @@ codingShellWss.on("connection", (ws) => {
       killProcessTree(running);
     } catch {}
     running = null;
+    runnerMode = "";
   };
-  ws.on("message", async (raw) => {
+  const handleMessage = async (raw) => {
     let message = null;
     try {
       message = JSON.parse(raw.toString());
@@ -439,7 +447,66 @@ codingShellWss.on("connection", (ws) => {
       send({ type: "cancelled", cwd });
       return;
     }
+    if (message.type === "stdin") {
+      if (!running || !runnerMode) {
+        send({ type: "error", message: "No AI runner session is active in this console." });
+        return;
+      }
+      try {
+        running.stdin.write(String(message.data ?? "") + "\n");
+      } catch (error) {
+        send({ type: "stderr", data: `Runner input failed: ${error.message}\n` });
+      }
+      return;
+    }
+    if (message.type === "launch") {
+      const runner = String(message.runner || "").toLowerCase();
+      const executables = { opencode: "opencode", claude: "claude", hermes: "hermes" };
+      const executable = executables[runner];
+      if (!executable) {
+        send({ type: "error", message: "Unknown AI runner." });
+        return;
+      }
+      if (running) {
+        send({ type: "error", message: "Stop the current command before starting an AI runner." });
+        return;
+      }
+      send({ type: "start", command: executable, cwd, runner });
+      const child = spawn(executable, {
+        cwd,
+        shell: true,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, FORCE_COLOR: "1", TERM: "xterm-256color" },
+      });
+      running = child;
+      runnerMode = runner;
+      const forwardRunner = (stream, type) => {
+        stream.on("data", (chunk) => {
+          // TUIs such as OpenCode and Claude emit raw terminal control codes.
+          // Strip them so the embedded console stays readable.
+          const text = String(chunk)
+            .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+            .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+            .replace(/\x1b[()][A-Za-z0-9]/g, "")
+            .replace(/\r/g, "");
+          if (text) send({ type, data: text });
+        });
+      };
+      forwardRunner(child.stdout, "stdout");
+      forwardRunner(child.stderr, "stderr");
+      child.on("error", (error) => {
+        send({ type: "stderr", data: error.message + "\n" });
+      });
+      child.on("close", (code) => {
+        running = null;
+        runnerMode = "";
+        send({ type: "exit", code: typeof code === "number" ? code : -1, cwd, runner });
+      });
+      return;
+    }
     if (message.type !== "run") return;
+    runnerMode = "";
     const command = String(message.command || "").trim();
     if (!command) return;
     if (running) {
@@ -492,12 +559,111 @@ codingShellWss.on("connection", (ws) => {
       running = null;
       send({ type: "exit", code: typeof code === "number" ? code : -1, cwd });
     });
+  };
+  ws.on("message", (raw) => {
+    handleMessage(raw).catch((error) => {
+      try {
+        send({ type: "error", message: String(error?.message || error) });
+      } catch {}
+    });
   });
+  ws.on("error", () => {});
+  const heartbeat = setInterval(() => {
+    try {
+      if (ws.readyState === 1) ws.ping();
+    } catch {}
+  }, 25000);
   ws.on("close", () => {
+    clearInterval(heartbeat);
     stopRunning();
   });
 });
 
+
+/* Real PTY terminal for the Coding console. Runs the user's own shell so
+ * full-screen CLIs (OpenCode, Claude Code) work exactly as in cmd/bash. */
+codingTerminalWss.on("connection", (ws) => {
+  let term = null;
+  const send = (payload) => {
+    if (ws.readyState === 1) ws.send(JSON.stringify(payload));
+  };
+  const dispose = () => {
+    const active = term;
+    term = null;
+    if (!active) return;
+    try {
+      active.kill();
+    } catch {}
+  };
+  ws.on("message", (raw) => {
+    let message = null;
+    try {
+      message = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    if (!message || typeof message !== "object") return;
+    if (message.type === "init") {
+      dispose();
+      let cwd = process.cwd();
+      try {
+        cwd = resolveCodingRoot(String(message.root || ""));
+      } catch (error) {
+        send({ type: "error", message: error.message });
+        return;
+      }
+      const isWindows = process.platform === "win32";
+      const shell = isWindows
+        ? process.env.COMSPEC || "cmd.exe"
+        : process.env.SHELL || "/bin/bash";
+      const args = isWindows ? [] : ["-l"];
+      try {
+        term = pty.spawn(shell, args, {
+          name: "xterm-256color",
+          cols: Math.max(20, Number(message.cols) || 100),
+          rows: Math.max(5, Number(message.rows) || 28),
+          cwd,
+          env: {
+            ...process.env,
+            TERM: "xterm-256color",
+            COLORTERM: "truecolor",
+          },
+          ...(isWindows ? { useConpty: true } : {}),
+        });
+      } catch (error) {
+        send({ type: "error", message: error.message });
+        return;
+      }
+      const active = term;
+      active.onData((data) => send({ type: "data", data }));
+      active.onExit(({ exitCode }) => {
+        if (term === active) term = null;
+        send({ type: "exit", code: exitCode });
+      });
+      send({ type: "ready", cwd, shell: path.basename(shell) });
+      return;
+    }
+    if (message.type === "input") {
+      try {
+        term?.write(String(message.data ?? ""));
+      } catch {}
+      return;
+    }
+    if (message.type === "resize") {
+      try {
+        term?.resize(Math.max(20, Number(message.cols) || 80), Math.max(5, Number(message.rows) || 24));
+      } catch {}
+      return;
+    }
+    if (message.type === "cancel") {
+      try {
+        term?.write("\u0003");
+      } catch {}
+    }
+  });
+  ws.on("error", dispose);
+  ws.on("close", dispose);
+});
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -853,6 +1019,7 @@ const defaultSettings = () => ({
   backgroundZoomPct: 100,
   textScale: 1,
   uiScale: 0.8,
+  trimGlow: false,
   reducedMotion: false,
   soundEffects: true,
   soundVolume: 0.8,
@@ -1103,9 +1270,12 @@ async function saveSettingsNow(patch) {
     next.backgroundImage = backgroundImage.startsWith("/api/background-image") ? "" : backgroundImage;
   }
   await writeJsonAtomic(path.join(DATA_DIR, "settings.json"), next);
+  // Always hand the renderer the live sidecar URL. Returning the blanked
+  // storage value made any unrelated settings save (blur, glow, darkness)
+  // unlink the user selected background image.
   return {
     ...next,
-    backgroundImage: backgroundImage.startsWith("data:") ? backgroundImageUrl() : next.backgroundImage,
+    backgroundImage: backgroundImageCache ? backgroundImageUrl() : next.backgroundImage,
   };
 }
 
@@ -1161,6 +1331,7 @@ async function applyAppearanceResetOnce() {
     backgroundZoomPct: 100,
     textScale: 1,
     uiScale: 0.8,
+    trimGlow: false,
     appearanceResetApplied: true,
     appearanceDefaultsVersion: APPEARANCE_DEFAULTS_VERSION,
   });
@@ -17032,6 +17203,23 @@ app.post("/api/bridge/tool", async (req, res) => {
     }
   }
   const toolName = String(name || "").replace(/^twix_/, "");
+  // Mirror this MCP tool call into the app so the AI engine panel shows live
+  // external tool activity (Claude/OpenCode running through the console).
+  broadcastApproval(projectId, { type: "coding.external.tool", name: toolName, status: "running", projectId });
+  res.on("finish", () => {
+    broadcastApproval(projectId, {
+      type: "coding.external.tool",
+      name: toolName,
+      status: res.statusCode >= 400 ? "error" : "done",
+      projectId,
+    });
+    if (
+      res.statusCode < 400 &&
+      /write|delete|remove|move|rename|create|mkdir|run_command|download|export|copy|edit/i.test(toolName)
+    ) {
+      broadcastApproval(projectId, { type: "coding.files.changed", root: "" });
+    }
+  });
   const buildBlockedTools = new Set(["library_material", "materialize_scene", "materialize_library"]);
   if (sceneJob?.mode === "build" && buildBlockedTools.has(toolName)) {
     return res.status(409).json({

@@ -203,6 +203,9 @@ export function mcpLinkStatus({ appRoot, dataDir, port, tokenFile, projectId }) 
   } catch {}
   return {
     bridge: { url: `http://127.0.0.1:${port}`, tokenFile },
+    serverScript: path.join(appRoot, "server", "mcp-server.mjs"),
+    execPath: process.execPath,
+    projectId: projectId || "",
     servers: Object.keys(serverEntries({ appRoot, dataDir, port, tokenFile, projectId, root: "" })),
     claudeDesktop: {
       configPath: claudeDesktopConfig,

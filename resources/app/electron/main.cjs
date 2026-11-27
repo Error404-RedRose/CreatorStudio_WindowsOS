@@ -144,6 +144,7 @@ let mainWindow = null;
 let overlayWindow = null;
 let overlayTimer = null;
 let quitting = false;
+let serverRestarts = 0;
 let serverProc = null;
 let serverPort = 4317;
 let backendFailure = "";
@@ -300,6 +301,11 @@ function startServer() {
     return;
   }
   mainLog("info", "electron", "backend spawned", { pid: serverProc.pid });
+  // A backend that stays healthy for a minute earns a fresh restart budget.
+  const healthyTimer = setTimeout(() => {
+    serverRestarts = 0;
+  }, 60000);
+  serverProc.once("exit", () => clearTimeout(healthyTimer));
   serverProc.stdout?.on("data", (chunk) => {
     process.stdout.write(`[server] ${chunk}`);
     writeMainLog({ ts: new Date().toISOString(), level: "info", source: "backend.stdout", message: String(chunk).trim() });
@@ -322,7 +328,29 @@ function startServer() {
     if (code && code !== 0 && mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send("twix:server-exit", code);
     }
+    // A dead backend leaves the console reconnecting forever with no way back.
+    // Bring it back automatically (up to three times) and reload the window so
+    // every API/WebSocket reconnects on the healthy server.
+    scheduleServerRestart(code);
   });
+}
+
+function scheduleServerRestart(code) {
+  if (quitting || serverRestarts >= 3) return;
+  serverRestarts += 1;
+  mainLog("warning", "electron", "restarting backend", { code, attempt: serverRestarts });
+  setTimeout(async () => {
+    if (quitting) return;
+    try {
+      startServer();
+      await waitForServer(`http://127.0.0.1:${serverPort}`, 30000);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.reload();
+      }
+    } catch (error) {
+      mainLog("error", "electron", "backend restart failed", { message: error?.message });
+    }
+  }, 1200);
 }
 
 async function createOverlayWindow() {
